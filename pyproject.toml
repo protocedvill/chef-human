@@ -1,0 +1,38 @@
+[project]
+name = "chef-human"
+version = "0.1.0"
+description = "Local AI software development tool"
+requires-python = ">=3.12"
+dependencies = [
+    "ollama>=0.3.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "rich>=13.0",
+    "click>=8.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+llamacpp = [
+    "llama-cpp-python>=0.3.0",
+]
+embeddings = [
+    "sentence-transformers>=3.0.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.5",
+    "pyright>=1.1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: tests that require a running Ollama server with a model",
+]

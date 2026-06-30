@@ -1,0 +1,10 @@
+LICENSE
+README.md
+pyproject.toml
+chef_human/__init__.py
+chef_human.egg-info/PKG-INFO
+chef_human.egg-info/SOURCES.txt
+chef_human.egg-info/dependency_links.txt
+chef_human.egg-info/requires.txt
+chef_human.egg-info/top_level.txt
+chef_human/llm/__init__.py

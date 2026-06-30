@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: chef-human
+Version: 0.1.0
+Summary: Local AI software development tool
+Requires-Python: >=3.12
+License-File: LICENSE
+Requires-Dist: ollama>=0.4.0
+Requires-Dist: pydantic>=2.0
+Requires-Dist: pydantic-settings>=2.0
+Requires-Dist: rich>=13.0
+Requires-Dist: click>=8.0
+Requires-Dist: tomli>=2.0; python_version < "3.11"
+Provides-Extra: llamacpp
+Requires-Dist: llama-cpp-python>=0.3.0; extra == "llamacpp"
+Provides-Extra: embeddings
+Requires-Dist: sentence-transformers>=3.0.0; extra == "embeddings"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.24; extra == "dev"
+Requires-Dist: ruff>=0.5; extra == "dev"
+Requires-Dist: pyright>=1.1; extra == "dev"
+Dynamic: license-file

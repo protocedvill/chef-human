@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from chef_human.llm.backend import Message, Role
 from chef_human.llm.tokenizer import Tokenizer, create_tokenizer
 
 if TYPE_CHECKING:
-    from chef_human.llm.backend import Message
+    from chef_human.agent.file_context import FileContextManager
+    from chef_human.agent.repo_map import RepoMap
+    from chef_human.agent.workspace import WorkspaceManager
 
 
 @dataclass
@@ -14,6 +17,8 @@ class ContextConfig:
     max_tokens: int = 32768
     max_response_tokens: int = 4096
     summary_tokens: int = 512
+    repo_map_tokens: int = 2000
+    file_context_tokens: int = 10000
 
 
 class ContextManager:
@@ -48,3 +53,99 @@ class ContextManager:
                 self.messages.pop(0)
             else:
                 break
+
+
+class ContextAssembler:
+    def __init__(
+        self,
+        conversation: ContextManager,
+        workspace: WorkspaceManager,
+        file_context: FileContextManager,
+        repo_map: RepoMap,
+    ) -> None:
+        self._conversation = conversation
+        self._workspace = workspace
+        self._file_context = file_context
+        self._repo_map = repo_map
+
+    def assemble(
+        self,
+        system_prompt: str,
+        tool_definitions: str = "",
+    ) -> list[Message]:
+        system_content = system_prompt
+        if tool_definitions:
+            system_content += "\n\n" + tool_definitions
+
+        system_tokens = self._conversation.tokenizer.count(system_content)
+        remaining = (
+            self._conversation.config.max_tokens
+            - self._conversation.config.max_response_tokens
+            - system_tokens
+        )
+
+        conversation_messages = self._conversation.get_messages()
+
+        repo_map_text = ""
+        repo_budget = min(
+            self._conversation.config.repo_map_tokens,
+            int(remaining * 0.15),
+        )
+        if repo_budget > 100:
+            repo_map_text = self._repo_map.generate(max_tokens=repo_budget)
+            remaining -= self._conversation.tokenizer.count(repo_map_text)
+
+        file_text = self._build_file_context()
+        file_tokens = self._conversation.tokenizer.count(file_text)
+        file_budget = min(
+            self._conversation.config.file_context_tokens,
+            remaining,
+        )
+        if file_tokens > file_budget:
+            file_text = self._truncate_file_context(file_text, file_budget)
+
+        messages: list[Message] = []
+        messages.append(Message(role=Role.system, content=system_content))
+
+        if repo_map_text:
+            messages.append(
+                Message(role=Role.system, content=f"## Repository Structure\n\n{repo_map_text}")
+            )
+
+        if file_text:
+            messages.append(
+                Message(role=Role.system, content=f"## File Context\n\n{file_text}")
+            )
+
+        messages.extend(conversation_messages)
+        return messages
+
+    def _build_file_context(self) -> str:
+        sections: list[str] = []
+        for path in self._file_context.cached_files():
+            content = self._file_context.get(path)
+            if content is not None:
+                resolved = path if path.is_absolute() else self._workspace.resolve(path)
+                rel = resolved.relative_to(self._workspace.root)
+                lines_list = content.splitlines()
+                sections.append(f"File: {rel} ({len(lines_list)} lines)")
+                sections.append("```")
+                sections.append(content)
+                sections.append("```")
+                sections.append("")
+        return "\n".join(sections)
+
+    def _truncate_file_context(self, text: str, max_tokens: int) -> str:
+        sections = text.split("\nFile: ")
+        kept: list[str] = []
+        remaining = max_tokens
+        for sec in sections:
+            if not sec.strip():
+                continue
+            entry_tokens = self._conversation.tokenizer.count(sec)
+            if entry_tokens <= remaining:
+                kept.append(sec)
+                remaining -= entry_tokens
+            else:
+                break
+        return "\nFile: ".join(kept)

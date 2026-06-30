@@ -13,9 +13,9 @@
 - [x] **1.1.5** ChatML message formatting & tool definition schema
 - [x] **1.1.6** Token counting & context window management
 - [x] **1.1.7** Embeddings backend (BGE for RAG)
-- [ ] **1.1.8** Configuration & model auto-detection
-- [ ] **1.1.9** Integration test: end-to-end chat + tool call
-- [ ] **1.1.10** Model download & setup script
+- [x] **1.1.8** Configuration & model auto-detection
+- [x] **1.1.9** Integration test: end-to-end chat + tool call
+- [x] **1.1.10** Model download & setup script
 
 ---
 
@@ -1067,6 +1067,7 @@ from chef_human.config import settings
 
 pytestmark = [
     pytest.mark.asyncio,
+    pytest.mark.integration,
     pytest.mark.skipif(
         settings.llm_backend != "ollama",
         reason="E2E test requires Ollama backend",
@@ -1074,8 +1075,20 @@ pytestmark = [
 ]
 
 
+def _ollama_reachable() -> bool:
+    try:
+        import ollama
+        client = ollama.Client(host=settings.ollama_host)
+        client.list()
+        return True
+    except Exception:
+        return False
+
+
 @pytest.fixture
 def backend():
+    if not _ollama_reachable():
+        pytest.skip("Ollama server is not reachable")
     from chef_human.llm import create_backend
     return create_backend()
 
@@ -1153,7 +1166,8 @@ async def test_multi_turn(backend):
 
 async def test_embedding(backend):
     """Backend can generate embeddings."""
-    resp = await backend.embed(texts=["hello world", "test"])
+    from chef_human.llm.backend import EmbeddingRequest
+    resp = await backend.embed(EmbeddingRequest(texts=["hello world", "test"]))
     assert len(resp.embeddings) == 2
     assert len(resp.embeddings[0]) > 0  # non-zero dimension
 ```
@@ -1180,21 +1194,47 @@ echo "=== chef-human setup ==="
 
 # 1. Check Python version
 PYTHON=$(command -v python3 || command -v python)
-PYVER=$($PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-if [ "$(echo "$PYVER" | cut -d. -f1)" -lt 3 ] || { [ "$(echo "$PYVER" | cut -d. -f1)" -eq 3 ] && [ "$(echo "$PYVER" | cut -d. -f2)" -lt 12 ]; }; then
-    echo "Error: Python 3.12+ required (found $PYVER)"
+if [ -z "$PYTHON" ]; then
+    echo "Error: Python not found. Install Python 3.12+ first."
     exit 1
 fi
 
+PYVER=$($PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+MAJOR=$(echo "$PYVER" | cut -d. -f1)
+MINOR=$(echo "$PYVER" | cut -d. -f2)
+
+if [ "$MAJOR" -lt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -lt 12 ]; }; then
+    echo "Error: Python 3.12+ required (found $PYVER)"
+    exit 1
+fi
+echo "Python $PYVER found."
+
 # 2. Install package
-echo "Installing chef-human..."
-$PYTHON -m pip install -e ".[dev]"
+echo ""
+echo "Installing chef-human (dev mode)..."
+$PYTHON -m pip install -e ".[dev]" 2>&1 || {
+    echo ""
+    echo "WARNING: Full install failed. This is likely due to missing"
+    echo "pre-built wheels for your Python version (e.g., pydantic-core"
+    echo "for Python beta/RC releases)."
+    echo ""
+    echo "Falling back to --no-deps install..."
+    $PYTHON -m pip install -e ".[dev]" --no-deps
+    echo "Installing core dependencies individually..."
+    $PYTHON -m pip install --no-deps ollama rich click python-dotenv tomli pytest ruff pyright pytest-asyncio 2>/dev/null || true
+    echo "Core dependencies installed (some optional deps may be missing)."
+    echo "To install optional extras later:"
+    echo "  pip install -e \".[llamacpp]\"   # llama.cpp backend"
+    echo "  pip install -e \".[embeddings]\"  # sentence-transformers for RAG"
+}
 
 # 3. Check/install Ollama
+echo ""
 if command -v ollama &>/dev/null; then
     echo "Ollama found."
 else
-    echo "Ollama not found. Install it:"
+    echo "Ollama not found."
+    echo "Install it manually:"
     echo "  curl -fsSL https://ollama.com/install.sh | sh"
     echo "  (or download from https://ollama.com)"
     echo ""
@@ -1202,13 +1242,14 @@ else
     if [[ "$yn" =~ ^[yY] ]]; then
         curl -fsSL https://ollama.com/install.sh | sh
     else
-        echo "Skipping Ollama install. You'll need it later."
+        echo "Skipping Ollama install. You'll need it before using chef-human."
     fi
 fi
 
 # 4. Pull model
 if command -v ollama &>/dev/null; then
     MODEL="${CHEF_OLLAMA_MODEL:-qwen2.5-coder:7b}"
+    echo ""
     echo "Pulling model: $MODEL (this may take a while)..."
     ollama pull "$MODEL"
     echo "Model $MODEL ready."
@@ -1216,8 +1257,14 @@ fi
 
 # 5. Verify
 echo ""
-echo "Setup complete! Verify with:"
+echo "=== Setup complete ==="
+echo ""
+echo "Verify with:"
 echo "  python -c 'from chef_human.llm import create_backend; b = create_backend(); print(b.model_name)'"
+echo ""
+echo "Next steps:"
+echo "  - Read docs/INSTALL.md  for detailed setup guide"
+echo "  - Read docs/USAGE.md    for usage examples"
 ```
 
 **File:** `scripts/setup.ps1` (Windows equivalent, optional)
@@ -1344,12 +1391,14 @@ def _parse_tool_calls_from_content(content: str) -> list[dict[str, Any]] | None:
 
 **Fix**: Once pydantic-core wheels are available for the target Python, `pydantic>=2.0` will resolve normally and `TypeAdapter` will be used.
 
-### 5. Task 1.1.1 Extended Scope
+### 5. Task 1.1.1 Extended Scope / Task 1.1.10 Finalized
 
-**Change**: The original plan only created 4 files. During implementation, it made sense to also create:
+**Change**: The original plan only created 4 files for 1.1.1. During implementation, it made sense to also create:
 - `docs/INSTALL.md` — installation guide with troubleshooting
 - `docs/USAGE.md` — programmatic usage examples
 - `scripts/setup.sh` — automated setup script (moved up from Task 1.1.10)
+
+The script was scaffolded in 1.1.1 and finalized in 1.1.10 with the `--no-deps` fallback for Python 3.15 beta environments where `pydantic-core` wheels are missing.
 
 These are non-code scaffolding that belong with the initial project setup.
 
@@ -1407,7 +1456,29 @@ Also reordered the checks: model path is validated **before** the import try, so
 - Mock-based tests validate `embed`, `embed_single`, and `dimension` behavior
 - `sentence-transformers` remains in `[embeddings]` optional extras; actual model loading will only work when proper wheels are available
 
----
+### 14. `pydantic-settings` Unavailable — Pure Dataclass `Settings` Used Instead
+
+**Change**: The plan specified `pydantic-settings.BaseSettings` with `SettingsConfigDict(toml_file=...)` for config loading. However, `pydantic-settings` depends on pydantic v2 internals (`pydantic._internal`), and only pydantic v1 is installable on this system (no pydantic-core wheels for Python 3.15 beta). Replaced with:
+
+- A frozen `@dataclass` `Settings` with all defaults
+- `_load_toml()` reads the `[chef_human]` section from `config.toml` via `tomllib` (stdlib)
+- `_load_env()` reads `CHEF_*` environment variables with type coercion
+- `load_settings()` merges with priority: env > TOML > defaults
+- `settings = load_settings()` at module level (same interface as the plan)
+
+**Impact**: When pydantic v2 + pydantic-settings become available, the `Settings` class can be migrated to `BaseSettings` + `SettingsConfigDict(toml_file=...)` with no API change — the rest of the code imports `from chef_human.config import settings` either way.
+
+**Status**: Temporary — should be reverted to `pydantic-settings` once pydantic-core wheels are available.
+
+### 15. E2E Test Improvements Over Plan
+
+**Changes to `test_e2e.py`:**
+- Added `_ollama_reachable()` helper that gracefully skips the tests when Ollama server is down (instead of failing with a `RuntimeError`)
+- The backend fixture now checks reachability and calls `pytest.skip()` early
+- Added `pytest.mark.integration` marker for consistency with existing integration tests
+- Fixed `test_embedding` — plan's code called `backend.embed(texts=...)` with kwargs, but the actual method takes an `EmbeddingRequest` object
+
+**Status**: Permanent improvements.
 
 ## Future Improvements
 

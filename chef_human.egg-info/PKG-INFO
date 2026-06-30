@@ -4,7 +4,7 @@ Version: 0.1.0
 Summary: Local AI software development tool
 Requires-Python: >=3.12
 License-File: LICENSE
-Requires-Dist: ollama>=0.4.0
+Requires-Dist: ollama>=0.3.0
 Requires-Dist: pydantic>=2.0
 Requires-Dist: pydantic-settings>=2.0
 Requires-Dist: rich>=13.0

@@ -15,8 +15,8 @@ from chef_human.llm.backend import (
     LLMBackend,
     Message,
     Role,
-    ToolDefinition,
 )
+from chef_human.llm.chatml import tool_to_dict
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ class OllamaBackend(LLMBackend):
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         ollama_messages = [_to_ollama_msg(m) for m in request.messages]
         ollama_tools = (
-            [_to_ollama_tool(t) for t in request.tools] if request.tools else None
+            [tool_to_dict(t) for t in request.tools] if request.tools else None
         )
 
         response = self._client.chat(
@@ -106,17 +106,6 @@ def _to_ollama_msg(msg: Message) -> dict[str, Any]:
     if msg.tool_call_id:
         d["tool_call_id"] = msg.tool_call_id
     return d
-
-
-def _to_ollama_tool(tool: ToolDefinition) -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.parameters,
-        },
-    }
 
 
 def _parse_tool_calls_from_content(content: str) -> list[dict[str, Any]] | None:

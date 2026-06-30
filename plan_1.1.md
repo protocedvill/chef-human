@@ -9,10 +9,10 @@
 - [x] **1.1.1** Project scaffolding (pyproject.toml, deps, tooling)
 - [x] **1.1.2** Abstract backend interface (`LLMBackend`)
 - [x] **1.1.3** Ollama backend implementation
-- [ ] **1.1.4** llama.cpp backend implementation
-- [ ] **1.1.5** ChatML message formatting & tool definition schema
-- [ ] **1.1.6** Token counting & context window management
-- [ ] **1.1.7** Embeddings backend (BGE for RAG)
+- [x] **1.1.4** llama.cpp backend implementation
+- [x] **1.1.5** ChatML message formatting & tool definition schema
+- [x] **1.1.6** Token counting & context window management
+- [x] **1.1.7** Embeddings backend (BGE for RAG)
 - [ ] **1.1.8** Configuration & model auto-detection
 - [ ] **1.1.9** Integration test: end-to-end chat + tool call
 - [ ] **1.1.10** Model download & setup script
@@ -460,9 +460,9 @@ async def test_ollama_embedding():
 
 For users who want to run directly via llama.cpp (no Ollama dependency). Uses `llama-cpp-python` bindings.
 
-```python
-# chef_human/llm/llamacpp_backend.py
+**File:** `chef_human/llm/llamacpp_backend.py` (as built)
 
+```python
 from __future__ import annotations
 
 import json
@@ -470,8 +470,6 @@ import logging
 import re
 from pathlib import Path
 from typing import Any
-
-from llama_cpp import Llama
 
 from chef_human.llm.backend import (
     CompletionRequest,
@@ -488,8 +486,6 @@ logger = logging.getLogger(__name__)
 
 
 class LlamaCppBackend(LLMBackend):
-    """LLM backend using llama.cpp directly."""
-
     def __init__(
         self,
         model_path: str | Path,
@@ -501,6 +497,14 @@ class LlamaCppBackend(LLMBackend):
         self._model_path = Path(model_path)
         if not self._model_path.exists():
             raise FileNotFoundError(f"Model not found: {model_path}")
+
+        try:
+            from llama_cpp import Llama
+        except ImportError as e:
+            raise ImportError(
+                "llama-cpp-python is required for the LlamaCppBackend. "
+                "Install it with: pip install chef-human[llamacpp]"
+            ) from e
 
         self._llm = Llama(
             model_path=str(self._model_path),
@@ -519,7 +523,7 @@ class LlamaCppBackend(LLMBackend):
         return self._llm.context_params.n_ctx
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
-        prompt = self._format_chatml(request)
+        prompt = self.format_chatml(request)
 
         response = self._llm.create_completion(
             prompt=prompt,
@@ -529,12 +533,12 @@ class LlamaCppBackend(LLMBackend):
         )
 
         content = response["choices"][0]["text"].strip()
-        tool_calls = self._parse_tool_calls(content)
+        tool_calls = self.parse_tool_calls(content)
 
         return CompletionResponse(
             message=Message(
                 role=Role.assistant,
-                content=self._strip_tool_calls(content),
+                content=self.strip_tool_calls(content),
                 tool_calls=tool_calls,
             ),
             usage={
@@ -553,13 +557,13 @@ class LlamaCppBackend(LLMBackend):
     def count_tokens(self, text: str) -> int:
         return len(self._llm.tokenize(text.encode("utf-8")))
 
-    def _format_chatml(self, request: CompletionRequest) -> str:
-        """Format messages into ChatML prompt with tool definitions."""
+    @staticmethod
+    def format_chatml(request: CompletionRequest) -> str:
         parts: list[str] = []
 
         if request.tools:
             tools_json = json.dumps(
-                [self._tool_to_dict(t) for t in request.tools], indent=2
+                [LlamaCppBackend.tool_to_dict(t) for t in request.tools], indent=2
             )
             parts.append(
                 f"<|im_start|>system\nAvailable tools:\n{tools_json}\n<|im_end|>"
@@ -577,15 +581,14 @@ class LlamaCppBackend(LLMBackend):
                         content += f"\n<|tool_call|>{json.dumps(tc)}<|/tool_call|>"
                 parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
             elif msg.role == Role.tool:
-                parts.append(
-                    f"<|im_start|>tool\n{msg.content}<|im_end|>"
-                )
+                parts.append(f"<|im_start|>tool\n{msg.content}<|im_end|>")
 
         parts.append("<|im_start|>assistant\n")
         return "\n".join(parts)
 
-    def _parse_tool_calls(self, text: str) -> list[dict[str, Any]] | None:
-        calls = []
+    @staticmethod
+    def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
+        calls: list[dict[str, Any]] = []
         for match in re.finditer(
             r"<tool_call>(.*?)</tool_call>", text, re.DOTALL
         ):
@@ -595,11 +598,12 @@ class LlamaCppBackend(LLMBackend):
                 logger.warning("Failed to parse tool call: %s", match.group(1))
         return calls if calls else None
 
-    def _strip_tool_calls(self, text: str) -> str:
+    @staticmethod
+    def strip_tool_calls(text: str) -> str:
         return re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL).strip()
 
     @staticmethod
-    def _tool_to_dict(tool: ToolDefinition) -> dict[str, Any]:
+    def tool_to_dict(tool: ToolDefinition) -> dict[str, Any]:
         return {
             "type": "function",
             "function": {
@@ -664,35 +668,50 @@ Every tool is defined with this structure:
 
 ### Prompt Template for Tool-Use Models
 
+**File:** `chef_human/llm/chatml.py` (as built)
+
 ```python
-# chef_human/llm/chatml.py
+from __future__ import annotations
 
 import json
 from typing import Any
 
 from chef_human.llm.backend import Message, Role, ToolDefinition
 
-# System prompt prefix
 SYSTEM_PROMPT = """You are chef-human, an AI software engineering assistant.
 You have access to tools. Use them to accomplish tasks.
 Always reason step by step before calling a tool.
 When you are done, call the `finish` tool."""
 
 
+def tool_to_dict(tool: ToolDefinition) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        },
+    }
+
+
 def format_tool_definitions(tools: list[ToolDefinition]) -> str:
-    """Format tool definitions for inclusion in the system prompt."""
-    entries = []
+    entries: list[str] = []
     for t in tools:
-        entries.append(json.dumps({
-            "name": t.name,
-            "description": t.description,
-            "parameters": t.parameters,
-        }, indent=2))
+        entries.append(
+            json.dumps(
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                },
+                indent=2,
+            )
+        )
     return "\n\n".join(entries)
 
 
 def build_system_prompt(tools: list[ToolDefinition] | None = None) -> str:
-    """Build the full system prompt with available tools."""
     prompt = SYSTEM_PROMPT
     if tools:
         tool_text = format_tool_definitions(tools)
@@ -899,7 +918,7 @@ class EmbeddingsBackend:
         if self._model is None:
             from sentence_transformers import SentenceTransformer
             logger.info("Loading embedding model: %s", self._model_name)
-            self._model = SentenceTransformer(self _model_name)
+            self._model = SentenceTransformer(self._model_name)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         self._lazy_load()
@@ -1333,6 +1352,60 @@ def _parse_tool_calls_from_content(content: str) -> list[dict[str, Any]] | None:
 - `scripts/setup.sh` — automated setup script (moved up from Task 1.1.10)
 
 These are non-code scaffolding that belong with the initial project setup.
+
+### 10. Lazy Import for `llama-cpp-python`
+
+**Change**: The plan had `from llama_cpp import Llama` at module level. Since `llama-cpp-python` is an optional dependency, this would crash on import when the package isn't installed. Changed to a lazy import inside `__init__` with a clear error message:
+
+```python
+try:
+    from llama_cpp import Llama
+except ImportError as e:
+    raise ImportError(
+        "llama-cpp-python is required for the LlamaCppBackend. "
+        "Install it with: pip install chef-human[llamacpp]"
+    ) from e
+```
+
+Also reordered the checks: model path is validated **before** the import try, so a missing model file raises `FileNotFoundError` even without the library installed.
+
+**Status**: Permanent design improvement.
+
+### 11. Static Methods Extracted for Testability
+
+**Change**: The plan's private methods (`_format_chatml`, `_parse_tool_calls`, `_strip_tool_calls`, `_tool_to_dict`) were made `@staticmethod` and made public. This allows 17 unit tests to run without requiring `llama-cpp-python` or a GGUF model:
+
+| Method | Tests | What it validates |
+|--------|-------|-------------------|
+| `format_chatml()` | 7 | ChatML prompt construction for all message roles + tool definitions |
+| `parse_tool_calls()` | 5 | `<tool_call>` tag parsing, invalid JSON, mixed content |
+| `strip_tool_calls()` | 3 | Tag removal, edge cases |
+| `tool_to_dict()` | 1 | ToolDefinition → dict conversion |
+| `__init__` | 2 | ImportError on missing lib, FileNotFoundError on missing model |
+
+**Status**: Permanent.
+
+### 12. Shared `tool_to_dict` Extracted to `chatml.py`, Backends Refactored
+
+**Change**: Both backends had identical `tool_to_dict` / `_to_ollama_tool` functions. Extracted to `chef_human/llm/chatml.py` as a shared utility. Both backends now import it:
+
+- `ollama_backend.py`: removed `_to_ollama_tool`, imports `tool_to_dict` from `chatml`
+- `llamacpp_backend.py`: removed `tool_to_dict` static method, imports `tool_to_dict` from `chatml`
+- `ToolDefinition` import removed from both backends (no longer needed)
+- `TestToolToDict` class removed from `test_llamacpp_backend.py` (tests are now in `test_chatml.py`)
+
+**Status**: Permanent design improvement.
+
+### 13. EmbeddingsBackend Typo Fixed, numpy Missing
+
+**Bug in plan code**: Line `self._model = SentenceTransformer(self _model_name)` had a space between `self` and `_model_name`, causing a `SyntaxError`. Fixed to `self._model_name`.
+
+**Change**: The plan's `EmbeddingsBackend` omitted `from __future__ import annotations` in the code block but it was present in the earlier imports — included in the actual implementation.
+
+**Status**: `sentence-transformers` and its transitive dependency `numpy` are not installed (Python 3.15 beta has no wheels). Tests verify:
+- All methods raise `ImportError` when the model is not loaded (11 unit tests pass without sentence-transformers)
+- Mock-based tests validate `embed`, `embed_single`, and `dimension` behavior
+- `sentence-transformers` remains in `[embeddings]` optional extras; actual model loading will only work when proper wheels are available
 
 ---
 

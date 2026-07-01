@@ -68,6 +68,14 @@ class ContextAssembler:
         self._file_context = file_context
         self._repo_map = repo_map
 
+    @property
+    def conversation(self) -> ContextManager:
+        return self._conversation
+
+    @property
+    def workspace(self) -> WorkspaceManager:
+        return self._workspace
+
     def assemble(
         self,
         system_prompt: str,

@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 
+from chef_human.agent.prompts import PLANNER_SYSTEM_PROMPT
 from chef_human.llm.backend import (
     CompletionRequest,
     LLMBackend,
@@ -32,17 +33,6 @@ class PlanStep:
 class Plan:
     goal: str
     steps: list[PlanStep] = field(default_factory=list)
-
-
-PLANNER_SYSTEM_PROMPT = """You are a planning assistant. Given a software engineering task,
-break it down into a series of concrete, actionable steps. Each step should be:
-1. Specific enough that an AI agent can execute it with available tools
-2. Ordered logically (dependencies before dependents)
-3. Self-contained (each step has a clear completion criterion)
-
-Output a JSON array of step objects with "description" fields.
-Do NOT include any other text before or after the JSON array.
-Output ONLY the JSON array, nothing else."""
 
 
 class Planner:

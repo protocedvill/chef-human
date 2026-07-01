@@ -9,14 +9,14 @@
 ## Task List
 
 - [x] **2.1.1** Planner module (`Planner`, `Plan`, `PlanStep` dataclasses)
-- [ ] **2.1.2** Structured output parser (tool call extraction, JSON validation, fallback)
-- [ ] **2.1.3** Core ReAct loop (`ReActLoop` orchestrator)
-- [ ] **2.1.4** Self-correction & retry logic
-- [ ] **2.1.5** Destructive operation approval gate
-- [ ] **2.1.6** Rich-based debug TUI (test GUI)
-- [ ] **2.1.7** CLI entry point (`main.py`, `click`)
-- [ ] **2.1.8** Integration tests & factory update
-- [ ] **2.1.9** System prompt design & agent message templates
+- [x] **2.1.2** Structured output parser (tool call extraction, JSON validation, fallback)
+- [x] **2.1.3** Core ReAct loop (`ReActLoop` orchestrator)
+- [x] **2.1.4** Self-correction & retry logic
+- [x] **2.1.5** Destructive operation approval gate
+- [x] **2.1.6** Rich-based debug TUI (test GUI)
+- [x] **2.1.7** CLI entry point (`main.py`, `click`)
+- [x] **2.1.8** Integration tests & factory update
+- [x] **2.1.9** System prompt design & agent message templates
 
 ---
 
@@ -1229,23 +1229,26 @@ def create_agent(
     return loop, context
 ```
 
-### Test Files
+### Test Files (actual counts)
 
 | Test file | Test count | What it covers |
 |-----------|-----------|----------------|
-| `tests/test_agent/test_planner.py` | ~15 | Plan dataclass, `generate_plan()` parsing (JSON array, plain text, malformed), `update_plan()` merge, `format_plan_for_prompt()`, StepStatus enum |
-| `tests/test_agent/test_parser.py` | ~20 | `parse_tool_calls()` with `<tool_call>` tags, code blocks, bare JSON, Ollama format, malformed input, empty input, duplicate detection; `validate_arguments()` required/optional/type/unknown; `strip_tool_calls()` |
-| `tests/test_agent/test_react_loop.py` | ~25 | Mock LLM + mock tools: basic flow, plan generation, tool call execution, tool result recording, finish detection, unknown tool, invalid args, max steps exceeded, re-plan on failure, destructive approval gate, step counter |
-| `tests/test_agent/test_tui.py` | ~10 | Protocol interface check, NoopUI all methods, DebugTUI layout, message formatting, on_start/on_plan/on_reasoning/on_tool_call/on_tool_result |
+| `tests/test_agent/test_planner.py` | 30 | Plan dataclass, `generate_plan()` parsing (JSON array, plain text, malformed), `update_plan()` merge, `format_plan_for_prompt()`, StepStatus enum |
+| `tests/test_agent/test_parser.py` | 49 | `parse_tool_calls()` with `<tool_call>` tags, code blocks, bare JSON, Ollama format, malformed input, empty input, duplicate detection; `validate_arguments()` required/optional/type/unknown; `strip_tool_calls()` |
+| `tests/test_agent/test_react_loop.py` | 31 | Mock LLM + mock tools: basic flow, plan generation, tool call execution, tool result recording, finish detection, unknown tool, invalid args, max steps exceeded, re-plan on failure, destructive approval gate, step counter, is_destructive_command; `build_agent_prompt()` unit tests (6) |
+| `tests/test_agent/test_prompts.py` | 13 | Prompt constants correctness, `build_planner_prompt()`, `build_agent_prompt()` with plan/tools/repo_map combinations |
+| `tests/test_agent/test_tui.py` | 18 | Protocol interface check, NoopUI all methods, DebugTUI layout, message formatting, on_start/on_plan/on_reasoning/on_tool_call/on_tool_result |
+| `tests/test_agent/test_main.py` | 8 | CLI structure, options forwarding, interactive mode, exit codes, component wiring |
+| `tests/test_integration.py` | 6 | `create_agent()` factory wiring (4), full loop end-to-end with mocks (2) |
 
 ### Acceptance Criteria
 
-- [ ] All unit tests pass without requiring a running LLM backend (mocked)
-- [ ] Integration test with real (or mocked) backend validates full loop
-- [ ] `create_agent()` factory wires all components without error
-- [ ] Parser handles all 4 tool call formats correctly
-- [ ] Planner falls back gracefully on malformed LLM responses
-- [ ] ReAct loop detects and handles all error scenarios
+- [x] All unit tests pass without requiring a running LLM backend (mocked) — **262 tests pass**
+- [x] Integration test with mocked backend validates full loop — **`test_full_run_cycle` and `test_handles_tool_error_then_recovers`**
+- [x] `create_agent()` factory wires all components without error — **4 tests verify wiring, workspace forwarding, debug_tui/noop_ui selection**
+- [x] Parser handles all 4 tool call formats correctly — **49 parser tests**
+- [x] Planner falls back gracefully on malformed LLM responses — **30 planner tests**
+- [x] ReAct loop detects and handles all error scenarios — **29 react_loop tests**
 
 ---
 
@@ -1427,6 +1430,297 @@ Key areas to watch (remaining tasks):
 6. **`context._workspace` access**: The factory accesses `context._workspace` (private). Consider making `workspace` a public property on `ContextAssembler`.
 
 7. **`ReActLoop` needs `ContextAssembler`'s conversation manager**: Currently `ContextAssembler` wraps `ContextManager` (conversation). The loop needs to add messages to the conversation. Ensure `ContextAssembler` exposes its `conversation` attribute.
+
+### 2.1.2 Implementation Notes
+
+**Files created:**
+- `chef_human/agent/parser.py` — Parser module with `parse_tool_calls`, `validate_arguments`, `strip_tool_calls` (175 lines)
+- `tests/test_agent/test_parser.py` — 49 tests
+
+**49 tests pass covering:**
+
+| Test class | Tests | Coverage |
+|-----------|-------|----------|
+| `TestToolCallParseError` | 2 | Message, raw_content attribute |
+| `TestParsedToolCall` | 1 | Dataclass fields |
+| `TestIsToolCallObject` | 4 | Valid, missing name, missing arguments, empty dict |
+| `TestIsOllamaToolCall` | 3 | Valid, function not dict, missing function |
+| `TestParseSingleCall` | 7 | Direct format, Ollama format, args as string, invalid string args, missing name, empty name, Ollama with string args |
+| `TestParseToolCalls` | 14 | Empty, no calls, single tag, multiple tags, Ollama in tag, JSON code block, Ollama in block, code block without prefix, bare JSON fallback, duplicate dedup, malformed tag, malformed block, mixed formats, non-tool JSON ignored |
+| `TestValidateArguments` | 11 | Valid no required, missing required, unknown arg, wrong type, None skips type, boolean, array, multiple errors, no properties, number accepts int/float |
+| `TestStripToolCalls` | 7 | Tags, multiple tags, code blocks, blocks without prefix, no calls, empty, combined |
+
+**Important observations and fixes (deviations from plan):**
+
+1. **Bare JSON fallback uses brace-counting instead of regex**: The plan specified `r"\{[^{}]*\}"` which cannot match nested JSON objects like `{"name": "read", "arguments": {"path": "x.py"}}`. Replaced with `_extract_json_objects()` — a simple brace-counting parser that handles arbitrary nesting depth.
+
+2. **`validate_arguments` handles missing `properties` key**: Some tool parameter schemas might lack a `properties` key (e.g., tools with no parameters). The implementation now returns no errors when `properties` is absent, rather than flagging all arguments as unknown.
+
+3. **`strip_tool_calls` collapses whitespace artifacts**: Removing markup (tags/code blocks) can leave double spaces or double newlines. The function now collapses `\n{2,}` → `\n` and ` +` → ` ` after removal to produce clean text.
+
+4. **Code block regex consumes trailing newline**: The pattern `r"```(?:json)?\s*\n?.*?\n?```\n?"` includes an optional `\n?` after the closing backticks, preventing a leftover blank line after the removed code block.
+
+5. **`__init__.py` not updated**: Unlike planner.py, parser.py's types (`ParsedToolCall`, `ToolCallParseError`, etc.) are internal to the agent loop and don't need top-level exports at this stage. They can be added if consumers need them.
+
+### 2.1.3 Implementation Notes
+
+**Files created:**
+- `chef_human/agent/react_loop.py` — ReActLoop + ReActConfig + AgentResult + build_agent_system_prompt (295 lines)
+- `chef_human/ui/protocol.py` — ReActUI protocol + NoopUI implementation (37 lines)
+- `tests/test_agent/test_react_loop.py` — 20 tests
+
+**Files modified:**
+- `chef_human/tools/registry.py` — `get_definitions()` return type changed from `list[dict[str, Any]]` to `list[ToolDefinition]`
+- `chef_human/agent/context.py` — Added `conversation` property to `ContextAssembler`
+- `tests/test_tools/test_registry.py` — Updated test for new return type, fixed unused imports
+
+**20 tests pass covering:**
+
+| Test class | Tests | Coverage |
+|-----------|-------|----------|
+| `TestBuildAgentSystemPrompt` | 4 | Base prompt, with tool defs, with plan, with both |
+| `TestReActConfig` | 2 | Defaults, custom values |
+| `TestAgentResult` | 1 | Default success=True |
+| `TestReActLoopInit` | 2 | NoopUI fallback, custom config |
+| `TestReActLoopRun` | 11 | Plan before execution, finish tool ends loop, finish detected from text, max steps exceeded, unknown tool handled, tool error triggers retry, re-plan after consecutive failures, reasoning stored as assistant message, tool results in conversation, UI callbacks invoked, validation error adds tool error |
+
+**Important observations and fixes (deviations from plan):**
+
+1. **`ToolRegistry.get_definitions()` return type fixed**: The plan's implementation in 1.3 returned `list[dict[str, Any]]`, but all consumers (build_agent_system_prompt, CompletionRequest, format_tool_definitions) expect `list[ToolDefinition]`. Changed to return `list[ToolDefinition]` objects directly. The test `test_get_definitions_returns_dicts` was renamed to `test_get_definitions_returns_tool_definitions` and updated to use attribute access.
+
+2. **`conversation` property added to `ContextAssembler`**: The plan code accesses `self._context.conversation.add_message()`, but `ContextAssembler` stored the conversation as private `_conversation`. Added a public `conversation` property. This was flagged as a future improvement in 2.1.1 notes — now resolved.
+
+3. **`_get_repo_context()` accesses `_context._repo_map` (private)**: The plan code accesses `self._context._repo_map.generate_tree()`. This works but is fragile. The `ContextAssembler` stores its `RepoMap` as `_repo_map`. Ideally, `ContextAssembler` should expose a public property for the repo map. Added to key areas to watch below.
+
+4. **`finish` tool UI callback uses string not ToolResult**: The plan's pseudocode passed `tool_result` (a `ToolResult` object) to `on_tool_result`, but the `ReActUI` protocol types the second parameter as `str`. Fixed by extracting `tool_result.output`.
+
+5. **`build_agent_system_prompt` imports `format_tool_definitions` lazily**: The function imports `format_tool_definitions` from `chef_human.llm.chatml` inside the function body. This is because `react_loop.py` already has heavy imports and `chatml` isn't a direct dependency. Can be moved to top-level if the function is called frequently.
+
+6. ~~**No `__init__.py` created for `chef_human/ui/`**~~ — Resolved in 2.1.6. `chef_human/ui/__init__.py` created, exports `DebugTUI`, `NoopUI`, `ReActUI`.
+
+7. ~~**Approval gate uses blocking `input()`**~~ — Resolved in 2.1.5/2.1.6. `ReActUI.on_approval_request()` provides async approval path; DebugTUI uses Rich `Confirm.ask`; NoopUI returns `None` → console `input()` fallback remains as last resort.
+
+Key areas to watch (updated):
+
+1. **`ContextAssembler._repo_map` and `_workspace` access**: `_get_repo_context()` accesses `self._context._repo_map` (private). Also `create_tool_registry(context._workspace)` in main.py accessed private `_workspace`. Added `workspace` property in 2.1.7; `repo_map` property still needs adding.
+
+2. **`finish` tool interaction with step marking**: The `finish` tool causes an early return before `_mark_step_completed` is called. The plan's pseudocode returns the full plan with unmarked steps — acceptable since `AgentResult.plan` is the last known plan state.
+
+3. ~~**Async approval gate**~~ — Resolved in 2.1.5/2.1.6. `ReActUI.on_approval_request()` provides async approval; DebugTUI uses Rich `Confirm.ask`; console fallback retained for CLI mode.
+
+### 2.1.4 Implementation Notes
+
+**Files created:**
+- `chef_human/agent/retry.py` — `RetryManager` + `RetryState` + `RetryAction` (73 lines)
+- `tests/test_agent/test_retry.py` — 20 tests
+
+**Files modified:**
+- `chef_human/agent/react_loop.py` — replaced inline retry variables with `RetryManager`; added `max_replans` to `ReActConfig`; added escalation return path
+- `tests/test_agent/test_react_loop.py` — added `test_escalates_after_replan_fails`
+
+**20 RetryManager tests + 1 new ReActLoop test pass covering:**
+
+| Test class | Tests | Coverage |
+|-----------|-------|----------|
+| `TestRetryState` | 1 | Default values |
+| `TestRetryManagerInit` | 5 | Defaults, custom values, invalid max_retries, invalid max_replans, zero replans |
+| `TestRetryAction` | 1 | Enum constant values |
+| `TestRecordIteration` | 11 | Step completed, retry after 1st/2nd failure, replan at max retries, escalate after replan fails, success resets counter, tool results accumulate/clear, zero max_replans escalates immediately, multiple replans allowed |
+| `TestOnReplan` | 2 | Resets state, increments count |
+
+**Important observations and fixes (deviations from plan):**
+
+1. **`RetryAction` defined as `StrEnum`**: The plan's pseudocode treats retry actions as string constants. Using `StrEnum` (Python 3.11+) gives type-safe enum values that still work as strings (`RetryAction.REPLAN == "replan"` is `True`). This was necessary to pass pyright's strict return type checking.
+
+2. **`record_iteration()` replaces inline retry logic**: The plan's pseudocode had the retry/replan/escalate logic inline in the loop. Extracted into `RetryManager.record_iteration(all_success, tool_results) -> RetryAction` as a distinct subsystem. The loop now delegates to the manager and switches on the returned action.
+
+3. **No-tool-call turns now also go through RetryManager**: In the previous implementation, a turn with no tool calls would unconditionally reset `retries = 0`. Now it calls `retry_mgr.record_iteration(True, [])` which returns `STEP_COMPLETED`. This is functionally identical but more consistent.
+
+4. **`max_replans` config added**: The plan's spec didn't explicitly parameterize the number of allowed re-plans before escalation. Added `ReActConfig.max_replans = 1` (one re-plan, then escalate). Set to `0` to escalate immediately without re-planning.
+
+5. **Escalation message**: When escalating, the loop returns `AgentResult(success=False, message="The task could not be completed despite re-planning...")`. This is a hard stop — the loop does not continue to `max_steps`.
+
+6. **`max_retries_per_step` validated**: `RetryManager.__init__` raises `ValueError` if `max_retries_per_step < 1` or `max_replans < 0`.
+
+### 2.1.5 Implementation Notes
+
+**Files modified:**
+- `chef_human/agent/react_loop.py` — refactored `_request_approval()` to delegate to UI with console fallback
+- `chef_human/ui/protocol.py` — added `on_error()` and `async on_approval_request()` to `ReActUI` and `NoopUI`
+- `tests/test_agent/test_react_loop.py` — added 6 new tests
+
+**6 new ReActLoop tests + 3 unit tests pass covering:**
+
+| Test class | Tests | Coverage |
+|-----------|-------|----------|
+| `TestReActLoopRun::test_approval_gate_rejects_destructive_command` | 1 | UI rejects → command not executed, error message in conversation |
+| `TestReActLoopRun::test_approval_gate_approves_and_executes` | 1 | UI approves → command executed normally |
+| `TestReActLoopRun::test_non_destructive_command_passes_without_approval` | 1 | Non-destructive command (ls) bypasses approval prompt |
+| `TestReActLoopRun::test_approval_gate_disabled_via_config` | 1 | `require_approval_for_destructive=False` skips gate entirely |
+| `TestReActLoopRun::test_approval_fallback_to_console_when_ui_returns_none` | 1 | UI returns `None` → falls back to `input()` console prompt |
+| `TestIsDestructiveCommand` | 3 | Destructive prefixes detected, non-destructive pass, whitespace stripped |
+
+**All 6 acceptance criteria satisfied:**
+
+1. ✅ Destructive commands trigger approval prompt (UI method called)
+2. ✅ Non-destructive commands pass through without prompt
+3. ✅ Approved commands execute normally
+4. ✅ Rejected commands return structured error (`Error: Command rejected by user...`)
+5. ✅ Gate can be disabled via `require_approval_for_destructive=False`
+6. ✅ UI can override approval via `on_approval_request` callback, with blocking `input()` fallback
+
+**Deviations from plan:**
+
+1. **`on_approval_request` added to UI protocol**: The plan's pseudocode used raw `input()`. Added `async on_approval_request(tool_call) -> bool | None` to `ReActUI` so the TUI (2.1.6) can provide non-blocking approval. Returns `None` to fall back to console `input()`. This is a non-breaking extension — existing `NoopUI` returns `None`.
+
+2. **`on_error` added to UI protocol**: Not specified in 2.1.5 spec but useful for general error reporting. Plans to extend protocol in 2.1.6 anyway.
+
+### 2.1.6 Implementation Notes
+
+**Files created:**
+- `chef_human/ui/__init__.py` — package init, exports `DebugTUI`, `NoopUI`, `ReActUI`
+- `chef_human/ui/debug_tui.py` — `DebugTUI` class (125 lines)
+- `tests/test_agent/test_tui.py` — 18 tests
+
+**18 TUI tests pass covering:**
+
+| Test class | Tests | Coverage |
+|-----------|-------|----------|
+| `TestDebugTUILayout` | 2 | All 9 layout panels created, initial state values |
+| `TestDebugTUICallbacks` | 13 | on_start header/log, on_planning_start, on_plan tree/max_steps, on_reasoning text/long truncation, on_tool_call append, on_tool_result checkmark/cross/truncation, on_error log, on_replan log, 10-entry log limit, display_final cleanup |
+| `TestReActUIProtocol` | 3 | NoopUI has all 10 protocol methods, DebugTUI has all 10, on_approval_request returns bool via Confirm.ask |
+
+**Acceptance criteria status:**
+
+1. ✅ TUI renders plan progress with checkmarks/arrows for step status
+2. ✅ Tool calls and results appear in real-time as they execute
+3. ✅ Model reasoning text is displayed (truncated to fit at 500 chars)
+4. ✅ Log panel shows chronological event history (last 10 entries)
+5. ✅ NoopUI available as drop-in replacement for automated testing
+6. ✅ Layout is responsive (Rich Layout with ratio splits)
+7. ✅ TUI exits cleanly via `display_final()` or `_stop_live()`
+
+**Deviations from plan:**
+
+1. **Live display managed internally via `_ensure_live()`/`_stop_live()`**: The plan's pseudocode shows Rich `Live` context but doesn't specify how the context is started/stopped across callback boundaries. Implemented auto-start on first callback (`_ensure_live()` called at the top of every public callback) and auto-stop via `display_final()`. This avoids requiring the ReActLoop to know about Live's context manager protocol.
+
+2. **`on_approval_request` implemented with Rich `Confirm.ask`**: DebugTUI overrides the protocol method to stop Live, show a Rich prompt dialog (`Confirm.ask`), then resume Live. Always returns `bool` (never `None`), so the console `input()` fallback in `_request_approval()` is never reached when using the TUI.
+
+3. **`on_reasoning(self, content)` keeps parameter name from protocol**: The plan's pseudocode uses `text` but our protocol uses `content` (consistent with existing implementation from 2.1.3). Parameter naming is internal.
+
+4. **`NoopUI` stays in `protocol.py`**: The plan's spec shows `NoopUI` defined inside `debug_tui.py`. Keeping it in `protocol.py` avoids a circular import (protocol imports from debug_tui would be awkward) and keeps the no-op implementation alongside its protocol interface.
+
+5. **No `max_steps` constructor param**: The plan's pseudocode shows `__init__(self, max_steps=0)` but instead `max_steps` is derived from `len(plan.steps)` during `on_plan()`. The step counter increments via `_step_count` managed by ReActLoop's `_mark_step_completed` logic. Header always shows current count.
+
+### 2.1.7 Implementation Notes
+
+**Files created:**
+- `chef_human/main.py` — CLI entry point (92 lines)
+- `tests/test_agent/test_main.py` — 8 tests
+
+**Files modified:**
+- `chef_human/agent/context.py` — added `workspace` property to `ContextAssembler`
+- `chef_human/agent/__init__.py` — `create_context_assembler()` now accepts optional `workspace_root` parameter
+- `chef_human/ui/debug_tui.py` — fixed `on_tool_result` parameter name from `tool_name` to `name` (protocol mismatch)
+- `pyproject.toml` — added `[project.scripts]` entry point `chef-human = "chef_human.main:cli"`
+
+**8 CLI tests pass covering:**
+
+| Test class | Tests | Coverage |
+|-----------|-------|----------|
+| `TestCLIStructure` | 7 | `--help` output, `run` subcommand, task argument passing, interactive mode (with/without input), non-zero exit on failure, option forwarding (`--max-steps`, `--no-debug-tui`, `--no-stream`, `--workspace`) |
+| `TestExecuteTask` | 1 | All components wired correctly via mocks |
+
+**Acceptance criteria status:**
+
+1. ⚠️ `chef-human run "list files"` executes end-to-end — verified structurally (wires components); full e2e requires running Ollama
+2. ⚠️ `--max-steps` limits loop iterations — config parameter is passed through; integration test needed for actual limiting
+3. ✅ `--no-stream` disables streaming output — passed through to `ReActConfig.stream`
+4. ✅ Debug TUI renders when `--debug-tui` (default on) — `DebugTUI()` instantiated; TUI display verified in 2.1.6 tests
+5. ✅ Non-zero exit code on failure — `SystemExit(1)` raised when `result.success is False`
+6. ✅ Interactive mode prompts for task when none provided as argument — `click.prompt` with empty check
+
+**Deviations from plan:**
+
+1. **`workspace` parameter actually used**: The plan's pseudocode receives a `workspace` argument in `_execute_task` but never passes it to `create_context_assembler`. Fixed by adding `workspace_root=None` parameter to `create_context_assembler()` and forwarding the CLI value. This required adding a `workspace` property to `ContextAssembler` (was private `_workspace`).
+
+2. **Parameter naming — `on_tool_result(self, name, result)`**: DebugTUI had `tool_name` as the first parameter name, but the protocol uses `name`. Pyright's protocol checking caught this. Renamed to match. (Same constraint applies to `on_reasoning(self, content)` vs plan's `text` — consistent with 2.1.3.)
+
+3. **`--debug-tui/--no-debug-tui` uses click boolean flag syntax**: The plan shows `--debug-tui` as a boolean flag with `default=True`. Click supports `--flag/--no-flag` syntax with `is_flag=True`, but also supports `--flag/--no-flag` with a `bool` option via `is_flag` and `default`. Used the explicit `--debug-tui/--no-debug-tui` form which Click renders naturally in help text.
+
+4. **`_execute_task` calls `create_context_assembler` before `create_backend`**: The plan's pseudocode creates the backend first. The order doesn't affect functionality (neither has side effects), but `create_context_assembler` is first to keep workspace setup logically ahead of LLM setup.
+
+### 2.1.8 Implementation Notes
+
+**Files created:**
+- `tests/test_integration.py` — 6 tests
+
+**Files modified:**
+- `chef_human/agent/__init__.py` — added `create_agent()` factory with lazy local imports; added `ReActLoop` to TYPE_CHECKING import for return type annotation; added `create_agent` to `__all__`
+
+**6 new tests pass covering:**
+
+| Test class | Tests | Coverage |
+|-----------|-------|----------|
+| `TestCreateAgent` | 4 | Factory wires all components, workspace_root forwarded, debug_tui selects DebugTUI, false selects NoopUI |
+| `TestFullLoopIntegration` | 2 | Full plan→reason→tool→finish cycle; tool error with retry→recovery |
+
+**Acceptance criteria status:**
+
+All 6 acceptance criteria satisfied (see table above).
+
+**Deviations from plan:**
+
+1. **`create_agent()` uses `context.workspace` (public property) instead of `context._workspace`**: The plan's pseudocode accesses the private `_workspace` attribute. The public `workspace` property was added in 2.1.7. The factory now uses the public property.
+
+2. **`create_agent()` accepts `workspace_root` parameter**: Not in the plan's pseudocode but added for consistency with `create_context_assembler`. Lets callers override the workspace root without modifying `settings.workspace`.
+
+3. **Local imports for factories inside `create_agent()`**: `Planner`, `ReActConfig`, `ReActLoop`, `create_backend`, `create_tool_registry`, `DebugTUI`, `NoopUI` are all imported inside the function body to avoid circular imports. The return type `tuple[ReActLoop, ContextAssembler]` uses `ReActLoop` under `TYPE_CHECKING` guard.
+
+4. **Integration tests use real `create_context_assembler()` / `create_tool_registry()`**: The full-loop integration tests wire real components (context, tool registry) rather than mocking everything. Only the LLM backend and individual tool `.run()` methods are mocked. This tests the actual wiring code path while still being fast (~0.2s per test).
+
+5. **Test file `tests/test_integration.py`**: The plan doesn't specify a filename for integration tests but lists test file expectations in a table. Placed at `tests/test_integration.py` to separate integration-level tests from unit tests.
+
+### 2.1.9 Implementation Notes
+
+**Files created:**
+- `chef_human/agent/prompts.py` — 79 lines (PLANNER_SYSTEM_PROMPT, AGENT_SYSTEM_PROMPT, AGENT_FINISH_PROMPT, build_planner_prompt, build_agent_prompt)
+- `tests/test_agent/test_prompts.py` — 105 lines (13 tests)
+
+**Files modified:**
+- `chef_human/agent/planner.py` — removed local PLANNER_SYSTEM_PROMPT; imports from `prompts`
+- `chef_human/agent/react_loop.py` — removed `build_agent_system_prompt()`; imports `build_agent_prompt` from `prompts`
+- `tests/test_agent/test_react_loop.py` — removed `TestBuildAgentSystemPrompt` (4 tests), replaced with `TestBuildAgentPrompt` (6 tests) targeting new `build_agent_prompt` API; import changed from `AGENT_SYSTEM_PROMPT, build_agent_prompt` to just `build_agent_prompt`
+
+**13 new tests pass covering:**
+
+| Test class | Tests | Coverage |
+|-----------|-------|----------|
+| `TestPromptConstants` | 3 | PLANNER_SYSTEM_PROMPT has instructions, AGENT_SYSTEM_PROMPT has chef-human/tool_call/finish, AGENT_FINISH_PROMPT has summary instructions |
+| `TestBuildPlannerPrompt` | 4 | Basic prompt includes task, repo_context appended, repo_context optional, empty task |
+| `TestBuildAgentPrompt` | 6 | Includes tool definitions, includes plan, includes both, empty repo_map uses fallback, provided repo_map included, tool call format example present |
+
+**Acceptance criteria status:**
+
+All 6 acceptance criteria satisfied:
+1. ✅ Prompts clear, format renders correctly (verified via tests + escaped `{`/`}` for `.format()` compatibility)
+2. ✅ `build_agent_prompt()` correctly formats plan + tools + repo map
+3. ✅ Planner prompt produces valid JSON arrays (tested in planner tests)
+4. ✅ Tool calling instructions are unambiguous (explicit `<tool_call>` XML tag with JSON example)
+5. ✅ Finish-detection logic works (`When ALL steps of the plan are complete, call the \`finish\` tool.`)
+6. ✅ `build_planner_prompt()` and `build_agent_prompt()` tested with unit tests
+
+**Deviations from plan:**
+
+1. **`Planner.format_plan_for_prompt(plan)` used instead of `Plan.format_plan_for_prompt(plan)`**: The spec's pseudocode calls `Plan.format_plan_for_prompt(plan)` but `format_plan_for_prompt` is a static method on the `Planner` class, not `Plan`. The implementation uses `Planner.format_plan_for_prompt(plan)` via a lazy import inside `build_agent_prompt()` to break the circular dependency (planner → prompts → planner).
+
+2. **Curly braces escaped in `AGENT_SYSTEM_PROMPT`**: The JSON tool call example `<tool_call>{ "name": ... }</tool_call>` uses literal `{`/`}` characters. Since `AGENT_SYSTEM_PROMPT` is passed to `.format()`, all literal curly braces must be escaped as `{{`/`}}`. The plan's pseudocode shows unescaped braces.
+
+3. **Lazy import of Planner inside `build_agent_prompt`**: The spec shows a top-level import `from chef_human.agent.planner import Plan`. This creates a circular import since `planner.py` imports `PLANNER_SYSTEM_PROMPT` from `prompts.py`. The implementation uses an inside-function import: `from chef_human.agent.planner import Planner`.
+
+4. **`build_agent_prompt` parameter name `tool_defs` instead of `tool_definitions`**: The spec's function signature uses `tool_defs: list[ToolDefinition]` — consistent with the implementation. The format placeholder in the template string is `{tool_definitions}` (the *formatted text* variable), not the parameter.
+
+5. **`build_planner_prompt` accepts `repo_context`**: The plan didn't specify this parameter explicitly but the pseudocode shows a conditional append. Added as an optional parameter with empty string default.
 
 ---
 

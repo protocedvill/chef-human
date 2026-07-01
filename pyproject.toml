@@ -26,6 +26,9 @@ dev = [
     "pyright>=1.1",
 ]
 
+[project.scripts]
+chef-human = "chef_human.main:cli"
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

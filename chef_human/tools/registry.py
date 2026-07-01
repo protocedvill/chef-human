@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from chef_human.llm.backend import ToolDefinition
+
 
 @dataclass
 class ToolResult:
@@ -32,12 +34,14 @@ class ToolRegistry:
     def list_tools(self) -> list[str]:
         return sorted(self._tools)
 
-    def get_definitions(self) -> list[dict[str, Any]]:
-        definitions: list[dict[str, Any]] = []
+    def get_definitions(self) -> list[ToolDefinition]:
+        definitions: list[ToolDefinition] = []
         for t in self._tools.values():
-            definitions.append({
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.parameters,
-            })
+            definitions.append(
+                ToolDefinition(
+                    name=t.name,
+                    description=t.description,
+                    parameters=t.parameters,
+                )
+            )
         return definitions

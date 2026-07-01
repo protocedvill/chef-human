@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
 
-from chef_human.tools.registry import Tool, ToolResult, ToolRegistry
+from chef_human.tools.registry import ToolResult, ToolRegistry
 
 
 class FakeTool:
@@ -59,18 +58,20 @@ class TestToolRegistry:
         reg.register(tool_a)
         assert reg.list_tools() == ["a_tool", "b_tool"]
 
-    def test_get_definitions_returns_dicts(self):
+    def test_get_definitions_returns_tool_definitions(self):
         reg = ToolRegistry()
         tool = FakeTool()
         tool.name = "adder"
         tool.description = "Adds numbers"
         tool.parameters = {"type": "object", "properties": {"a": {"type": "integer"}}}
         reg.register(tool)
+        from chef_human.llm.backend import ToolDefinition
         defs = reg.get_definitions()
         assert len(defs) == 1
-        assert defs[0]["name"] == "adder"
-        assert defs[0]["description"] == "Adds numbers"
-        assert defs[0]["parameters"]["properties"]["a"]["type"] == "integer"
+        assert isinstance(defs[0], ToolDefinition)
+        assert defs[0].name == "adder"
+        assert defs[0].description == "Adds numbers"
+        assert defs[0].parameters["properties"]["a"]["type"] == "integer"
 
     def test_register_replaces_existing(self):
         reg = ToolRegistry()

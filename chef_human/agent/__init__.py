@@ -1,5 +1,6 @@
 from chef_human.agent.context import ContextAssembler, ContextConfig, ContextManager
 from chef_human.agent.file_context import FileContextManager
+from chef_human.agent.planner import Plan, PlanStep, Planner, StepStatus
 from chef_human.agent.repo_map import RepoMap
 from chef_human.agent.symbols.extractor import RegexExtractor, create_extractor
 from chef_human.agent.workspace import WorkspaceManager
@@ -33,7 +34,11 @@ __all__ = [
     "ContextConfig",
     "ContextManager",
     "FileContextManager",
+    "Plan",
+    "PlanStep",
+    "Planner",
     "RepoMap",
+    "StepStatus",
     "WorkspaceManager",
     "create_context_assembler",
 ]

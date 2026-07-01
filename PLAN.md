@@ -80,6 +80,8 @@ Core tools the agent can invoke:
 
 ## Phase 2: Agent Loop (Month 3)
 
+During the development of this project, there shall be a test gui to test features which are partially complete, but not all the way.
+
 ### 2.1 ReAct Loop
 
 Implement a structured ReAct (Reasoning + Acting) loop:

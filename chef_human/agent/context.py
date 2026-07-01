@@ -42,6 +42,39 @@ class ContextManager:
     def token_count(self) -> int:
         return sum(self.tokenizer.count(m.content) for m in self.messages)
 
+    def to_dict(self) -> dict:
+        return {
+            "max_tokens": self.config.max_tokens,
+            "messages": [
+                {
+                    "role": m.role.value,
+                    "content": m.content,
+                    "tool_calls": m.tool_calls,
+                    "tool_call_id": m.tool_call_id,
+                }
+                for m in self.messages
+            ],
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict,
+        config: ContextConfig | None = None,
+        tokenizer: Tokenizer | None = None,
+    ) -> ContextManager:
+        cm = cls(config=config, tokenizer=tokenizer)
+        cm.messages = [
+            Message(
+                role=Role(msg["role"]),
+                content=msg["content"],
+                tool_calls=msg.get("tool_calls"),
+                tool_call_id=msg.get("tool_call_id"),
+            )
+            for msg in data["messages"]
+        ]
+        return cm
+
     def _trim_if_needed(self) -> None:
         budget = self.config.max_tokens - self.config.max_response_tokens - self.config.summary_tokens
         while self.token_count() > budget and len(self.messages) > 1:

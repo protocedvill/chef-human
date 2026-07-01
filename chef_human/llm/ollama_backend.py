@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import ollama
@@ -90,6 +91,61 @@ class OllamaBackend(LLMBackend):
                 "completion_tokens": response.get("eval_count", 0),
             },
         )
+
+    async def complete_stream(
+        self, request: CompletionRequest
+    ) -> AsyncGenerator[tuple[str, CompletionResponse | None], None]:
+        ollama_messages = [_to_ollama_msg(m) for m in request.messages]
+        ollama_tools = (
+            [tool_to_dict(t) for t in request.tools] if request.tools else None
+        )
+
+        async_client = ollama.AsyncClient(host=self._host)
+        stream = await async_client.chat(
+            model=self._model,
+            messages=ollama_messages,
+            tools=ollama_tools or None,
+            options={
+                "temperature": request.temperature,
+                "num_predict": request.max_tokens,
+                "stop": request.stop,
+            },
+            stream=True,
+        )
+
+        full_content = ""
+        tool_calls: list[dict[str, Any]] | None = None
+        final_usage: dict[str, int] | None = None
+
+        async for chunk in stream:
+            if "message" not in chunk:
+                continue
+            msg = chunk["message"]
+            content_token = msg.get("content", "") or ""
+            if content_token:
+                full_content += content_token
+                yield content_token, None
+
+            # Last chunk may carry tool_calls
+            if "tool_calls" in msg and msg["tool_calls"]:
+                tool_calls = msg["tool_calls"]
+
+            # Capture usage from final chunk
+            if chunk.get("done"):
+                final_usage = {
+                    "prompt_tokens": chunk.get("prompt_eval_count", 0),
+                    "completion_tokens": chunk.get("eval_count", 0),
+                }
+
+        if tool_calls is None:
+            tool_calls = _parse_tool_calls_from_content(full_content)
+
+        msg = Message(
+            role=Role.assistant,
+            content=full_content,
+            tool_calls=tool_calls,
+        )
+        yield "", CompletionResponse(message=msg, usage=final_usage)
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         embeddings = []

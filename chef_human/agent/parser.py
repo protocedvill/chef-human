@@ -164,6 +164,32 @@ def validate_arguments(
     return errors
 
 
+_SCRATCH_PATTERN = re.compile(
+    r"^## Scratchpad:\s*(.*)$",
+    re.MULTILINE,
+)
+
+
+def extract_scratchpad(content: str) -> str | None:
+    """Extract the last scratchpad update from model output.
+
+    The model writes:
+        ## Scratchpad: <content>
+
+    Only the last occurrence is used; previous ones are overwritten.
+    Returns None if no scratchpad block is found.
+    """
+    matches = list(_SCRATCH_PATTERN.finditer(content))
+    if not matches:
+        return None
+    return matches[-1].group(1).strip()
+
+
+def strip_scratchpad(content: str) -> str:
+    """Remove ## Scratchpad: lines from content."""
+    return _SCRATCH_PATTERN.sub("", content).strip()
+
+
 def strip_tool_calls(content: str) -> str:
     content = re.sub(r"<tool_call>.*?</tool_call>", "", content, flags=re.DOTALL)
     content = re.sub(

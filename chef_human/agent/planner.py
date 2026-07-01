@@ -28,11 +28,24 @@ class PlanStep:
     description: str
     status: StepStatus = StepStatus.pending
 
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "description": self.description,
+            "status": self.status.value,
+        }
+
 
 @dataclass
 class Plan:
     goal: str
     steps: list[PlanStep] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "goal": self.goal,
+            "steps": [s.to_dict() for s in self.steps],
+        }
 
 
 class Planner:

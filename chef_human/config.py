@@ -54,6 +54,15 @@ def _load_toml(path: str = "config.toml") -> dict[str, object]:
     return result
 
 
+def _find_project_config(start_dir: str | Path = ".") -> Path | None:
+    current = Path(start_dir).resolve()
+    for parent in [current] + list(current.parents):
+        candidate = parent / ".chef-human" / "config.toml"
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _load_env() -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in os.environ.items():
@@ -63,9 +72,15 @@ def _load_env() -> dict[str, object]:
     return result
 
 
-def load_settings(config_path: str = "config.toml") -> Settings:
+def load_settings(
+    config_path: str = "config.toml",
+    project_start: str | Path = ".",
+) -> Settings:
     merged: dict[str, object] = {}
     merged.update(_load_toml(config_path))
+    project_cfg = _find_project_config(project_start)
+    if project_cfg is not None:
+        merged.update(_load_toml(str(project_cfg)))
     merged.update(_load_env())
     return Settings(**merged)
 

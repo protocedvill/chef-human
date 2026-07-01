@@ -89,3 +89,23 @@ class TestBuildAgentPrompt:
         tool_defs: list[ToolDefinition] = []
         prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
         assert "tool_name" in prompt
+
+    def test_scratchpad_empty_uses_fallback(self):
+        plan = Plan(goal="Test", steps=[])
+        tool_defs: list[ToolDefinition] = []
+        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        assert "Scratchpad" in prompt
+        assert "add notes" in prompt
+
+    def test_scratchpad_included_when_provided(self):
+        plan = Plan(goal="Test", steps=[])
+        tool_defs: list[ToolDefinition] = []
+        prompt = build_agent_prompt(
+            plan=plan, tool_defs=tool_defs, scratchpad="I found the bug"
+        )
+        assert "I found the bug" in prompt
+        assert "add notes" not in prompt
+
+    def test_scratchpad_placeholder_present_in_constant(self):
+        assert "{scratchpad}" in AGENT_SYSTEM_PROMPT
+        assert "## Notes / Scratchpad" in AGENT_SYSTEM_PROMPT

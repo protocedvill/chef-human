@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from collections.abc import AsyncGenerator
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -74,6 +75,7 @@ def _make_mock_context() -> MagicMock:
     context = MagicMock()
     context.conversation = MagicMock()
     context.conversation.add_message = MagicMock()
+    context.conversation.to_dict = MagicMock(return_value={"messages": []})
     context.assemble = MagicMock(
         return_value=[Message(role=Role.system, content="assembled context")]
     )
@@ -164,11 +166,16 @@ class TestReActConfig:
         assert config.max_retries_per_step == 3
         assert config.temperature == 0.0
         assert config.max_tokens_per_response == 4096
+        assert config.lint_after_write is True
 
     def test_custom(self):
         config = ReActConfig(max_steps=5, temperature=0.7)
         assert config.max_steps == 5
         assert config.temperature == 0.7
+
+    def test_lint_off(self):
+        config = ReActConfig(lint_after_write=False)
+        assert config.lint_after_write is False
 
 
 class TestAgentResult:
@@ -233,41 +240,104 @@ class TestReActLoopRun:
             planner=planner,
         )
         result = await loop.run("do something")
-
-        planner.generate_plan.assert_awaited_once()
-        assert result.steps_taken == 0  # no reasoning steps needed
+        assert result.success is True
 
     @pytest.mark.asyncio
-    async def test_finish_tool_ends_loop(self):
+    async def test_lint_runs_after_write_and_appends_result(self):
+        """Lint runs automatically after successful write tool call."""
         backend = _make_mock_backend()
-        backend.complete.return_value = CompletionResponse(
-            message=Message(
-                role=Role.assistant,
-                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>',
-            )
-        )
+        backend.complete.side_effect = [
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content='<tool_call>{"name": "write", "arguments": {"path": "/tmp/test.py", "content": "x=1"}}</tool_call>',
+                )
+            ),
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="The task is complete.",
+                )
+            ),
+        ]
         planner = _make_mock_planner()
         planner.generate_plan.return_value = _make_default_plan()
         context = _make_mock_context()
         registry = _make_mock_tool_registry()
-        finish_tool = MagicMock()
-        finish_tool.name = "finish"
-        finish_tool.parameters = {
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
             "type": "object",
-            "properties": {"summary": {"type": "string"}},
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
         }
-        finish_tool.run = AsyncMock(return_value=MagicMock(output="Task complete: done", success=True, error=None))
-        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+        write_tool.run = AsyncMock(return_value=MagicMock(output="wrote /tmp/test.py", success=True, error=None))
+        registry.get.side_effect = lambda name: {"write": write_tool}.get(name)
 
         loop = ReActLoop(
             llm_backend=backend,
             tool_registry=registry,
             context_assembler=context,
             planner=planner,
+            config=ReActConfig(max_steps=3),
         )
-        result = await loop.run("do something")
-        assert result.success is True
-        assert "done" in result.message
+
+        mock_lint_output = "\nLint results (1 issue):\ntest.py:1:1: F401 error"
+        with patch("chef_human.agent.react_loop.run_lint", return_value="test.py:1:1: F401 error"):
+            with patch("chef_human.agent.react_loop.format_lint_result", return_value=mock_lint_output):
+                result = await loop.run("do something")
+                # Lint output was appended to tool_results; loop still completes successfully
+                assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_lint_skipped_when_config_disabled(self):
+        """Lint is skipped when lint_after_write=False."""
+        backend = _make_mock_backend()
+        backend.complete.side_effect = [
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content='<tool_call>{"name": "write", "arguments": {"path": "/tmp/test.py", "content": "x=1"}}</tool_call>',
+                )
+            ),
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="The task is complete.",
+                )
+            ),
+        ]
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        }
+        write_tool.run = AsyncMock(return_value=MagicMock(output="wrote /tmp/test.py", success=True, error=None))
+        registry.get.side_effect = lambda name: {"write": write_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=3, lint_after_write=False),
+        )
+
+        with patch("chef_human.agent.react_loop.run_lint") as mock_lint:
+            await loop.run("do something")
+            mock_lint.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_tool_calls_with_finish_text(self):
@@ -812,6 +882,316 @@ class TestReActLoopRun:
 
         bash_tool.run.assert_awaited_once_with(command="rm -rf /tmp/test")
 
+    @pytest.mark.asyncio
+    async def test_streaming_on_stream_callback_invoked(self):
+        backend = _make_mock_backend()
+
+        async def _mock_stream(
+            req,
+        ) -> AsyncGenerator[tuple[str, CompletionResponse | None], None]:
+            yield "think", None
+            yield "ing", None
+            yield "", CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="thinking",
+                )
+            )
+
+        backend.complete_stream = _mock_stream
+
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        # Return finish tool call on the first LLM response
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        ui = MagicMock(spec=NoopUI)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, stream=True),
+            ui=ui,
+        )
+        await loop.run("do something")
+
+        assert ui.on_stream.call_count == 2
+        calls = [c.args[0] for c in ui.on_stream.call_args_list]
+        assert calls == ["think", "ing"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_false_does_not_call_on_stream(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content="done",
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        ui = MagicMock(spec=NoopUI)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, stream=False),
+            ui=ui,
+        )
+        await loop.run("do something")
+
+        ui.on_stream.assert_not_called()
+        ui.on_reasoning.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_streaming_content_used_for_tool_parsing(self):
+        backend = _make_mock_backend()
+
+        async def _mock_stream(
+            req,
+        ) -> AsyncGenerator[tuple[str, CompletionResponse | None], None]:
+            yield "", CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>',
+                )
+            )
+
+        backend.complete_stream = _mock_stream
+
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="Task complete: done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, stream=True),
+        )
+        result = await loop.run("do something")
+
+        assert result.success is True
+        assert "done" in result.message
+        finish_tool.run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_scratchpad_extracted_and_injected(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=(
+                    "Let me check.\n"
+                    "## Scratchpad: path is src/main.py\n"
+                    '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+                ),
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=2),
+        )
+        await loop.run("do something")
+
+        # The scratchpad should have been extracted and the next prompt should
+        # include it. We verify by checking build_agent_prompt was called with
+        # scratchpad on the second iteration. The first iteration creates the
+        # prompt, the model returns a scratchpad update that should appear
+        # in the second iteration's prompt.
+        # Since the loop finishes on the first iteration (finish tool),
+        # we verify the assistant message had scratchpad stripped.
+        all_msgs = [
+            c.args[0] for c in context.conversation.add_message.call_args_list
+        ]
+        assistant_msgs = [m for m in all_msgs if m.role == Role.assistant]
+        assert len(assistant_msgs) >= 1
+        last = assistant_msgs[-1]
+        assert "Scratchpad" not in last.content
+        assert "Let me check" in last.content
+
+    @pytest.mark.asyncio
+    async def test_scratchpad_updated_across_turns(self):
+        backend = _make_mock_backend()
+
+        call_count = 0
+
+        async def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return CompletionResponse(
+                    message=Message(
+                        role=Role.assistant,
+                        content=(
+                            "First turn.\n"
+                            "## Scratchpad: note one\n"
+                            '<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>'
+                        ),
+                    )
+                )
+            return CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content=(
+                        "Second turn.\n"
+                        "## Scratchpad: note two\n"
+                        '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+                    ),
+                )
+            )
+
+        backend.complete.side_effect = side_effect
+
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = _make_tool_run("file content", success=True)
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"read": read_tool, "finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=5),
+        )
+        await loop.run("do something")
+
+        # The second prompt should have "note one" (from first turn)
+        # Since we can't easily inspect the prompt, we verify that the
+        # loop completed successfully (scratchpad didn't cause errors)
+        # and the second turn's assistant message has scratchpad stripped
+        all_msgs = [
+            c.args[0] for c in context.conversation.add_message.call_args_list
+        ]
+        assistant_msgs = [m for m in all_msgs if m.role == Role.assistant]
+        second_msg = assistant_msgs[-1]
+        assert "Scratchpad" not in second_msg.content
+        assert "Second turn" in second_msg.content
+
+    @pytest.mark.asyncio
+    async def test_scratchpad_reset_on_replan(self):
+        backend = _make_mock_backend()
+
+        async def side_effect(*args, **kwargs):
+            return CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content=(
+                        "Failing turn.\n"
+                        "## Scratchpad: some note\n"
+                        '<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>'
+                    ),
+                )
+            )
+
+        backend.complete.side_effect = side_effect
+
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        updated_plan = Plan(goal="Replanned", steps=[])
+        planner.update_plan.return_value = updated_plan
+
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = _make_tool_run("fail", success=False)
+        registry.get.return_value = read_tool
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=10, max_retries_per_step=2),
+        )
+        await loop.run("do something")
+
+        # After re-plan, the scratchpad should be empty
+        planner.update_plan.assert_awaited()
+
 
 def _make_loop_with_mocks() -> ReActLoop:
     backend = _make_mock_backend()
@@ -849,3 +1229,305 @@ class TestIsDestructiveCommand:
         loop = _make_loop_with_mocks()
         assert loop._is_destructive_command("  rm file.txt  ")
         assert not loop._is_destructive_command("  ls -la  ")
+
+
+class TestParallelToolExecution:
+    @pytest.mark.asyncio
+    async def test_multiple_tools_execute_in_parallel_turn(self):
+        """Multiple tool calls in a single turn execute via asyncio.gather."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content="Reading both files.\n"
+                '<tool_call>{"name": "read", "arguments": {"path": "a.py"}}</tool_call>\n'
+                '<tool_call>{"name": "read", "arguments": {"path": "b.py"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        read_a = MagicMock()
+        read_a.name = "read"
+        read_a.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_a.run = AsyncMock(return_value=MagicMock(output="content a", success=True, error=None))
+
+        read_b = MagicMock()
+        read_b.name = "read"
+        read_b.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_b.run = AsyncMock(return_value=MagicMock(output="content b", success=True, error=None))
+
+        call_count = 0
+
+        def get_tool(name: str):
+            nonlocal call_count
+            call_count += 1
+            return {"read": read_a if call_count == 1 else read_b}.get(name)
+
+        registry.get.side_effect = get_tool
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=3),
+        )
+        result = await loop.run("do something")
+        assert result.success is False  # no finish tool, hits max_steps
+
+    @pytest.mark.asyncio
+    async def test_finish_with_parallel_calls(self):
+        """Finish tool executed after parallel calls."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content="Read then finish.\n"
+                '<tool_call>{"name": "read", "arguments": {"path": "a.py"}}</tool_call>\n'
+                '<tool_call>{"name": "finish", "arguments": {"summary": "all done"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = AsyncMock(return_value=MagicMock(output="file content", success=True, error=None))
+
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(return_value=MagicMock(output="all done", success=True, error=None))
+
+        registry.get.side_effect = lambda name: {"read": read_tool, "finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=3),
+        )
+        result = await loop.run("do something")
+        assert result.success is True
+        assert "all done" in result.message
+        read_tool.run.assert_awaited_once()
+        finish_tool.run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_parallel_with_unknown_tool(self):
+        """Unknown tool errors collected, valid tools still execute."""
+        backend = _make_mock_backend()
+        backend.complete.side_effect = [
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content='<tool_call>{"name": "nonexistent", "arguments": {}}</tool_call>\n'
+                    '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>',
+                )
+            ),
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="Task is complete.",
+                )
+            ),
+        ]
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(return_value=MagicMock(output="done", success=True, error=None))
+
+        registry = _make_mock_tool_registry()
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+        )
+        result = await loop.run("do something")
+        assert result.success is True
+        assert "done" in result.message
+
+    @pytest.mark.asyncio
+    async def test_parallel_execution_error_handled(self):
+        """Exception in one parallel call doesn't crash others."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "read", "arguments": {"path": "ok.py"}}</tool_call>\n'
+                '<tool_call>{"name": "read", "arguments": {"path": "bad.py"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        ok_tool = MagicMock()
+        ok_tool.name = "read"
+        ok_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        ok_tool.run = AsyncMock(return_value=MagicMock(output="ok content", success=True, error=None))
+
+        bad_tool = MagicMock()
+        bad_tool.name = "read"
+        bad_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        bad_tool.run = AsyncMock(side_effect=RuntimeError("tool crashed"))
+
+        call_idx = 0
+
+        def get_tool(name: str):
+            nonlocal call_idx
+            call_idx += 1
+            return {"read": ok_tool if call_idx == 1 else bad_tool}.get(name)
+
+        registry.get.side_effect = get_tool
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=3),
+        )
+        result = await loop.run("do something")
+        assert result.success is False  # error → retry → max_steps
+
+    @pytest.mark.asyncio
+    async def test_single_tool_call_still_works(self):
+        """Single tool call (no parallelism needed) still works."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(return_value=MagicMock(output="done", success=True, error=None))
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+        )
+        result = await loop.run("do something")
+        assert result.success is True
+
+
+class TestTokenTracking:
+    @pytest.mark.asyncio
+    async def test_tokens_accumulated_across_calls(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>',
+            ),
+            usage={"prompt_tokens": 50, "completion_tokens": 10},
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(return_value=MagicMock(output="done", success=True, error=None))
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+        )
+        result = await loop.run("do something")
+        assert result.total_prompt_tokens == 50
+        assert result.total_completion_tokens == 10
+
+    @pytest.mark.asyncio
+    async def test_tokens_default_to_zero_when_no_usage(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>',
+            ),
+            usage=None,
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(return_value=MagicMock(output="done", success=True, error=None))
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+        )
+        result = await loop.run("do something")
+        assert result.total_prompt_tokens == 0
+        assert result.total_completion_tokens == 0

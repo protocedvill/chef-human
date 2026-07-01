@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +83,44 @@ class LlamaCppBackend(LLMBackend):
                 "completion_tokens": response["usage"]["completion_tokens"],
             },
         )
+
+    async def complete_stream(
+        self, request: CompletionRequest
+    ) -> AsyncGenerator[tuple[str, CompletionResponse | None], None]:
+        prompt = self.format_chatml(request)
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def _produce() -> None:
+            for token_dict in self._llm.create_completion(
+                prompt=prompt,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                stop=request.stop or ["<|im_end|>"],
+                stream=True,
+            ):
+                text = token_dict.get("choices", [{}])[0].get("text", "")
+                if text:
+                    queue.put_nowait(text)
+            queue.put_nowait(None)  # sentinel
+
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _produce)
+
+        full_content = ""
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            full_content += chunk
+            yield chunk, None
+
+        tool_calls = self.parse_tool_calls(full_content)
+        msg = Message(
+            role=Role.assistant,
+            content=self.strip_tool_calls(full_content),
+            tool_calls=tool_calls,
+        )
+        yield "", CompletionResponse(message=msg)
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         embeddings = []

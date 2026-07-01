@@ -197,3 +197,53 @@ class TestCreateBackend:
                     n_gpu_layers=24,
                     n_threads=4,
                 )
+
+
+class TestProjectConfig:
+    def test_find_project_config_not_found(self, tmp_path):
+        from chef_human.config import _find_project_config
+        assert _find_project_config(tmp_path) is None
+
+    def test_find_project_config_found(self, tmp_path):
+        from chef_human.config import _find_project_config
+        cfg_dir = tmp_path / ".chef-human"
+        cfg_dir.mkdir()
+        cfg_file = cfg_dir / "config.toml"
+        cfg_file.write_text("[chef_human]\nllm_backend = \"llamacpp\"\n")
+        found = _find_project_config(tmp_path)
+        assert found is not None
+        assert found == cfg_file
+
+    def test_find_project_config_walks_up(self, tmp_path):
+        from chef_human.config import _find_project_config
+        nested = tmp_path / "a" / "b" / "c"
+        nested.mkdir(parents=True)
+        cfg_dir = tmp_path / ".chef-human"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.toml").write_text("[chef_human]\n")
+        found = _find_project_config(nested)
+        assert found is not None
+
+    def test_project_config_merges_before_env(self):
+        from chef_human.config import load_settings
+        toml_data = {"llm_backend": "ollama", "temperature": 0.5}
+        with (
+            patch("chef_human.config._load_toml", return_value=toml_data),
+            patch("chef_human.config._load_env", return_value={}),
+            patch("chef_human.config._find_project_config", return_value=None),
+        ):
+            s = load_settings()
+            assert s.temperature == 0.5
+
+    def test_env_still_overrides_project_config(self):
+        from chef_human.config import load_settings
+        toml_data = {"llm_backend": "ollama"}
+        env_data = {"llm_backend": "llamacpp"}
+        project_data = {"llm_backend": "ollama"}
+        with (
+            patch("chef_human.config._load_toml", side_effect=[toml_data, project_data]),
+            patch("chef_human.config._load_env", return_value=env_data),
+            patch("chef_human.config._find_project_config", return_value=Path("proj.toml")),
+        ):
+            s = load_settings()
+            assert s.llm_backend == "llamacpp"

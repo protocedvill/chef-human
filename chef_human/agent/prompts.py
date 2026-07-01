@@ -44,7 +44,16 @@ When ALL steps of the plan are complete, call the `finish` tool.
 {plan_text}
 
 ## Available Tools
-{tool_definitions}"""
+{tool_definitions}
+
+## Notes / Scratchpad
+{scratchpad}
+
+Use the scratchpad to keep notes across turns — track assumptions,
+list sub-tasks, or remember file paths. Update it when your
+understanding changes. To update, start a line with "## Scratchpad:"
+followed by the new content. Only one scratchpad exists; each update
+replaces the previous content."""
 
 
 AGENT_FINISH_PROMPT = """
@@ -66,6 +75,7 @@ def build_agent_prompt(
     plan: Plan,
     tool_defs: list[ToolDefinition],
     repo_map: str = "",
+    scratchpad: str = "",
 ) -> str:
     from chef_human.agent.planner import Planner
 
@@ -76,4 +86,5 @@ def build_agent_prompt(
         repo_map=repo_map or "(no project context loaded)",
         plan_text=plan_text,
         tool_definitions=tool_text,
+        scratchpad=scratchpad or "(empty -- use ## Scratchpad: to add notes)",
     )

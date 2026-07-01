@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -58,6 +59,21 @@ class LLMBackend(ABC):
     @abstractmethod
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         ...
+
+    async def complete_stream(
+        self, request: CompletionRequest
+    ) -> AsyncGenerator[tuple[str, CompletionResponse | None], None]:
+        """Default streaming: yields entire response as a single chunk.
+
+        Subclasses (OllamaBackend, LlamaCppBackend) should override
+        for true token-by-token streaming.
+
+        Yields (token_chunk, None) for intermediate tokens, then
+        ("", CompletionResponse) for the final response.
+        """
+        resp = await self.complete(request)
+        yield resp.message.content, None
+        yield "", resp
 
     @abstractmethod
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:

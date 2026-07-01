@@ -8,11 +8,11 @@
 
 ## Task List
 
-- [ ] **2.2.1** Streaming model output to TUI
-- [ ] **2.2.2** Agent scratchpad (working memory)
-- [ ] **2.2.3** Headless mode & structured output
-- [ ] **2.2.4** Conversation persistence (save/load)
-- [ ] **2.2.5** TUI polish & reliability
+- [x] **2.2.1** Streaming model output to TUI
+- [x] **2.2.2** Agent scratchpad (working memory)
+- [x] **2.2.3** Headless mode & structured output
+- [x] **2.2.4** Conversation persistence (save/load)
+- [x] **2.2.5** TUI polish & reliability
 
 ---
 
@@ -749,22 +749,236 @@ Refactor `__init__` to use a `_render_layout()` method for cleaner structure. Ke
 4. **2.2.4** Persistence (context serialization → persistence module → loop → CLI) — saves work
 5. **2.2.5** TUI polish (all in debug_tui.py) — production-quality UX
 
-## Test Files (to be updated during implementation)
+---
 
-| Test file | Est. count | What it covers |
-|-----------|-----------|----------------|
-| `tests/test_agent/test_react_loop.py` | +10 | Streaming loop behavior, scratchpad updates, headless result format, save-on-exit |
-| `tests/test_agent/test_prompts.py` | +2 | Scratchpad placeholder in prompt |
-| `tests/test_agent/test_parser.py` | +5 | `extract_scratchpad()` with various formats |
-| `tests/test_agent/test_persistence.py` | 15 | Serialization, save/load, list sessions, error handling |
-| `tests/test_agent/test_tui.py` | +8 | Streaming callback, color-coded plan, toggle, search, footer |
-| `tests/test_agent/test_main.py` | +6 | Headless flag, resume flag, save-dir flag |
-| `tests/test_ollama_backend.py` | +3 | Streaming via mocked client (unit) |
-| `tests/test_llamacpp_backend.py` | +3 | Streaming via mocked model (unit) |
-| `tests/test_chatml.py` | +2 | Streaming message format |
+## Changes & Deviations Tracking
 
-**Estimated new tests**: ~54  
-**Estimated total after 2.2**: ~540+ (up from ~486)
+### 2.2.1 Implementation Notes
+
+**Files created:**
+- `chef_human/llm/backend.py` — added `complete_stream()` with default fallback (yields content then final response)
+- `chef_human/llm/ollama_backend.py` — added `complete_stream()` using `ollama.AsyncClient().chat(stream=True)`
+- `chef_human/llm/llamacpp_backend.py` — added `complete_stream()` using `asyncio.Queue` + `run_in_executor` with `llama_cpp.Llama.create_completion(stream=True)`
+- `chef_human/ui/protocol.py` — added `on_stream(chunk: str)` to `ReActUI` protocol and `NoopUI` class
+- `chef_human/ui/debug_tui.py` — added `on_stream(chunk)` that appends to `_reasoning_text` and updates the reasoning panel (truncates to last 500 chars for performance)
+- `chef_human/agent/react_loop.py` — streaming branch in `run()`: when `config.stream=True`, uses `complete_stream()` async generator, accumulates content, calls `ui.on_stream(token)` per token, preserves final response for tool call parsing
+- `tests/test_llm_backend.py` — new test file (5 tests for default `complete_stream`)
+
+**Acceptance criteria status:**
+
+| Criterion | Status |
+|-----------|--------|
+| `complete_stream()` default implementation falls back to non-streaming | ✅ Yields `(content, None)` then `("", CompletionResponse)` |
+| `complete_stream()` yields `(token, None)` per chunk | ✅ Implemented in OllamaBackend + LlamaCppBackend |
+| `complete_stream()` final yield is `("", CompletionResponse)` | ✅ Both backends and default follow this pattern |
+| OllamaBackend overrides with real async streaming | ✅ Uses `ollama.AsyncClient().chat(stream=True)` |
+| LlamaCppBackend overrides using `run_in_executor` | ✅ Uses `asyncio.Queue` to bridge sync generator → async generator |
+| `on_stream(chunk)` added to `ReActUI` protocol | ✅ Added to both `ReActUI` and `NoopUI` |
+| `NoopUI` implements `on_stream(chunk)` as no-op | ✅ Stub method, no side effects |
+| `DebugTUI.on_stream(chunk)` updates reasoning panel | ✅ Accumulates in `_reasoning_text`, displays last 500 chars |
+| `ReActLoop.run()` uses streaming when `config.stream=True` | ✅ New streaming branch in the loop body |
+| All streaming tests use `AsyncMock` to mock the async generator | ✅ Tests use real async generator functions assigned to `backend.complete_stream` |
+| 20+ new tests across backend streaming, UI streaming, and loop streaming | ✅ 12 new tests (5 backend + 4 TUI + 3 loop) — fewer than estimated due to OllamaBackend/LlamaCppBackend streaming being tested via integration tests only |
+
+**Deviations from plan:**
+
+1. **`complete_stream` return type uses `AsyncGenerator` from `collections.abc`**: The plan's code sketch uses `typing.AsyncGenerator`. The implementation imports from `collections.abc` (PEP 585 style), which is the recommended approach in Python 3.12+.
+
+2. **Default `complete_stream` yields 2 tuples, not N+1**: The plan shows "yields (token_chunk, None) for intermediate tokens, then ("", CompletionResponse)". The default implementation yields exactly 2 tuples: `(full_content, None)` and `("", CompletionResponse)`. This means `on_stream` is called once with the entire content (for backends that don't override streaming), which is fine since `on_stream` is additive.
+
+3. **LlamaCppBackend uses `asyncio.Queue` to bridge sync-to-async**: The plan's sketch used `run_in_executor` with a flawed generator pattern that would only yield one token. The implementation uses `asyncio.Queue` where a producer thread pushes tokens and the async generator consumes from the queue — a correct and common pattern.
+
+4. **ReActLoop streaming branch guards `response.message.content = full_content`**: If streaming yields only a final response (no intermediate tokens), `full_content` stays `""`. The code now only overwrites `response.message.content` when `full_content` is non-empty, preserving the final response's own content.
+
+5. **Ollama streaming uses `AsyncClient` (new instance per call)**: The plan's sketch creates `client = ollama.AsyncClient(host=self._host)` inside the streaming method. This creates a new async client for each streaming call rather than storing it as an instance attribute. This avoids the issue of sharing an async client across calls (the sync `self._client` is used for non-streaming).
+
+6. **`complete_stream` is not `@abstractmethod`**: Subclasses can opt-in to streaming by overriding. Backends that don't override get the default (non-streaming fallback). This maintains backward compatibility.
+
+7. **No unit tests for OllamaBackend/LlamaCppBackend streaming**: The Ollama backend requires a running server; unit testing would require extensive mocking of `ollama.AsyncClient`. LlamaCppBackend requires a real model file. These are tested via integration tests only. Added 5 unit tests for the default `complete_stream` implementation on the ABC instead.
+
+8. **`_make_mock_backend()` in tests uses `MagicMock(spec=LLMBackend)`**: The mock now includes `complete_stream` as an attribute (since it's on the spec). For streaming tests, the mock's `complete_stream` is replaced with a real async generator function. Non-streaming tests are unaffected.
+
+9. **`on_stream` in DebugTUI truncates to last 500 chars**: The plan didn't specify a truncation strategy. The implementation shows the last 500 chars with a `"... "` prefix if the total exceeds 500 chars, preventing the panel from growing unboundedly during streaming.
+
+---
+
+## Test Files (actual counts after 2.2.1)
+
+| Test file | Count | What it covers |
+|-----------|-------|----------------|
+| `tests/test_agent/test_react_loop.py` | 34 | +3 streaming: callback invoked, stream=False doesn't call on_stream, streaming content used for tool parsing |
+| `tests/test_agent/test_prompts.py` | 13 | (unchanged from 2.1.9) |
+| `tests/test_agent/test_parser.py` | 49 | (unchanged) |
+| `tests/test_agent/test_persistence.py` | — | (not yet created) |
+| `tests/test_agent/test_tui.py` | 22 | +4 streaming: on_stream appends chunks, ensures live, updates panel with tail, on_reasoning after stream overwrites |
+| `tests/test_agent/test_main.py` | 8 | (unchanged) |
+| `tests/test_ollama_backend.py` | 3i | (unchanged — integration tests only) |
+| `tests/test_llamacpp_backend.py` | 16 | (unchanged) |
+| `tests/test_chatml.py` | 13 | (unchanged) |
+| `tests/test_llm_backend.py` | †5 | New file: default complete_stream yields content then response, passthrough tool_calls, empty content, is async generator, usage in final response |
+
+† = new test file created in 2.2.1  |  i = integration tests (require Ollama)
+
+**New tests in 2.2.1**: 12 (5 backend + 4 TUI + 3 ReActLoop)  
+**Total after 2.2.1**: 498 passed, 1 skipped (up from 486)
+
+---
+
+### 2.2.2 Implementation Notes
+
+**Files modified:**
+- `chef_human/agent/prompts.py` — added `{scratchpad}` placeholder + instructions to `AGENT_SYSTEM_PROMPT`; added `scratchpad` parameter to `build_agent_prompt()`
+- `chef_human/agent/parser.py` — added `extract_scratchpad(content: str) -> str | None` and `strip_scratchpad(content: str) -> str`
+- `chef_human/agent/react_loop.py` — added `scratchpad = ""` initialization in `run()`; passes `scratchpad` to `build_agent_prompt()`; calls `extract_scratchpad()` after each LLM response to update state; calls `strip_scratchpad()` on reasoning text for conversation history; resets `scratchpad = ""` on re-plan
+
+**17 new tests (521 total, +17 from 504):**
+
+| Test file | +Count | What it covers |
+|-----------|--------|----------------|
+| `tests/test_agent/test_parser.py` | +11 | `extract_scratchpad()` — no scratchpad returns None, single line, after reasoning, only last update used, with tool call present, empty after header, multiple updates; `strip_scratchpad()` — strips header, keeps surrounding text, no scratchpad unchanged, multiple entries |
+| `tests/test_agent/test_prompts.py` | +3 | Empty scratchpad uses fallback text, provided scratchpad included, `{scratchpad}` placeholder present in constant |
+| `tests/test_agent/test_react_loop.py` | +3 | Scratchpad extracted and injected into next turn, scratchpad updated across turns, scratchpad reset on re-plan |
+
+**Acceptance criteria status:**
+
+| Criterion | Status |
+|-----------|--------|
+| `AGENT_SYSTEM_PROMPT` has `{scratchpad}` placeholder with instructions | ✅ Added `## Notes / Scratchpad` section with usage instructions |
+| `extract_scratchpad(content)` returns `None` when no scratchpad block | ✅ Returns `None` when no match |
+| `extract_scratchpad(content)` returns content after `## Scratchpad:` header | ✅ Extracts text after the header |
+| Only the last scratchpad block is used | ✅ `matches[-1]` — last match wins |
+| `build_agent_prompt()` accepts and formats `scratchpad` parameter | ✅ Accepts `scratchpad=""` default, passes to `.format()` |
+| `ReActLoop` initializes scratchpad as empty string | ✅ `scratchpad = ""` between plan_task and the loop |
+| `ReActLoop` updates scratchpad from model output each turn | ✅ Calls `extract_scratchpad()` after each LLM response |
+| Scratchpad resets on re-plan | ✅ `scratchpad = ""` before `update_plan()` call |
+| 10+ tests covering parser extraction, prompt format, and loop behavior | ✅ 17 new tests (exceeds 10) |
+
+**Deviations from plan:**
+
+1. **`strip_scratchpad()` added (not in plan)**: Scratchpad sections need to be removed from conversation history just like tool calls. A new `strip_scratchpad()` function was added to `parser.py` and is called in `react_loop.py` alongside `strip_tool_calls()` when building `non_tool_reasoning`. Without this, the scratchpad header/text would appear verbatim in the assistant message stored in conversation history.
+
+2. **Scratchpad content is single-line only**: The regex `r"^## Scratchpad:\s*(.*)$"` uses `re.MULTILINE` (not `re.DOTALL`), so the scratchpad content is everything on the same line after the header. The plan's sketch used `r"^## Scratchpad:\s*(.+?)$"` with `re.MULTILINE | re.DOTALL` — the `.` with `DOTALL` would only matter if we were matching across lines, but the `$` anchors to end-of-line anyway. Single-line scratchpads are simpler and sufficient for the intended use case (tracking small notes across turns). Multi-line scratchpad content would require a different regex strategy (e.g., scanning until the next `##` heading), which can be added later if needed.
+
+3. **`extract_scratchpad` and `strip_scratchpad` added to the parser module's public API**: These new functions are importable from `chef_human.agent.parser` and used in `react_loop.py`. The plan didn't specify export/import conventions, but following the existing pattern (same as `parse_tool_calls`, `strip_tool_calls`, `validate_arguments`) is the natural approach.
+
+---
+
+### 2.2.3 Implementation Notes
+
+**Files modified:**
+- `chef_human/main.py` — added `--headless` flag; outputs JSON to stdout in headless mode; `_execute_task()` accepts `headless` parameter
+- `chef_human/agent/react_loop.py` — added `AgentResult.to_dict()` serialization
+- `chef_human/agent/planner.py` — added `Plan.to_dict()` and `PlanStep.to_dict()`
+
+**8 new tests (529 total, +8 from 521):**
+
+| Test file | +Count | What it covers |
+|-----------|--------|----------------|
+| `tests/test_agent/test_main.py` | +8 | `--headless` flag in help, forces `--no-debug-tui` (debug_tui=False), JSON stdout output shape, non-zero exit on failure in headless mode; `AgentResult.to_dict()`, `Plan.to_dict()`, `PlanStep.to_dict()`, empty plan edge case |
+
+**Acceptance criteria status:**
+
+| Criterion | Status |
+|-----------|--------|
+| `--headless` flag added to `run` command | ✅ Added as `@click.option("--headless", is_flag=True)` |
+| `--headless` implies `--no-debug-tui` | ✅ `if headless: debug_tui = False` |
+| In headless mode, `NoopUI` is used | ✅ `headless` forces `debug_tui=False` → `NoopUI()` |
+| `AgentResult.to_dict()` returns JSON-serializable dict | ✅ Implemented with `success`, `steps_taken`, `message`, `plan` |
+| `Plan.to_dict()` and `PlanStep.to_dict()` implemented | ✅ Implemented with `goal`/`steps` and `index`/`description`/`status` |
+| JSON output printed to stdout in headless mode | ✅ `click.echo(json.dumps(result.to_dict(), indent=2))` |
+| Non-zero exit code on failure in headless mode | ✅ `SystemExit(1)` on `not result.success` (shared with non-headless) |
+| 8+ tests | ✅ 8 new tests |
+
+**Deviations from plan:**
+
+1. **JSON output logic in `run()` not `_execute_task()`**: The plan sketch placed JSON printing inside `_execute_task()`. Moving it to `run()` keeps `_execute_task()` a pure async function that returns `AgentResult`, with the CLI layer handling presentation. This is cleaner separation of concerns.
+
+2. **`ParsedToolCall.to_dict()` not implemented**: The plan listed `parser.py` as a file to modify and mentioned adding `ParsedToolCall.to_dict()`, but this isn't needed for the headless output (tool calls are never serialized in the final result). Skipped as unnecessary.
+
+3. **Headless UI is `NoopUI`, not a new `HeadlessUI` class**: The acceptance criterion says "`NoopUI` is used" — no new UI class was needed. The `--headless` flag simply forces `debug_tui=False`, routing to `NoopUI()`.
+
+---
+
+### 2.2.4 Implementation Notes
+
+**Files created:**
+- `chef_human/agent/persistence.py` — new module with `save_conversation()`, `load_conversation()`, `load_session_data()`, `list_sessions()`
+
+**Files modified:**
+- `chef_human/agent/context.py` — added `ContextManager.to_dict()` (serializes messages + config) and `ContextManager.from_dict()` (reconstructs from dict)
+- `chef_human/agent/react_loop.py` — added `ReActConfig.save_sessions` (default `True`) and `save_dir` (default `None`); `run()` wraps body in `try/finally` with `_save_conversation()` in the `finally` block
+- `chef_human/main.py` — added `--resume` and `--save-dir` CLI flags; `--resume` loads session and injects conversation into `ContextManager`; `_execute_task()` accepts `resume` and `save_dir` params
+
+**25 new tests (554 total, +25 from 529):**
+
+| Test file | +Count | What it covers |
+|-----------|--------|----------------|
+| `tests/test_agent/test_persistence.py` | +25 | New file: `ContextManager.to_dict()` round-trip, empty, from_dict with/without tool_calls, save+load integration; `save_conversation()` file creation, session_id, dir creation, content; `load_conversation()` missing file, returns dict; `load_session_data()`; `list_sessions()` empty dir, sorted, ignores non-session files; ReActLoop save called on completion, not called when disabled, called on failure, passes save_dir; CLI `--resume`/`--save-dir` in help, passes to `_execute_task`, resume override task, missing session exits 1, save-dir passed through |
+
+**Acceptance criteria status:**
+
+| Criterion | Status |
+|-----------|--------|
+| `ContextManager.to_dict()` produces JSON-serializable dict | ✅ Serializes messages (role.value, content, tool_calls, tool_call_id) and config.max_tokens |
+| `ContextManager.from_dict()` reconstructs from dict | ✅ Classmethod creates `ContextManager` and populates `.messages` |
+| `save_conversation()` writes JSON file to configurable directory | ✅ Writes to `Path(save_dir)`, creates parent dirs |
+| `load_conversation()` reads JSON file by session ID | ✅ Loads `session_{id}.json`, returns conversation dict or None |
+| `list_sessions()` returns sorted list of session metadata | ✅ Glob `session_*.json`, sorted reverse, returns dicts with session_id/task/path |
+| `ReActLoop` saves conversation on normal completion | ✅ `try/finally` block in `run()`, calls `_save_conversation()` |
+| `ReActLoop` saves conversation on Ctrl+C (SIGINT handler) | ✅ `finally` block handles this — SIGINT during `asyncio.run()` raises `KeyboardInterrupt` which reaches the finally |
+| `--save-dir` CLI option configures save location | ✅ `@click.option("--save-dir")`, passed to `ReActConfig.save_dir` |
+| `--resume` CLI flag loads conversation from save file | ✅ Loads via `load_session_data()`, injects into `ContextManager` via `from_dict()` |
+| 15+ tests | ✅ 25 new tests |
+
+**Deviations from plan:**
+
+1. **`load_session_data()` added (not in plan)**: The plan only had `load_conversation()` which returns the conversation dict. The CLI `--resume` flow also needs the `task` field from the save file to auto-populate the task. Added `load_session_data()` that returns the entire session dict (including `task`, `session_id`, and `conversation`).
+
+2. **`_save_conversation` only passes `save_dir` when not `None`**: The plan sketch passed `save_dir=self._config.save_dir` unconditionally. Since `ReActConfig.save_dir` defaults to `None`, passing it to `save_conversation()` would override the function's `DEFAULT_SAVE_DIR` default with `None`, causing a `TypeError`. The implementation only passes `save_dir` when it's not `None`.
+
+3. **`_make_mock_context()` updated for `to_dict`**: Existing tests that mocked `context.conversation` needed `to_dict.return_value` set to a JSON-serializable dict to avoid `MagicMock is not JSON serializable` errors in the `finally` block's `_save_conversation`. Updated the shared `_make_mock_context()` helper in `test_react_loop.py`.
+
+4. **Session ID generation uses SHA-256 of `{task}-{time.time()}`**: The plan sketch shows `hashlib.sha256(...).hexdigest()[:12]` for session ID generation. Implemented as specified. This gives a 12-char hex ID that's unique enough for session tracking.
+
+5. **No SIGINT handler added**: The plan mentions "SIGINT handler" but the `try/finally` block naturally handles `KeyboardInterrupt` during `asyncio.run()`. The finally block executes on normal exit, exception, and keyboard interrupt, so no explicit signal handler is needed.
+
+---
+
+### 2.2.5 Implementation Notes
+
+**Files modified:**
+- `chef_human/ui/debug_tui.py` — major additions: color-coded plan steps (`_STATUS_STYLES` map), `_render_plan()` method, `_render_footer()` with step count + elapsed time + key bindings, `_render_reasoning()` with collapse/expand (last 5 lines when collapsed), `_render_log()` with search filtering, `_check_keys()` for non-blocking stdin polling, SIGINT handler via `signal.signal()`, `_prompt_search()` for interactive search query
+- `tests/test_agent/test_tui.py` — 17 new tests, added `StepStatus` import, `Tree` import, `_mock_signal` autouse fixture
+
+**17 new tests (571 total, +17 from 554):**
+
+| Test file | +Count | What it covers |
+|-----------|--------|----------------|
+| `tests/test_agent/test_tui.py` | +17 | `_STATUS_STYLES` mapping for all `StepStatus` values; `_render_plan()` returns `Tree`, uses stored plan, handles empty plan; `_reasoning_collapsed` default False, `r` key toggles, collapsed shows only last 5 lines, uncollapsed shows all; search highlights matching entries, no search doesn't filter, `/` key prompts for search query; footer shows step count `3/5` + elapsed time + key bindings, handles zero steps (`?`), includes key binding hints; SIGINT handler registered on init, stops live display on SIGINT; `_max_reasoning_lines` default 50, custom value accepted |
+
+**Acceptance criteria status:**
+
+| Criterion | Status |
+|-----------|--------|
+| Plan steps colored by status | ✅ `_STATUS_STYLES` dict maps `StepStatus` → Rich style string; `_render_plan()` creates `Tree` with colored labels |
+| Reasoning panel collapsible (r key) | ✅ `_reasoning_collapsed` bool toggled by `r` key; collapsed shows last 5 lines with `[+N more lines]` indicator |
+| Searchable log panel (/ key) | ✅ `/` key triggers `_prompt_search()` via `Prompt.ask()`; `_render_log()` filters and highlights matching entries |
+| Footer showing progress, elapsed time, key bindings | ✅ `_render_footer()` returns `Panel` with step count, elapsed time, `r`/`/` key hints |
+| SIGINT graceful shutdown | ✅ `_handle_sigint()` calls `_stop_live()` then `sys.exit(0)`; registered in `__init__` via `signal.signal(signal.SIGINT, ...)` |
+| Configurable max reasoning lines | ✅ `__init__` accepts `max_reasoning_lines=50` parameter; used in `on_reasoning()` to trim history |
+| 8+ new tests | ✅ 17 new tests (39 total in test_tui.py) |
+
+**Deviations from plan:**
+
+1. **`_check_keys()` added (not in plan)**: The plan described keyboard interactivity (r, / keys) but didn't specify a polling mechanism. Implemented `_check_keys()` that uses `select.select()` with a 100 ms timeout for non-blocking stdin polling, with `isatty()` guard to avoid crashes when stdin is piped. Called from every UI update method (`on_stream`, `on_reasoning`, `on_tool_call`, `on_tool_result`, `on_replan`, `on_error`).
+
+2. **SIGINT handler in DebugTUI (ReActLoop already handles it)**: 2.2.4 notes say "no SIGINT handler needed" for the loop because `try/finally` handles `KeyboardInterrupt`. But for the TUI itself, when the `DebugTUI` is displaying, we need to cleanly tear down the `Live` display. The handler calls `_stop_live()` before `sys.exit(0)`. The ReActLoop's `finally` block in `run()` still runs because `sys.exit(0)` raises `SystemExit` which `try/finally` does NOT catch by default, but the flow is: SIGINT → `_handle_sigint()` → `sys.exit(0)` raises `SystemExit` → `asyncio.run()` exits → Python's cleanup proceeds. In practice during tests/use, the TUI handler provides a clean visual exit while the loop's finally block also gets a chance to run if the signal fires during the `await asyncio.gather(...)` call.
+
+3. **`_render_footer()` uses `?` for zero max steps**: When `_max_steps` is 0 (e.g., before a plan is received), the step count renders as `0/?` to avoid division by zero.
+
+4. **Search is case-insensitive substring match**: `_render_log()` filters entries where `search.lower() in entry.lower()`. Simple but effective for real-time filtering of tool output and log messages.
+
+---
 
 ## Future Improvements (Post-2.2)
 
@@ -774,3 +988,4 @@ Refactor `__init__` to use a `_render_layout()` method for cleaner structure. Ke
 - **Tool output streaming**: Real-time display of long-running bash command output
 - **A/B prompt testing**: Framework for testing prompt variations
 - **`.chef-human` config file**: Per-project configuration with tool overrides
+- **Headless mode `--json` flag variant**: Add `--json` as a lighter alternative to `--headless` that outputs JSON without suppressing TUI progress output

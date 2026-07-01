@@ -359,3 +359,90 @@ class TestStripToolCalls:
         )
         result = strip_tool_calls(content)
         assert result == "text end"
+
+
+class TestExtractScratchpad:
+    def test_no_scratchpad_returns_none(self):
+        from chef_human.agent.parser import extract_scratchpad
+        assert extract_scratchpad("Just reasoning text") is None
+
+    def test_extracts_single_line(self):
+        from chef_human.agent.parser import extract_scratchpad
+        result = extract_scratchpad("## Scratchpad: The bug is in parser.py")
+        assert result == "The bug is in parser.py"
+
+    def test_extracts_after_reasoning(self):
+        from chef_human.agent.parser import extract_scratchpad
+        content = "Let me check the file.\n## Scratchpad: File is at src/main.py"
+        result = extract_scratchpad(content)
+        assert result == "File is at src/main.py"
+
+    def test_only_last_update_is_used(self):
+        from chef_human.agent.parser import extract_scratchpad
+        content = (
+            "## Scratchpad: first thought\n"
+            "some reasoning\n"
+            "## Scratchpad: second thought\n"
+        )
+        result = extract_scratchpad(content)
+        assert result == "second thought"
+
+    def test_with_tool_call_present(self):
+        from chef_human.agent.parser import extract_scratchpad
+        content = (
+            "Let me read the file.\n"
+            "## Scratchpad: path is src/main.py\n"
+            '<tool_call>{"name": "read", "arguments": {"path": "src/main.py"}}</tool_call>'
+        )
+        result = extract_scratchpad(content)
+        assert result == "path is src/main.py"
+
+    def test_empty_after_header(self):
+        from chef_human.agent.parser import extract_scratchpad
+        result = extract_scratchpad("## Scratchpad:  ")
+        assert result == ""
+
+    def test_multiple_updates_in_same_turn(self):
+        from chef_human.agent.parser import extract_scratchpad
+        content = (
+            "## Scratchpad: path is src/main.py\n"
+            '<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>\n'
+            "The file shows different content.\n"
+            "## Scratchpad: path is actually x.py\n"
+        )
+        result = extract_scratchpad(content)
+        assert result == "path is actually x.py"
+
+
+class TestStripScratchpad:
+    def test_strips_scratchpad_header(self):
+        from chef_human.agent.parser import strip_scratchpad
+        result = strip_scratchpad("## Scratchpad: some notes")
+        assert result == ""
+
+    def test_keeps_surrounding_text(self):
+        from chef_human.agent.parser import strip_scratchpad
+        content = "Reasoning here\n## Scratchpad: note\nMore reasoning"
+        result = strip_scratchpad(content)
+        assert "Reasoning here" in result
+        assert "More reasoning" in result
+        assert "Scratchpad" not in result
+
+    def test_no_scratchpad_unchanged(self):
+        from chef_human.agent.parser import strip_scratchpad
+        content = "Just plain text"
+        result = strip_scratchpad(content)
+        assert result == "Just plain text"
+
+    def test_strips_multiple_scratchpad_entries(self):
+        from chef_human.agent.parser import strip_scratchpad
+        content = (
+            "## Scratchpad: first\n"
+            "middle\n"
+            "## Scratchpad: second\n"
+            "end"
+        )
+        result = strip_scratchpad(content)
+        assert "Scratchpad" not in result
+        assert "middle" in result
+        assert "end" in result

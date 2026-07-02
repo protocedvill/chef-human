@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from chef_human.tools.registry import Tool, ToolResult
+from chef_human.tools.diff import compute_diff, find_closest_match
+from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
     from chef_human.agent.workspace import WorkspaceManager
+    from chef_human.tools.diff import DiffStore
 
 
 class ReadTool:
@@ -71,14 +72,22 @@ class WriteTool:
         "required": ["path", "content"],
     }
 
-    def __init__(self, workspace: WorkspaceManager) -> None:
+    def __init__(self, workspace: WorkspaceManager, diff_store: DiffStore | None = None) -> None:
         self._workspace = workspace
+        self._diff_store = diff_store
 
     async def run(self, path: str, content: str) -> ToolResult:
         resolved = self._workspace.resolve(path)
 
         if not self._workspace.is_within_workspace(resolved):
             return ToolResult(success=False, error=f"Outside workspace: {path}")
+
+        old_content: str | None = None
+        if resolved.exists():
+            try:
+                old_content = resolved.read_text(encoding="utf-8")
+            except Exception:
+                old_content = None
 
         resolved.parent.mkdir(parents=True, exist_ok=True)
 
@@ -88,12 +97,21 @@ class WriteTool:
             return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
 
         lines = content.count("\n") + 1
-        return ToolResult(output=f"Wrote {lines} lines to {path}")
+        output_parts: list[str] = [f"Wrote {lines} lines to {path}"]
+
+        if old_content is not None:
+            diff = compute_diff(old_content, content, path=path)
+            if diff:
+                output_parts.append(diff)
+                if self._diff_store:
+                    self._diff_store.record(path, diff, "write", old_content=old_content, new_content=content)
+
+        return ToolResult(output="\n".join(output_parts))
 
 
 class EditTool:
     name = "edit"
-    description = "Find-and-replace text in a file"
+    description = "Find-and-replace text in a file (supports fuzzy matching)"
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -101,14 +119,23 @@ class EditTool:
             "old_string": {"type": "string", "description": "Text to replace"},
             "new_string": {"type": "string", "description": "Replacement text"},
             "replace_all": {"type": "boolean", "description": "Replace all occurrences", "default": False},
+            "fuzzy": {"type": "boolean", "description": "Enable fuzzy matching if exact match fails", "default": True},
         },
         "required": ["path", "old_string", "new_string"],
     }
 
-    def __init__(self, workspace: WorkspaceManager) -> None:
+    def __init__(self, workspace: WorkspaceManager, diff_store: DiffStore | None = None) -> None:
         self._workspace = workspace
+        self._diff_store = diff_store
 
-    async def run(self, path: str, old_string: str, new_string: str, replace_all: bool = False) -> ToolResult:
+    async def run(
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+        fuzzy: bool = True,
+    ) -> ToolResult:
         resolved = self._workspace.resolve(path)
 
         if not resolved.exists():
@@ -118,25 +145,53 @@ class EditTool:
             return ToolResult(success=False, error=f"Outside workspace: {path}")
 
         try:
-            content = resolved.read_text(encoding="utf-8")
+            old_content = resolved.read_text(encoding="utf-8")
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot read {path}: {exc}")
 
-        if old_string not in content:
-            return ToolResult(success=False, error=f"old_string not found in {path}")
+        matched_old = old_string
+        fuzzy_note = ""
 
-        count = content.count(old_string)
+        if old_string not in old_content:
+            if not fuzzy:
+                return ToolResult(success=False, error=f"old_string not found in {path}")
+
+            match = find_closest_match(old_string, old_content)
+            if match is None:
+                return ToolResult(
+                    success=False,
+                    error=f"old_string not found in {path} (fuzzy: no close match found)",
+                )
+
+            matched_old = match.matched_text
+            fuzzy_note = (
+                f"Note: fuzzy match used (ratio: {match.ratio:.2f}, "
+                f"lines {match.start_line}-{match.end_line}).\n"
+            )
+
+        count = old_content.count(matched_old)
         if replace_all:
-            new_content = content.replace(old_string, new_string)
+            new_content = old_content.replace(matched_old, new_string)
         else:
-            new_content = content.replace(old_string, new_string, 1)
+            new_content = old_content.replace(matched_old, new_string, 1)
 
         try:
             resolved.write_text(new_content, encoding="utf-8")
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
 
-        return ToolResult(output=f"Applied edit to {path} ({count} occurrence{'s' if count != 1 else ''})")
+        output_parts: list[str] = []
+        output_parts.append(f"Applied edit to {path} ({count} occurrence{'s' if count != 1 else ''})")
+        if fuzzy_note:
+            output_parts.append(fuzzy_note.rstrip())
+
+        diff = compute_diff(old_content, new_content, path=path)
+        if diff:
+            output_parts.append(diff)
+            if self._diff_store:
+                self._diff_store.record(path, diff, "edit")
+
+        return ToolResult(output="\n".join(output_parts))
 
 
 class GrepTool:

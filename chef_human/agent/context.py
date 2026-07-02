@@ -8,7 +8,11 @@ from chef_human.llm.tokenizer import Tokenizer, create_tokenizer
 
 if TYPE_CHECKING:
     from chef_human.agent.file_context import FileContextManager
+    from chef_human.agent.rag.retriever import RAGRetriever
     from chef_human.agent.repo_map import RepoMap
+    from chef_human.agent.symbols.dependencies import DependencyGraph
+    from chef_human.agent.symbols.index import SymbolIndex
+    from chef_human.agent.symbols.retriever import SymbolRetriever
     from chef_human.agent.workspace import WorkspaceManager
 
 
@@ -95,11 +99,19 @@ class ContextAssembler:
         workspace: WorkspaceManager,
         file_context: FileContextManager,
         repo_map: RepoMap,
+        symbol_index: SymbolIndex | None = None,
+        dep_graph: DependencyGraph | None = None,
+        symbol_retriever: SymbolRetriever | None = None,
+        rag_retriever: RAGRetriever | None = None,
     ) -> None:
         self._conversation = conversation
         self._workspace = workspace
         self._file_context = file_context
         self._repo_map = repo_map
+        self._symbol_index = symbol_index
+        self._dep_graph = dep_graph
+        self._symbol_retriever = symbol_retriever
+        self._rag_retriever = rag_retriever
 
     @property
     def conversation(self) -> ContextManager:
@@ -108,6 +120,14 @@ class ContextAssembler:
     @property
     def workspace(self) -> WorkspaceManager:
         return self._workspace
+
+    @property
+    def symbol_index(self) -> SymbolIndex | None:
+        return self._symbol_index
+
+    @property
+    def file_context(self) -> FileContextManager:
+        return self._file_context
 
     def assemble(
         self,
@@ -158,8 +178,54 @@ class ContextAssembler:
                 Message(role=Role.system, content=f"## File Context\n\n{file_text}")
             )
 
+        if self._rag_retriever and conversation_messages and remaining > 500:
+            rag_text = self._build_rag_context(conversation_messages, remaining)
+            if rag_text:
+                messages.append(
+                    Message(role=Role.system, content=f"## Related Code\n\n{rag_text}")
+                )
+        elif self._symbol_retriever and conversation_messages and remaining > 500:
+            symbol_text = self._build_symbol_context(conversation_messages, remaining)
+            if symbol_text:
+                messages.append(
+                    Message(role=Role.system, content=f"## Related Symbols\n\n{symbol_text}")
+                )
+
         messages.extend(conversation_messages)
         return messages
+
+    def _build_symbol_context(
+        self, conversation_messages: list[Message], budget: int
+    ) -> str:
+        retriever = self._symbol_retriever
+        assert retriever is not None
+        recent = " ".join(
+            m.content for m in conversation_messages[-4:] if m.role != Role.system
+        )
+        names = retriever.detect_symbol_references(recent)
+
+        sections: list[str] = []
+        for name in names[:5]:
+            defn = retriever.retrieve(name)
+            if defn:
+                tokens = self._conversation.tokenizer.count(defn)
+                if tokens <= budget:
+                    sections.append(defn)
+                    budget -= tokens
+        return "\n\n".join(sections)
+
+    def _build_rag_context(
+        self, conversation_messages: list[Message], budget: int
+    ) -> str:
+        retriever = self._rag_retriever
+        assert retriever is not None
+        recent = " ".join(
+            m.content for m in conversation_messages[-4:] if m.role != Role.system
+        )
+        chunks = retriever.retrieve(recent, top_k=5)
+        if not chunks:
+            return ""
+        return retriever.format_for_prompt(chunks, budget)
 
     def _build_file_context(self) -> str:
         sections: list[str] = []

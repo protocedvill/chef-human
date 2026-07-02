@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from chef_human.agent import create_context_assembler
 from chef_human.agent.context import ContextAssembler, ContextConfig, ContextManager, Role
 from chef_human.agent.file_context import FileContextManager
 from chef_human.agent.repo_map import RepoMap
-from chef_human.agent.symbols.extractor import RegexExtractor, Symbol, create_extractor
+from chef_human.agent.symbols.extractor import CompositeExtractor, RegexExtractor, create_extractor
 from chef_human.agent.workspace import WorkspaceManager
 from chef_human.llm.tokenizer import ApproxTokenizer, create_tokenizer
+from chef_human.tools import create_tool_registry
+from chef_human.tools.view_diff import ViewDiffTool
 
 
 # ---------------------------------------------------------------------------
@@ -90,9 +90,9 @@ class TestEndToEnd:
 # ---------------------------------------------------------------------------
 
 class TestFactoryEdgeCases:
-    def test_create_extractor_fallback(self):
+    def test_create_extractor_returns_composite(self):
         extractor = create_extractor()
-        assert isinstance(extractor, RegexExtractor)
+        assert isinstance(extractor, CompositeExtractor)
 
     def test_create_tokenizer_fallback(self):
         tokenizer = create_tokenizer()
@@ -118,3 +118,41 @@ class TestSymbolExtractorIntegration:
         assert len(symbols) == 2
         assert symbols[0].name == "foo"
         assert symbols[1].name == "Bar"
+
+
+# ---------------------------------------------------------------------------
+# Tool registry integration (Phase 3.3)
+# ---------------------------------------------------------------------------
+
+class TestDiffToolRegistry:
+    def test_view_diff_tool_registered(self, tmp_path: Path):
+        ws = WorkspaceManager(root=tmp_path)
+        registry = create_tool_registry(ws)
+        tool = registry.get("view_diff")
+        assert tool is not None
+        assert isinstance(tool, ViewDiffTool)
+
+    def test_edit_tool_has_diff_store(self, tmp_path: Path):
+        ws = WorkspaceManager(root=tmp_path)
+        registry = create_tool_registry(ws)
+        tool = registry.get("edit")
+        assert tool is not None
+        assert hasattr(tool, "_diff_store")
+        assert tool._diff_store is not None
+
+    def test_write_tool_has_diff_store(self, tmp_path: Path):
+        ws = WorkspaceManager(root=tmp_path)
+        registry = create_tool_registry(ws)
+        tool = registry.get("write")
+        assert tool is not None
+        assert hasattr(tool, "_diff_store")
+        assert tool._diff_store is not None
+
+    def test_diff_store_shared_across_tools(self, tmp_path: Path):
+        ws = WorkspaceManager(root=tmp_path)
+        registry = create_tool_registry(ws)
+        edit_tool = registry.get("edit")
+        write_tool = registry.get("write")
+        view_tool = registry.get("view_diff")
+        assert edit_tool._diff_store is write_tool._diff_store
+        assert edit_tool._diff_store is view_tool._store

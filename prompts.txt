@@ -4,4 +4,4 @@ Ask me questions when debating significant design choices.
 Create the plan for part 2.1. Put it in plan_2.1.md. Ask me questions when debating design choices. Include lots of details, and todo action items.
 
 
-Build part 2.2.2 of plan_2.2.md. Additionally, take note of any changes, temporary stopgap measures, or things which should be fixed in the future and update plan_2.2.md to contain them.
+Build part 3.1.1 of plan_3.1.md. Additionally, take note of any changes, temporary stopgap measures, or things which should be fixed in the future and update plan_3.1.md to contain them.

@@ -26,6 +26,9 @@ class TestSettings:
         assert s.workspace == ""
         assert s.max_tool_retries == 3
         assert s.max_agent_steps == 25
+        assert s.persist_index is True
+        assert s.watch_files is False
+        assert s.watch_interval == 2.0
 
     def test_frozen(self):
         s = Settings()

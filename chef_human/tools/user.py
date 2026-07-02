@@ -4,7 +4,7 @@ import logging
 import sys
 from typing import Any
 
-from chef_human.tools.registry import Tool, ToolResult
+from chef_human.tools.registry import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,10 @@ class AskUserTool:
 
     async def run(self, question: str) -> ToolResult:
         logger.info("User asked: %s", question)
+        if not sys.stdin.isatty():
+            return ToolResult(
+                output="[no-tty] Cannot ask user in non-interactive mode. Continuing without answer."
+            )
         print(f"\n[Agent asks]: {question}")
         print("[Type your response, or 'skip' to continue without answering]: ", end="", flush=True)
         try:

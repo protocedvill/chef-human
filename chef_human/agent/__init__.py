@@ -57,6 +57,7 @@ def _build_rag_context_assembler(
         file_context=file_ctx,
         repo_map=repo_map,
         rag_retriever=rag_retriever,
+        symbol_index=symbol_index,
     )
 
 
@@ -185,7 +186,10 @@ def create_agent(
         dep_graph=context.dep_graph,
     )
     planner = Planner(llm_backend=backend)
-    config = ReActConfig(max_steps=max_steps)
+    config = ReActConfig(
+        max_steps=max_steps,
+        tool_timeout=settings.tool_timeout,
+    )
     ui = DebugTUI() if debug_tui else NoopUI()
 
     loop = ReActLoop(

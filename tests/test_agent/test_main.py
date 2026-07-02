@@ -47,10 +47,72 @@ class TestCLIStructure:
             mock_exec.assert_awaited_once()
             assert mock_exec.call_args[1]["task"] == "list files"
 
-    def test_interactive_mode_prompts_for_task(self, runner):
+    def test_json_flag_in_help(self, runner):
+        from chef_human.main import cli
+
+        result = runner.invoke(cli, ["run", "--help"])
+        assert result.exit_code == 0
+        assert "--json" in result.output
+
+    def test_json_flag_outputs_json_after_rich(self, runner):
         from chef_human.main import cli
 
         with patch("chef_human.main._execute_task", new_callable=AsyncMock) as mock_exec:
+            mock_exec.return_value = AgentResult(
+                plan=Plan(goal="test", steps=[]),
+                steps_taken=1,
+                message="Done",
+                success=True,
+            )
+            result = runner.invoke(cli, ["run", "test", "--json"])
+            assert result.exit_code == 0
+            import json
+            json_start = result.output.index("{")
+            data = json.loads(result.output[json_start:])
+            assert data["success"] is True
+            assert data["message"] == "Done"
+
+    def test_json_headless_precedence(self, runner):
+        from chef_human.main import cli
+
+        with patch("chef_human.main._execute_task", new_callable=AsyncMock) as mock_exec:
+            mock_exec.return_value = AgentResult(
+                plan=Plan(goal="test", steps=[]),
+                steps_taken=1,
+                message="Done",
+                success=True,
+            )
+            result = runner.invoke(cli, ["run", "test", "--headless", "--json"])
+            assert result.exit_code == 0
+            import json
+            data = json.loads(result.output)
+            assert data["success"] is True
+
+    def test_stdin_pipe_reads_task(self, runner):
+        from chef_human.main import cli
+
+        with (
+            patch("chef_human.main._execute_task", new_callable=AsyncMock) as mock_exec,
+            patch("sys.stdin.isatty", return_value=False),
+        ):
+            mock_exec.return_value = AgentResult(
+                plan=Plan(goal="test", steps=[]),
+                steps_taken=1,
+                message="Done",
+                success=True,
+            )
+            result = runner.invoke(cli, ["run"], input="task from stdin\n")
+            assert result.exit_code == 0
+            mock_exec.assert_awaited_once()
+            assert mock_exec.call_args[1]["task"] == "task from stdin"
+
+    def test_interactive_mode_prompts_for_task(self, runner):
+        from chef_human.main import cli
+
+        with (
+            patch("chef_human.main._execute_task", new_callable=AsyncMock) as mock_exec,
+            patch("sys.stdin.isatty", return_value=True),
+        ):
             mock_exec.return_value = AgentResult(
                 plan=Plan(goal="test", steps=[]),
                 steps_taken=1,
@@ -62,12 +124,47 @@ class TestCLIStructure:
             mock_exec.assert_awaited_once()
             assert mock_exec.call_args[1]["task"] == "hello"
 
-    def test_interactive_mode_exits_on_empty_task(self, runner):
+    def test_no_task_exits(self, runner):
         from chef_human.main import cli
 
-        result = runner.invoke(cli, ["run"], input="\n")
-        assert result.exit_code == 0
-        assert "No task provided" in result.output
+        with patch("sys.stdin.isatty", return_value=False):
+            result = runner.invoke(cli, ["run"], input="\n")
+            assert result.exit_code == 0
+            assert "No task provided" in result.output
+
+    def test_main_routes_inline_task(self):
+        with (
+            patch("chef_human.main.cli") as mock_cli,
+        ):
+            import sys
+            from chef_human.main import main
+            with patch.object(sys, "argv", ["chef-human", "fix this bug"]):
+                main()
+                mock_cli.assert_called_once()
+
+    def test_main_does_not_route_known_subcommands(self):
+        import sys
+        from chef_human.main import main
+
+        with patch("chef_human.main.cli") as mock_cli:
+            with patch.object(sys, "argv", ["chef-human", "run", "--help"]):
+                main()
+            with patch.object(sys, "argv", ["chef-human", "repl"]):
+                main()
+            with patch.object(sys, "argv", ["chef-human", "session", "list"]):
+                main()
+        assert mock_cli.call_count == 3
+
+    def test_main_routes_help_without_insertion(self):
+        import sys
+        from chef_human.main import main
+
+        with (
+            patch("chef_human.main.cli") as mock_cli,
+        ):
+            with patch.object(sys, "argv", ["chef-human", "--help"]):
+                main()
+            mock_cli.assert_called_once()
 
     def test_non_zero_exit_on_failure(self, runner):
         from chef_human.main import cli
@@ -178,7 +275,140 @@ class TestCLIStructure:
             assert data["success"] is False
             assert data["message"] == "Failed"
 
+    # ── 5.1.5 Configuration Overrides ─────────────────────────────────
 
+    def test_run_model_flag_in_help(self, runner):
+        from chef_human.main import cli
+
+        result = runner.invoke(cli, ["run", "--help"])
+        assert result.exit_code == 0
+        assert "--model" in result.output
+
+    def test_run_temperature_flag_in_help(self, runner):
+        from chef_human.main import cli
+
+        result = runner.invoke(cli, ["run", "--help"])
+        assert result.exit_code == 0
+        assert "--temperature" in result.output
+
+    def test_run_config_flag_in_help(self, runner):
+        from chef_human.main import cli
+
+        result = runner.invoke(cli, ["run", "--help"])
+        assert result.exit_code == 0
+        assert "--config" in result.output
+
+    def test_show_config_command_in_help(self, runner):
+        from chef_human.main import cli
+
+        result = runner.invoke(cli, ["--help"])
+        assert result.exit_code == 0
+        assert "show-config" in result.output
+
+    def test_show_config_displays_settings(self, runner):
+        from chef_human.main import cli
+
+        result = runner.invoke(cli, ["show-config"])
+        assert result.exit_code == 0
+        assert "ollama_model" in result.output
+        assert "temperature" in result.output
+
+    def test_model_flag_passed_to_execute_task(self, runner):
+        from chef_human.main import cli
+
+        with patch("chef_human.main._execute_task", new_callable=AsyncMock) as mock_exec:
+            mock_exec.return_value = AgentResult(
+                plan=Plan(goal="test", steps=[]),
+                steps_taken=1,
+                message="Done",
+                success=True,
+            )
+            result = runner.invoke(cli, ["run", "test", "--model", "llama3"])
+            assert result.exit_code == 0
+            kwargs = mock_exec.call_args[1]
+            assert kwargs["model"] == "llama3"
+
+    def test_temperature_flag_passed_to_execute_task(self, runner):
+        from chef_human.main import cli
+
+        with patch("chef_human.main._execute_task", new_callable=AsyncMock) as mock_exec:
+            mock_exec.return_value = AgentResult(
+                plan=Plan(goal="test", steps=[]),
+                steps_taken=1,
+                message="Done",
+                success=True,
+            )
+            result = runner.invoke(cli, ["run", "test", "--temperature", "0.5"])
+            assert result.exit_code == 0
+            kwargs = mock_exec.call_args[1]
+            assert kwargs["temperature"] == 0.5
+
+    def test_config_flag_passed_to_execute_task(self, runner):
+        from chef_human.main import cli
+        import tempfile, os
+
+        with tempfile.NamedTemporaryFile(suffix=".toml", delete=False) as f:
+            f.write(b"[chef_human]\n")
+            cfg_path = f.name
+        try:
+            with patch("chef_human.main._execute_task", new_callable=AsyncMock) as mock_exec:
+                mock_exec.return_value = AgentResult(
+                    plan=Plan(goal="test", steps=[]),
+                    steps_taken=1,
+                    message="Done",
+                    success=True,
+                )
+                result = runner.invoke(cli, ["run", "test", "--config", cfg_path])
+                assert result.exit_code == 0
+                kwargs = mock_exec.call_args[1]
+                assert kwargs["config_path"] == cfg_path
+        finally:
+            os.unlink(cfg_path)
+
+    def test_repl_model_flag_in_help(self, runner):
+        from chef_human.main import cli
+
+        result = runner.invoke(cli, ["repl", "--help"])
+        assert result.exit_code == 0
+        assert "--model" in result.output
+
+
+class TestResolveSettings:
+    def test_returns_global_settings_without_overrides(self):
+        from chef_human.main import _resolve_settings
+
+        result = _resolve_settings(model=None, temperature=None, config_path=None)
+        from chef_human.config import settings
+        assert result is settings
+
+    def test_overrides_model(self):
+        from chef_human.main import _resolve_settings
+
+        result = _resolve_settings(model="llama3", temperature=None, config_path=None)
+        from chef_human.config import Settings
+        assert isinstance(result, Settings)
+        assert result.ollama_model == "llama3"
+
+    def test_overrides_temperature(self):
+        from chef_human.main import _resolve_settings
+
+        result = _resolve_settings(model=None, temperature=0.5, config_path=None)
+        assert result.temperature == 0.5
+
+    def test_overrides_both(self):
+        from chef_human.main import _resolve_settings
+
+        result = _resolve_settings(model="llama3", temperature=0.5, config_path=None)
+        assert result.ollama_model == "llama3"
+        assert result.temperature == 0.5
+
+    def test_does_not_mutate_global_settings(self):
+        from chef_human.main import _resolve_settings
+        from chef_human.config import settings
+
+        original_model = settings.ollama_model
+        _resolve_settings(model="llama3", temperature=None, config_path=None)
+        assert settings.ollama_model == original_model
 
 
 class TestToDict:
@@ -393,3 +623,78 @@ class TestSessionCLI:
             assert result.exit_code == 0
             assert "# Session: abc123" in result.output
             assert "Hello" in result.output
+
+    # ── 5.1.6 Session Management Improvements ─────────────────────────
+
+    def test_session_list_shows_dates(self, runner):
+        from chef_human.main import cli
+
+        sessions = [
+            {"session_id": "abc123", "task": "do something", "created": 1000000},
+        ]
+        with patch("chef_human.main.list_sessions", return_value=sessions):
+            result = runner.invoke(cli, ["session", "list"])
+            assert result.exit_code == 0
+            assert "abc123" in result.output
+
+    def test_session_list_sorts_by_mtime(self, runner):
+        from chef_human.main import cli
+
+        sessions = [
+            {"session_id": "newer", "task": "b", "created": 2000},
+            {"session_id": "older", "task": "a", "created": 1000},
+        ]
+        with patch("chef_human.main.list_sessions", return_value=sessions):
+            result = runner.invoke(cli, ["session", "list"])
+            assert result.exit_code == 0
+            newer_pos = result.output.index("newer")
+            older_pos = result.output.index("older")
+            assert newer_pos < older_pos
+
+    def test_default_save_dir_is_project_relative(self):
+        from chef_human.agent.persistence import DEFAULT_SAVE_DIR
+        assert ".chef-human" in str(DEFAULT_SAVE_DIR)
+        assert "sessions" in str(DEFAULT_SAVE_DIR)
+
+    def test_save_conversation_includes_created_timestamp(self):
+        from chef_human.agent.persistence import save_conversation, load_session_data
+        import tempfile, os
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = save_conversation(
+                {"messages": []}, task="test", save_dir=tmpdir
+            )
+            data = load_session_data(path.stem.split("_", 1)[1], save_dir=tmpdir)
+            assert data is not None
+            assert "created" in data
+            assert isinstance(data["created"], (int, float))
+            assert data["created"] > 0
+
+    def test_continue_alias_in_run_help(self, runner):
+        from chef_human.main import cli
+
+        result = runner.invoke(cli, ["run", "--help"])
+        assert result.exit_code == 0
+        assert "--continue" in result.output
+
+    def test_continue_alias_in_repl_help(self, runner):
+        from chef_human.main import cli
+
+        result = runner.invoke(cli, ["repl", "--help"])
+        assert result.exit_code == 0
+        assert "--continue" in result.output
+
+    def test_continue_passed_as_resume(self, runner):
+        from chef_human.main import cli
+
+        with patch("chef_human.main._execute_task", new_callable=AsyncMock) as mock_exec:
+            mock_exec.return_value = AgentResult(
+                plan=Plan(goal="test", steps=[]),
+                steps_taken=1,
+                message="Done",
+                success=True,
+            )
+            with patch("chef_human.main.load_session_data", return_value=None):
+                result = runner.invoke(cli, ["run", "test", "--continue", "abc123"])
+                assert result.exit_code == 1
+                assert "not found" in result.output

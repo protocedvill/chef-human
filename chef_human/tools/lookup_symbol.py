@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any
 from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
-    from chef_human.agent.symbols.index import SymbolIndex
+    from chef_human.agent.symbols.index import IndexEntry, SymbolIndex
     from chef_human.agent.workspace import WorkspaceManager
 
 
@@ -53,6 +53,21 @@ class LookupSymbolTool:
 
         if name is not None:
             entries = self._symbol_index.lookup(name)
+            if not entries:
+                similar = self._symbol_index.find_similar(name)
+                if similar:
+                    header = (
+                        f"No exact match for '{name}'. Found similarly-named symbols "
+                        "that may already do what you need — check these before writing "
+                        "new code:"
+                    )
+                    return ToolResult(output=header + "\n" + self._format(similar))
+                return ToolResult(
+                    output=(
+                        f"No symbol named '{name}' or anything similar exists in this "
+                        "codebase. There is nothing to reuse — implement it from scratch."
+                    )
+                )
         elif prefix is not None:
             entries = self._symbol_index.lookup_by_prefix(prefix)
         else:
@@ -61,6 +76,9 @@ class LookupSymbolTool:
         if not entries:
             return ToolResult(output="No symbols found.")
 
+        return ToolResult(output=self._format(entries))
+
+    def _format(self, entries: list[IndexEntry]) -> str:
         lines: list[str] = []
         for entry in entries[:50]:
             rel = entry.file_path
@@ -77,4 +95,4 @@ class LookupSymbolTool:
         output = "\n".join(lines)
         if len(entries) > 50:
             output += f"\n... and {len(entries) - 50} more results"
-        return ToolResult(output=output)
+        return output

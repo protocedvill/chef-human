@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 
 from chef_human.agent.context import ContextAssembler
@@ -10,6 +12,8 @@ from chef_human.agent.linter import annotate_diff_with_lint, format_lint_result,
 from chef_human.agent.parser import (
     ParsedToolCall,
     extract_scratchpad,
+    format_parse_error,
+    looks_like_tool_call,
     parse_tool_calls,
     strip_scratchpad,
     strip_tool_calls,
@@ -28,6 +32,11 @@ from chef_human.tools.registry import ToolRegistry
 from chef_human.ui.protocol import NoopUI, ReActUI
 
 logger = logging.getLogger(__name__)
+
+
+def _rollback_file(path: str, content: str) -> None:
+    """Restore a file to its pre-write content."""
+    Path(path).write_text(content)
 
 
 @dataclass
@@ -62,6 +71,7 @@ class ReActConfig:
     save_sessions: bool = True
     save_dir: str | None = None
     lint_after_write: bool = True
+    tool_timeout: float = 60.0
 
 
 class ReActLoop:
@@ -88,6 +98,7 @@ class ReActLoop:
         steps_taken = 0
         plan = await self._plan_task(task)
         scratchpad = ""
+        last_call_signature: str | None = None
         retry_mgr = RetryManager(
             max_retries_per_step=self._config.max_retries_per_step,
             max_replans=self._config.max_replans,
@@ -160,11 +171,26 @@ class ReActLoop:
                 self._context.conversation.add_message(assistant_msg)
 
                 if not tool_calls:
+                    parse_error = None
+                    if looks_like_tool_call(response.message.content):
+                        parse_error = format_parse_error(
+                            response.message.content,
+                            detail="Could not extract valid tool call JSON",
+                        )
+                        self._context.conversation.add_message(
+                            Message(role=Role.tool, content=parse_error)
+                        )
+
                     steps_taken += 1
-                    action = retry_mgr.record_iteration(True, [])
+                    if parse_error:
+                        action = retry_mgr.record_iteration(1, 1, [parse_error])
+                    else:
+                        action = retry_mgr.record_iteration(0, 0, [])
+
                     if action == RetryAction.STEP_COMPLETED:
                         self._mark_step_completed(plan, [])
-                    if self._detect_finish(non_tool_reasoning):
+
+                    if self._detect_finish(non_tool_reasoning) and not parse_error:
                         return self._make_result(
                             plan=plan,
                             steps_taken=steps_taken,
@@ -172,7 +198,16 @@ class ReActLoop:
                         )
                     continue
 
-                all_success = True
+                call_signature = json.dumps(
+                    sorted([[tc.name, tc.arguments] for tc in tool_calls], key=lambda x: x[0]),
+                    sort_keys=True,
+                    default=str,
+                )
+                is_repeat_call = call_signature == last_call_signature
+                last_call_signature = call_signature
+
+                total_calls = len(tool_calls)
+                failed_calls = 0
                 tool_results: list[str] = []
                 finish_call: tuple[ParsedToolCall, object] | None = None
                 parallel_candidates: list[tuple[ParsedToolCall, object]] = []
@@ -187,7 +222,7 @@ class ReActLoop:
                         )
                         self._ui.on_tool_result(tc.name, result)
                         tool_results.append(result)
-                        all_success = False
+                        failed_calls += 1
                         continue
 
                     errors = validate_arguments(tc, tool.parameters)
@@ -196,7 +231,7 @@ class ReActLoop:
                         result = self._make_tool_error(error_msg)
                         self._ui.on_tool_result(tc.name, result)
                         tool_results.append(result)
-                        all_success = False
+                        failed_calls += 1
                         continue
 
                     if tc.name == "finish":
@@ -215,12 +250,27 @@ class ReActLoop:
                                 )
                                 self._ui.on_tool_result(tc.name, result)
                                 tool_results.append(result)
+                                failed_calls += 1
                                 continue
 
                     parallel_candidates.append((tc, tool))
 
                 if parallel_candidates:
-                    coros = [tool.run(**tc.arguments) for tc, tool in parallel_candidates]
+                    # Capture original file content for write/edit tools (for rollback)
+                    pre_write_content: dict[str, str | None] = {}
+                    if self._config.lint_after_write:
+                        for tc, _tool in parallel_candidates:
+                            if tc.name in ("write", "edit"):
+                                path = tc.arguments.get("path", "")
+                                pre_write_content[path] = self._capture_file_content(path)
+
+                    coros = [
+                        asyncio.wait_for(
+                            tool.run(**tc.arguments),
+                            timeout=self._config.tool_timeout,
+                        )
+                        for tc, tool in parallel_candidates
+                    ]
                     gathered = await asyncio.gather(*coros, return_exceptions=True)
 
                     for (tc, _tool), tool_result in zip(parallel_candidates, gathered):
@@ -228,12 +278,12 @@ class ReActLoop:
                             result = self._make_tool_error(f"Execution error: {tool_result}")
                             self._ui.on_tool_result(tc.name, result)
                             tool_results.append(result)
-                            all_success = False
+                            failed_calls += 1
                             continue
 
                         if not tool_result.success:
                             result = f"Error: {tool_result.error}\nOutput: {tool_result.output}"
-                            all_success = False
+                            failed_calls += 1
                         else:
                             result = tool_result.output
 
@@ -248,6 +298,19 @@ class ReActLoop:
                             file_path = tc.arguments.get("path", "")
                             lint_output = run_lint(file_path)
                             if lint_output:
+                                # If lint has actual errors, roll back the file
+                                original = pre_write_content.get(file_path)
+                                if original is not None:
+                                    _rollback_file(file_path, original)
+                                    rollback_msg = (
+                                        f"\n[rollback] Lint errors detected — "
+                                        f"file '{file_path}' restored to pre-write state."
+                                    )
+                                else:
+                                    rollback_msg = (
+                                        f"\n[rollback] Lint errors detected — "
+                                        f"file '{file_path}' was new, cannot restore."
+                                    )
                                 # Annotate the last tool result's diff if present
                                 last_idx = len(tool_results) - 1
                                 if last_idx >= 0 and "```diff" in tool_results[last_idx]:
@@ -256,19 +319,30 @@ class ReActLoop:
                                     )
                                     if annotated:
                                         tool_results[last_idx] = annotated
-                                # Still append raw lint output for complete issue list
-                                lint_result = format_lint_result(lint_output)
+                                # Append lint output with rollback note
+                                lint_result = format_lint_result(lint_output) + rollback_msg
                                 tool_results.append(lint_result)
+                                failed_calls += 1
 
                 if finish_call is not None:
                     tc, tool = finish_call
                     try:
-                        finish_result = await tool.run(**tc.arguments)
+                        finish_result = await asyncio.wait_for(
+                            tool.run(**tc.arguments),
+                            timeout=self._config.tool_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        result = self._make_tool_error(
+                            f"Tool '{tc.name}' timed out after {self._config.tool_timeout}s"
+                        )
+                        self._ui.on_tool_result(tc.name, result)
+                        tool_results.append(result)
+                        failed_calls += 1
                     except Exception as exc:
                         result = self._make_tool_error(f"Execution error: {exc}")
                         self._ui.on_tool_result(tc.name, result)
                         tool_results.append(result)
-                        all_success = False
+                        failed_calls += 1
                     else:
                         finish_msg = finish_result.output if finish_result.success else finish_result.error or ""
                         self._ui.on_tool_result(tc.name, finish_msg)
@@ -278,13 +352,24 @@ class ReActLoop:
                             message=finish_result.output,
                         )
 
+                if is_repeat_call and finish_call is None:
+                    nudge = (
+                        "You just repeated the exact same tool call with identical "
+                        "arguments as the previous step — it produced no new "
+                        "information. Stop repeating it. Either take a concrete "
+                        "action that makes progress (e.g. write or edit a file) or "
+                        "call `finish` if the task is actually already complete."
+                    )
+                    tool_results.append(nudge)
+                    failed_calls += 1
+
                 for result_text in tool_results:
                     self._context.conversation.add_message(
                         Message(role=Role.tool, content=result_text)
                     )
 
                 steps_taken += 1
-                action = retry_mgr.record_iteration(all_success, tool_results)
+                action = retry_mgr.record_iteration(total_calls, failed_calls, tool_results)
 
                 if action == RetryAction.STEP_COMPLETED:
                     self._mark_step_completed(plan, tool_results)
@@ -360,6 +445,17 @@ class ReActLoop:
         print(f"\n[!] Destructive operation requested: {cmd}")
         response = input("Approve? (y/N): ").strip().lower()
         return response in ("y", "yes")
+
+    @staticmethod
+    def _capture_file_content(path: str) -> str | None:
+        """Read file content before write/edit for potential rollback."""
+        p = Path(path)
+        if p.exists():
+            try:
+                return p.read_text()
+            except OSError:
+                return None
+        return None
 
     @staticmethod
     def _make_tool_error(message: str) -> str:

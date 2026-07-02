@@ -32,6 +32,9 @@ rag = [
     "faiss-cpu>=1.14",
     "numpy>=1.25",
 ]
+tui = [
+    "textual>=0.60",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
@@ -40,7 +43,7 @@ dev = [
 ]
 
 [project.scripts]
-chef-human = "chef_human.main:cli"
+chef-human = "chef_human.main:main"
 
 [tool.ruff]
 line-length = 100

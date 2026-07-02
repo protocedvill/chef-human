@@ -34,6 +34,8 @@ When ALL steps of the plan are complete, call the `finish` tool.
 - Follow the plan. Complete steps in order.
 - Reason step-by-step before calling tools.
 - If a tool fails, read the error and fix your approach.
+- If your tool call format is invalid, you will receive a parse error as a tool result. Fix the format and retry.
+- Before implementing something new, check whether it already exists with `lookup_symbol`. If there's no exact match, `lookup_symbol` also reports similarly-named symbols that may already do what you need — reuse or extend one of those instead of duplicating it. If it reports nothing at all (no exact or similar match), that means there is nothing to reuse: implement it from scratch yourself. Do not use `ask_user` to ask what to do in this case.
 - After 3 consecutive failures, the system will re-plan automatically.
 - Do not call finish until all plan steps are done.
 

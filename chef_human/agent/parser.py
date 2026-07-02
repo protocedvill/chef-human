@@ -190,6 +190,33 @@ def strip_scratchpad(content: str) -> str:
     return _SCRATCH_PATTERN.sub("", content).strip()
 
 
+def looks_like_tool_call(content: str) -> bool:
+    """Check if content appears to attempt a tool call, even if unparseable."""
+    if "<tool_call" in content:
+        return True
+    if re.search(r'"name"\s*:', content) and re.search(r'"arguments"\s*:', content):
+        return True
+    if re.search(r'```(?:json)?\s*\n?\s*\{', content):
+        return True
+    return False
+
+
+def format_parse_error(content: str, detail: str = "") -> str:
+    """Produce a human-readable parse error message for the LLM."""
+    snippet = content.strip()[:200]
+    msg = "Error: Failed to parse tool call from your output.\n"
+    if detail:
+        msg += f"Reason: {detail}\n"
+    msg += f"Your output was:\n{snippet}"
+    if len(content) > 200:
+        msg += "..."
+    msg += (
+        "\n\nFix the format and try again. "
+        "Use <tool_call>{{\"name\": \"tool_name\", \"arguments\": {{...}}}}</tool_call>."
+    )
+    return msg
+
+
 def strip_tool_calls(content: str) -> str:
     content = re.sub(r"<tool_call>.*?</tool_call>", "", content, flags=re.DOTALL)
     content = re.sub(

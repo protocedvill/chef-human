@@ -189,7 +189,7 @@ class EditTool:
         if diff:
             output_parts.append(diff)
             if self._diff_store:
-                self._diff_store.record(path, diff, "edit")
+                self._diff_store.record(path, diff, "edit", old_content=old_content, new_content=new_content)
 
         return ToolResult(output="\n".join(output_parts))
 

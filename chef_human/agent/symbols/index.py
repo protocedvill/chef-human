@@ -153,6 +153,31 @@ class SymbolIndex:
                         return results
         return sorted(results, key=lambda e: e.access_count, reverse=True)
 
+    def find_similar(
+        self, name: str, max_results: int = 10, cutoff: float = 0.6
+    ) -> list[IndexEntry]:
+        """Find symbols with a name similar to `name` (typos, naming variants,
+        partial matches) when an exact lookup finds nothing."""
+        import difflib
+
+        candidates = list(self._entries)
+        close = difflib.get_close_matches(name, candidates, n=max_results, cutoff=cutoff)
+
+        name_lower = name.lower()
+        substring_matches = [
+            c for c in candidates
+            if c not in close and (name_lower in c.lower() or c.lower() in name_lower)
+        ]
+
+        results: list[IndexEntry] = []
+        for cname in close + substring_matches[: max(0, max_results - len(close))]:
+            entries = self._entries.get(cname, [])
+            if entries:
+                best = max(entries, key=lambda e: e.access_count)
+                best.access_count += 1
+                results.append(best)
+        return results
+
     def search(self, query: str) -> list[IndexEntry]:
         query_lower = query.lower()
         results: list[IndexEntry] = []

@@ -414,6 +414,67 @@ class TestExtractScratchpad:
         assert result == "path is actually x.py"
 
 
+class TestLooksLikeToolCall:
+    def test_tool_call_tag_detected(self):
+        from chef_human.agent.parser import looks_like_tool_call
+        content = "Let me read <tool_call>{\"name\": \"read\"}</tool_call>"
+        assert looks_like_tool_call(content) is True
+
+    def test_name_and_arguments_detected(self):
+        from chef_human.agent.parser import looks_like_tool_call
+        content = 'Here is the call: {"name": "read", "arguments": {"path": "x.py"}}'
+        assert looks_like_tool_call(content) is True
+
+    def test_json_code_block_detected(self):
+        from chef_human.agent.parser import looks_like_tool_call
+        content = "```json\n{\"name\": \"read\"}\n```"
+        assert looks_like_tool_call(content) is True
+
+    def test_plain_text_returns_false(self):
+        from chef_human.agent.parser import looks_like_tool_call
+        assert looks_like_tool_call("Just reasoning without tools") is False
+
+    def test_empty_content_returns_false(self):
+        from chef_human.agent.parser import looks_like_tool_call
+        assert looks_like_tool_call("") is False
+
+    def test_only_name_without_arguments_returns_false(self):
+        from chef_human.agent.parser import looks_like_tool_call
+        content = 'Some text with "name": "read" but no arguments'
+        assert looks_like_tool_call(content) is False
+
+
+class TestFormatParseError:
+    def test_returns_error_message(self):
+        from chef_human.agent.parser import format_parse_error
+        msg = format_parse_error("bad content", detail="Could not parse JSON")
+        assert "Error: Failed to parse tool call" in msg
+        assert "Could not parse JSON" in msg
+        assert "bad content" in msg
+
+    def test_includes_format_hint(self):
+        from chef_human.agent.parser import format_parse_error
+        msg = format_parse_error("xyz")
+        assert "<tool_call>" in msg
+
+    def test_truncates_long_content(self):
+        from chef_human.agent.parser import format_parse_error
+        long = "x" * 500
+        msg = format_parse_error(long)
+        assert len(msg) < 700
+        assert "..." in msg
+
+    def test_no_detail_omits_reason(self):
+        from chef_human.agent.parser import format_parse_error
+        msg = format_parse_error("xyz")
+        assert "Reason:" not in msg
+
+    def test_empty_content(self):
+        from chef_human.agent.parser import format_parse_error
+        msg = format_parse_error("")
+        assert "Failed to parse" in msg
+
+
 class TestStripScratchpad:
     def test_strips_scratchpad_header(self):
         from chef_human.agent.parser import strip_scratchpad

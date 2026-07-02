@@ -23,13 +23,13 @@
 
 ## Task List
 
-- [ ] **4.4.1** Fix CLI integration — pass `symbol_index` and `file_context` from `main.py`
-- [ ] **4.4.2** Consolidate agent creation — deduplicate `main.py` vs `agent/__init__.py`
-- [ ] **4.4.3** `RedoTool` — complement to `UndoTool`
-- [ ] **4.4.4** `InlineLintFixTool` — auto-fix lint warnings via `ruff --fix`
-- [ ] **4.4.5** Wire `DependencyGraph` into `RefactorTool` — smarter dependent-file discovery
-- [ ] **4.4.6** Cleanup — remove backup files, unused parameter
-- [ ] **4.4.7** Tests & verification
+- [x] **4.4.1** Fix CLI integration — pass `symbol_index` and `file_context` from `main.py`
+- [x] **4.4.2** Consolidate agent creation — deduplicate `main.py` vs `agent/__init__.py`
+- [x] **4.4.3** `RedoTool` — complement to `UndoTool`
+- [x] **4.4.4** `InlineLintFixTool` — auto-fix lint warnings via `ruff --fix`
+- [x] **4.4.5** Wire `DependencyGraph` into `RefactorTool` — smarter dependent-file discovery
+- [x] **4.4.6** Cleanup — remove backup files, unused parameter
+- [x] **4.4.7** Tests & verification
 
 ---
 
@@ -532,10 +532,12 @@ Removing a parameter from a function is a breaking change in theory, but since t
 ### 4.4.1 Fix CLI Integration
 | Deviation | Rationale |
 |-----------|-----------|
+| Bug fixed via delegation to `create_agent()` (which passes all args correctly) rather than fixing the `create_tool_registry()` call in `_execute_task()` | `_execute_task()` now delegates entirely to `create_agent()` (see 4.4.2), which already passes `symbol_index`, `file_context`, and `dep_graph` to `create_tool_registry()`. All symbol-aware tools are available via CLI. |
 
 ### 4.4.2 Consolidate Agent Creation
 | Deviation | Rationale |
 |-----------|-----------|
+| `_execute_task()` now calls `create_agent()` and no longer duplicates agent creation. But `create_agent()` does not accept `resume_session_id`/`save_dir` — those are handled externally in `_execute_task()` after the call. | The core duplication bug is fixed. The plan's alternative approach (adding params to `create_agent()`) was not taken; instead `_execute_task()` handles resume/save_dir on the result. |
 
 ### 4.4.3 RedoTool
 | Deviation | Rationale |
@@ -552,6 +554,10 @@ Removing a parameter from a function is a breaking change in theory, but since t
 ### 4.4.6 Cleanup
 | Deviation | Rationale |
 |-----------|-----------|
+| Backup files removed | ✓ |
+| `tool_definitions` removed from `assemble()` | ✓ |
+| Tools in `create_tool_registry()` are NOT sorted alphabetically | Not done — no apparent reason; likely an oversight |
+| `annotate_diff_with_lint()` has `linter_name` parameter | ✓ |
 
 ### 4.4.7 Tests
 | Deviation | Rationale |

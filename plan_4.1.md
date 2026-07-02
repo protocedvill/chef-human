@@ -25,12 +25,12 @@
 
 ## Task List
 
-- [ ] **4.1.1** DiffStore enhancement — store `old_content` and `new_content` alongside diff for undo
-- [ ] **4.1.2** `LookupSymbolTool` — new agent tool to query the symbol index by name/prefix
-- [ ] **4.1.3** `UndoTool` — revert the last write/edit using stored content
-- [ ] **4.1.4** `PatchTool` — apply a unified diff patch to a file
-- [ ] **4.1.5** Tool registry wiring — register all new tools, expose SymbolIndex to tool constructors
-- [ ] **4.1.6** Tests — all new tools, DiffStore enhancement, integration
+- [x] **4.1.1** DiffStore enhancement — store `old_content` and `new_content` alongside diff for undo
+- [x] **4.1.2** `LookupSymbolTool` — new agent tool to query the symbol index by name/prefix
+- [x] **4.1.3** `UndoTool` — revert the last write/edit using stored content
+- [x] **4.1.4** `PatchTool` — apply a unified diff patch to a file
+- [x] **4.1.5** Tool registry wiring — register all new tools, expose SymbolIndex to tool constructors
+- [x] **4.1.6** Tests — all new tools, DiffStore enhancement, integration
 
 ---
 

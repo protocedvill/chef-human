@@ -22,13 +22,13 @@
 
 ## Task List
 
-- [ ] **4.2.1** `SymbolIndex.serialize()` / `SymbolIndex.deserialize()` — save/load to `.chef-human/index.json`
-- [ ] **4.2.2** `DependencyGraph.serialize()` / `DependencyGraph.deserialize()` — save/load alongside index
-- [ ] **4.2.3** Startup integration — load persisted state when available, skip build
-- [ ] **4.2.4** File watcher mode — `watchdog`-based auto-refresh of index on file changes
-- [ ] **4.2.5** Symbol usage rank — track and persist access counts, prioritise frequent symbols
-- [ ] **4.2.6** Config — `persist_index`, `watch_files`, `watch_interval` settings
-- [ ] **4.2.7** Tests — persistence round-trip, startup load, file watcher, usage rank
+- [x] **4.2.1** `SymbolIndex.serialize()` / `SymbolIndex.deserialize()` — save/load to `.chef-human/index.json`
+- [x] **4.2.2** `DependencyGraph.serialize()` / `DependencyGraph.deserialize()` — save/load alongside index
+- [x] **4.2.3** Startup integration — load persisted state when available, skip build
+- [x] **4.2.4** File watcher mode — `watchdog`-based auto-refresh of index on file changes
+- [x] **4.2.5** Symbol usage rank — track and persist access counts, prioritise frequent symbols
+- [x] **4.2.6** Config — `persist_index`, `watch_files`, `watch_interval` settings
+- [x] **4.2.7** Tests — persistence round-trip, startup load, file watcher, usage rank
 
 ---
 
@@ -519,6 +519,7 @@ A simple hash of sorted file paths detects new/deleted files. Content-level stal
 ### 4.2.4 File Watcher
 | Deviation | Rationale |
 |-----------|-----------|
+| `FileWatcher` class exists in `watcher.py` with `start()`/`stop()` but is never wired into `create_agent()` | The class and tests exist but the integration point in the agent factory was never added. `watch_files` and `watch_interval` config settings are dead code. Deferred to future work. |
 
 ### 4.2.5 Symbol Usage Rank
 | Deviation | Rationale |

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 from chef_human.tools.diff import RedoEntry
@@ -37,6 +38,30 @@ class UndoTool:
             resolved = self._workspace.resolve(entry.path)
             resolved.unlink(missing_ok=True)
             return ToolResult(output=f"Undid {entry.tool_name}: deleted {entry.path} (was new file)")
+
+        is_batch = entry.path.startswith("batch:")
+
+        if is_batch:
+            old_map: dict[str, str] = json.loads(entry.old_content)
+            current_map: dict[str, str] = {}
+            for fp, old_content in old_map.items():
+                resolved = self._workspace.resolve(fp)
+                current = resolved.read_text(encoding="utf-8") if resolved.exists() else ""
+                current_map[fp] = current
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                resolved.write_text(old_content, encoding="utf-8")
+
+            self._store.push_redo(RedoEntry(
+                file_path=entry.path,
+                old_content=json.dumps(current_map),
+                new_content=entry.old_content,
+                tool_name=entry.tool_name,
+            ))
+
+            output_parts = [
+                f"Undid {entry.tool_name}: restored {len(old_map)} file{'s' if len(old_map) != 1 else ''}",
+            ]
+            return ToolResult(output="\n".join(output_parts))
 
         resolved = self._workspace.resolve(entry.path)
         resolved.parent.mkdir(parents=True, exist_ok=True)

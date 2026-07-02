@@ -8,7 +8,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SAVE_DIR = Path.home() / ".cache" / "chef-human" / "sessions"
+DEFAULT_SAVE_DIR = Path(".chef-human") / "sessions"
 
 
 def save_conversation(
@@ -30,6 +30,7 @@ def save_conversation(
         "session_id": session_id,
         "task": task,
         "conversation": conversation,
+        "created": time.time(),
     }
     path.write_text(json.dumps(data, indent=2))
     logger.info("Conversation saved to %s", path)
@@ -78,11 +79,18 @@ def list_sessions(
     if not save_dir.exists():
         return []
     sessions = []
-    for f in sorted(save_dir.glob("session_*.json"), reverse=True):
-        data = json.loads(f.read_text())
+    for f in sorted(save_dir.glob("session_*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            continue
+        created = data.get("created")
+        mtime = f.stat().st_mtime
         sessions.append({
-            "session_id": data.get("session_id"),
-            "task": data.get("task"),
+            "session_id": data.get("session_id", f.stem),
+            "task": (data.get("task") or "")[:120],
+            "created": created or mtime,
             "path": str(f),
+            "file_path": str(f),
         })
     return sessions

@@ -37,15 +37,15 @@ class RetryManager:
         return self._state.tool_results
 
     def record_iteration(
-        self, all_success: bool, tool_results: list[str]
+        self, total_calls: int, failed_calls: int, tool_results: list[str]
     ) -> RetryAction:
-        if all_success:
+        if failed_calls == 0:
             self._state.consecutive_failures = 0
             self._state.tool_results = []
             return RetryAction.STEP_COMPLETED
 
-        self._state.consecutive_failures += 1
         self._state.tool_results.extend(tool_results)
+        self._state.consecutive_failures += 1
 
         if self._state.consecutive_failures >= self._max_retries:
             if self._state.replan_count >= self._max_replans:
@@ -57,6 +57,9 @@ class RetryManager:
                 return RetryAction.ESCALATE
             return RetryAction.REPLAN
 
+        if failed_calls < total_calls:
+            return RetryAction.PARTIAL_SUCCESS
+
         return RetryAction.RETRY
 
     def on_replan(self) -> None:
@@ -67,6 +70,7 @@ class RetryManager:
 
 class RetryAction(StrEnum):
     RETRY = "retry"
+    PARTIAL_SUCCESS = "partial_success"
     REPLAN = "replan"
     ESCALATE = "escalate"
     STEP_COMPLETED = "step_completed"

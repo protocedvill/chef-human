@@ -24,12 +24,12 @@
 
 ## Task List
 
-- [ ] **4.3.1** `RefactorTool` — rename a symbol across all files that define it
-- [ ] **4.3.2** `GotoDefinitionTool` — locate the definition site of a symbol and load it into context
-- [ ] **4.3.3** `ReferenceFinderTool` — find all usages of a symbol across the workspace
-- [ ] **4.3.4** Lint-annotated diffs — overlay lint warnings on the diff output after edits
-- [ ] **4.3.5** Integration — wire new tools into registry, integrate lint-annotated diffs into ReActLoop
-- [ ] **4.3.6** Tests
+- [x] **4.3.1** `RefactorTool` — rename a symbol across all files that define it
+- [x] **4.3.2** `GotoDefinitionTool` — locate the definition site of a symbol and load it into context
+- [x] **4.3.3** `ReferenceFinderTool` — find all usages of a symbol across the workspace
+- [x] **4.3.4** Lint-annotated diffs — overlay lint warnings on the diff output after edits
+- [x] **4.3.5** Integration — wire new tools into registry, integrate lint-annotated diffs into ReActLoop
+- [x] **4.3.6** Tests
 
 ---
 

@@ -1,2 +1,2 @@
 [console_scripts]
-chef-human = chef_human.main:cli
+chef-human = chef_human.main:main

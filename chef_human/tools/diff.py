@@ -195,3 +195,7 @@ class DiffStore:
 
     def clear_redo(self) -> None:
         self._redo_stack.clear()
+
+    def push_entry(self, entry: DiffEntry) -> None:
+        """Append an entry without clearing the redo stack (used by RedoTool)."""
+        self._entries.append(entry)

@@ -33,6 +33,7 @@ class Settings:
     persist_index: bool = True
     watch_files: bool = False
     watch_interval: float = 2.0
+    tool_timeout: float = 60.0
 
 
 _ENV_PREFIX = "CHEF_"

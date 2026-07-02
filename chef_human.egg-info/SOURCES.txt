@@ -21,6 +21,7 @@ chef_human/agent/prompts.py
 chef_human/agent/react_loop.py
 chef_human/agent/repo_map.py
 chef_human/agent/retry.py
+chef_human/agent/watcher.py
 chef_human/agent/workspace.py
 chef_human/agent/rag/__init__.py
 chef_human/agent/rag/chunker.py
@@ -40,11 +41,15 @@ chef_human/llm/llamacpp_backend.py
 chef_human/llm/ollama_backend.py
 chef_human/llm/tokenizer.py
 chef_human/tools/__init__.py
-chef_human/tools/diff-federate-safeBackup-0001.py
 chef_human/tools/diff.py
-chef_human/tools/filesystem-federate-safeBackup-0001.py
+chef_human/tools/filesystem.py
+chef_human/tools/goto_definition.py
+chef_human/tools/lint_fix.py
 chef_human/tools/lookup_symbol.py
 chef_human/tools/patch_tool.py
+chef_human/tools/redo.py
+chef_human/tools/refactor.py
+chef_human/tools/reference_finder.py
 chef_human/tools/registry.py
 chef_human/tools/shell.py
 chef_human/tools/undo.py
@@ -53,6 +58,8 @@ chef_human/tools/view_diff.py
 chef_human/ui/__init__.py
 chef_human/ui/debug_tui.py
 chef_human/ui/protocol.py
+chef_human/ui/repl.py
+chef_human/ui/streaming.py
 tests/test_agent_integration.py
 tests/test_chatml.py
 tests/test_config.py
@@ -67,4 +74,5 @@ tests/test_llm_backend.py
 tests/test_ollama_backend.py
 tests/test_repo_map.py
 tests/test_tokenizer.py
+tests/test_watcher.py
 tests/test_workspace.py

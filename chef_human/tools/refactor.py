@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -183,14 +184,6 @@ class RefactorTool:
                     )
 
                 diff = compute_diff(content, new_content, path=str(file_path))
-                if self._diff_store and diff:
-                    self._diff_store.record(
-                        str(file_path),
-                        diff,
-                        "refactor_symbol",
-                        old_content=content,
-                        new_content=new_content,
-                    )
                 results.append({
                     "path": str(file_path),
                     "count": count,
@@ -204,7 +197,23 @@ class RefactorTool:
                 output=f"No occurrences of '{old_name}' found in the selected files."
             )
 
-        # Phase 3: Build output
+        # Phase 3: Record batch undo entry
+        if not dry_run and self._diff_store:
+            pending = [r for r in results if r.get("diff")]
+            if pending:
+                batch_path = f"batch:refactor_symbol:{old_name}→{new_name}"
+                old_contents = {r["path"]: r["old_content"] for r in pending}
+                new_contents = {r["path"]: r["new_content"] for r in pending}
+                combined_diff = "\n\n".join(r["diff"] for r in pending if r.get("diff"))
+                self._diff_store.record(
+                    batch_path,
+                    combined_diff,
+                    "refactor_symbol",
+                    old_content=json.dumps(old_contents),
+                    new_content=json.dumps(new_contents),
+                )
+
+        # Phase 4: Build output
         if dry_run:
             return self._format_dry_run(old_name, new_name, results)
         return self._format_applied(old_name, new_name, results)

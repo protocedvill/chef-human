@@ -266,8 +266,8 @@ class TestToDict:
 class TestExecuteTask:
     @pytest.mark.asyncio
     async def test_wires_components_and_runs(self):
-        mock_repl = MagicMock()
-        mock_repl.run = AsyncMock(
+        mock_loop = MagicMock()
+        mock_loop.run = AsyncMock(
             return_value=AgentResult(
                 plan=Plan(goal="test", steps=[]),
                 steps_taken=1,
@@ -275,21 +275,16 @@ class TestExecuteTask:
                 success=True,
             )
         )
+        mock_ctx = MagicMock()
+        mock_ctx.conversation = MagicMock()
 
         with (
-            patch("chef_human.main.create_context_assembler") as mock_ctx_factory,
-            patch("chef_human.main.create_backend") as mock_backend_factory,
-            patch("chef_human.main.create_tool_registry"),
-            patch("chef_human.main.Planner"),
-            patch("chef_human.main.ReActLoop", return_value=mock_repl),
-            patch("chef_human.main.DebugTUI"),
+            patch("chef_human.main.create_agent", return_value=(mock_loop, mock_ctx)),
         ):
             from chef_human.main import _execute_task
 
             result = await _execute_task("test task", max_steps=5, stream=False)
 
-            mock_ctx_factory.assert_called_once_with(workspace_root=None)
-            mock_backend_factory.assert_called_once()
             assert result.success is True
             assert result.steps_taken == 1
 

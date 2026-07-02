@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, create_autospec
 
 import pytest
 
@@ -145,8 +144,8 @@ class TestContextAssemblerAssemble:
             file_context=file_context,
             repo_map=repo_map,
         )
-        result = ca.assemble(system_prompt="Be helpful.", tool_definitions="**tools**")
-        assert "**tools**" in result[0].content
+        result = ca.assemble(system_prompt="Be helpful.")
+        assert "Be helpful." in result[0].content
 
     def test_includes_repo_map(self, conversation, workspace, file_context, repo_map):
         ca = ContextAssembler(
@@ -248,8 +247,8 @@ class TestContextAssemblerTruncation:
             file_context=file_context,
             repo_map=repo_map,
         )
-        result = ca.assemble(system_prompt="s", tool_definitions="**tools**")
-        assert "**tools**" in result[0].content
+        result = ca.assemble(system_prompt="s")
+        assert "s" in result[0].content
 
 
 class TestBuildFileContext:
@@ -319,7 +318,7 @@ class TestContextAssemblerIntegration:
             file_context=file_context,
             repo_map=repo_map,
         )
-        result = ca.assemble(system_prompt="test", tool_definitions="tools")
+        result = ca.assemble(system_prompt="test")
         assert isinstance(result, list)
         assert all(hasattr(m, "role") for m in result)
         assert all(hasattr(m, "content") for m in result)

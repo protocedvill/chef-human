@@ -106,7 +106,6 @@ class ReActLoop:
                 )
                 messages = self._context.assemble(
                     system_prompt=system_prompt,
-                    tool_definitions="",
                 )
                 self._ui.on_reasoning_start()
                 if self._config.stream:

@@ -9,6 +9,7 @@ from chef_human.agent.workspace import WorkspaceManager
 from chef_human.llm.tokenizer import ApproxTokenizer
 from chef_human.tools import create_tool_registry
 from chef_human.tools.goto_definition import GotoDefinitionTool
+from chef_human.tools.redo import RedoTool
 from chef_human.tools.refactor import RefactorTool
 from chef_human.tools.reference_finder import ReferenceFinderTool
 
@@ -74,3 +75,42 @@ class TestPhase4ToolRegistry:
         idx._initial_built = True
         registry = create_tool_registry(workspace=ws, symbol_index=idx)
         assert registry.get("lookup_symbol") is not None
+
+    def test_redo_registered(self, tmp_path: Path):
+        ws = WorkspaceManager(root=tmp_path)
+        registry = create_tool_registry(workspace=ws)
+        tool = registry.get("redo")
+        assert tool is not None
+        assert isinstance(tool, RedoTool)
+
+    def test_undo_registered(self, tmp_path: Path):
+        ws = WorkspaceManager(root=tmp_path)
+        registry = create_tool_registry(workspace=ws)
+        assert registry.get("undo") is not None
+
+    def test_refactor_accepts_dep_graph(self, tmp_path: Path):
+        ws = WorkspaceManager(root=tmp_path)
+        idx = SymbolIndex(workspace=ws, extractor=CompositeExtractor())
+        idx._initial_built = True
+        registry = create_tool_registry(workspace=ws, symbol_index=idx)
+        tool = registry.get("refactor_symbol")
+        assert tool is not None
+        assert hasattr(tool, "_dep_graph")
+        assert tool._dep_graph is None  # no dep_graph passed = None
+
+    def test_refactor_with_dep_graph(self, tmp_path: Path):
+        from chef_human.agent.symbols.dependencies import DependencyGraph
+        ws = WorkspaceManager(root=tmp_path)
+        idx = SymbolIndex(workspace=ws, extractor=CompositeExtractor())
+        idx._initial_built = True
+        dg = DependencyGraph(idx)
+        registry = create_tool_registry(workspace=ws, symbol_index=idx, dep_graph=dg)
+        tool = registry.get("refactor_symbol")
+        assert tool is not None
+        assert tool._dep_graph is dg
+
+    def test_lint_fix_registered(self, tmp_path: Path):
+        ws = WorkspaceManager(root=tmp_path)
+        registry = create_tool_registry(workspace=ws)
+        tool = registry.get("lint_fix")
+        assert tool is not None

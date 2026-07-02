@@ -110,11 +110,20 @@ class DiffEntry:
     tool_name: str
 
 
+@dataclass
+class RedoEntry:
+    file_path: str
+    old_content: str
+    new_content: str
+    tool_name: str
+
+
 class DiffStore:
     """Session-level store of file diffs produced by write/edit tools."""
 
     def __init__(self) -> None:
         self._entries: list[DiffEntry] = []
+        self._redo_stack: list[RedoEntry] = []
 
     def record(
         self,
@@ -136,6 +145,7 @@ class DiffStore:
                 tool_name=tool_name,
             )
         )
+        self._redo_stack.clear()
 
     def get_all(self, path: str | None = None) -> list[DiffEntry]:
         if path is None:
@@ -174,3 +184,14 @@ class DiffStore:
 
     def clear(self) -> None:
         self._entries.clear()
+
+    def push_redo(self, entry: RedoEntry) -> None:
+        self._redo_stack.append(entry)
+
+    def pop_redo(self) -> RedoEntry | None:
+        if not self._redo_stack:
+            return None
+        return self._redo_stack.pop()
+
+    def clear_redo(self) -> None:
+        self._redo_stack.clear()

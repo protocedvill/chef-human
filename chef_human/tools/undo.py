@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from chef_human.tools.diff import RedoEntry
 from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
@@ -39,7 +40,15 @@ class UndoTool:
 
         resolved = self._workspace.resolve(entry.path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
+        current_content = resolved.read_text(encoding="utf-8") if resolved.exists() else ""
         resolved.write_text(entry.old_content, encoding="utf-8")
+
+        self._store.push_redo(RedoEntry(
+            file_path=entry.path,
+            old_content=current_content,
+            new_content=entry.old_content,
+            tool_name=entry.tool_name,
+        ))
 
         from chef_human.tools.diff import compute_diff
 

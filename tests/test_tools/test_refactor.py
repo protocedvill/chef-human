@@ -171,3 +171,36 @@ class TestRefactorTool:
         result = await tool.run(old_name="Circle", new_name="Oval", dry_run=True)
         assert result.success
         assert "occurrence" in result.output
+
+    async def test_dep_graph_includes_dependents(
+        self, workspace: WorkspaceManager, symbol_index: SymbolIndex, tmp_path: Path
+    ):
+        from chef_human.agent.symbols.dependencies import DependencyGraph
+        create_file(tmp_path, "importer.py", "from shapes import Circle\nc = Circle()\n")
+        dg = DependencyGraph(symbol_index)
+        dg.build()
+        tool = RefactorTool(workspace=workspace, symbol_index=symbol_index, dep_graph=dg)
+        result = await tool.run(old_name="Circle", new_name="Oval", scope="all")
+        assert result.success
+        content = (tmp_path / "importer.py").read_text()
+        assert "Oval" in content
+
+    async def test_dep_graph_fallback_when_none(
+        self, tool: RefactorTool, tmp_path: Path
+    ):
+        create_file(tmp_path, "importer.py", "from shapes import Circle\nc = Circle()\n")
+        result = await tool.run(old_name="Circle", new_name="Oval", scope="all")
+        assert result.success
+        # Without dep_graph, importer.py is only found by grep
+        content = (tmp_path / "importer.py").read_text()
+        assert "Oval" in content
+
+    async def test_dep_graph_empty_no_error(
+        self, workspace: WorkspaceManager, symbol_index: SymbolIndex
+    ):
+        from chef_human.agent.symbols.dependencies import DependencyGraph
+        dg = DependencyGraph(symbol_index)
+        tool = RefactorTool(workspace=workspace, symbol_index=symbol_index, dep_graph=dg)
+        result = await tool.run(old_name="Circle", new_name="Oval", scope="all")
+        # Empty dependency graph shouldn't cause error — grep will still try
+        assert result.success or "No definitions found" in (result.error or "")

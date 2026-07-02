@@ -6,19 +6,14 @@ import logging
 
 import click
 
-from chef_human.agent import create_context_assembler
+from chef_human.agent import create_agent
 from chef_human.agent.context import ContextManager
 from chef_human.agent.persistence import (
     delete_session,
     list_sessions,
     load_session_data,
 )
-from chef_human.agent.planner import Planner
-from chef_human.agent.react_loop import AgentResult, ReActConfig, ReActLoop
-from chef_human.llm import create_backend
-from chef_human.tools import create_tool_registry
-from chef_human.ui.debug_tui import DebugTUI
-from chef_human.ui.protocol import NoopUI
+from chef_human.agent.react_loop import AgentResult
 
 
 @click.group()
@@ -171,34 +166,22 @@ async def _execute_task(
 ) -> AgentResult:
     logging.basicConfig(level=logging.WARNING)
 
-    context = create_context_assembler(workspace_root=workspace)
+    loop, _ = create_agent(
+        workspace_root=workspace,
+        max_steps=max_steps,
+        debug_tui=debug_tui,
+    )
+    loop._config.stream = stream
+    loop._config.save_dir = save_dir
 
     if resume:
+        from chef_human.agent.persistence import load_session_data
         session_data = load_session_data(resume, save_dir=save_dir or ".")
         if session_data is not None:
             conv_data = session_data.get("conversation")
             if conv_data:
                 loaded = ContextManager.from_dict(conv_data)
-                context.conversation.messages = loaded.messages
-
-    backend = create_backend()
-    tool_registry = create_tool_registry(context.workspace)
-    planner = Planner(llm_backend=backend)
-    config = ReActConfig(
-        max_steps=max_steps,
-        stream=stream,
-        save_dir=save_dir,
-    )
-    ui = DebugTUI() if debug_tui else NoopUI()
-
-    loop = ReActLoop(
-        llm_backend=backend,
-        tool_registry=tool_registry,
-        context_assembler=context,
-        planner=planner,
-        config=config,
-        ui=ui,
-    )
+                loop._context.conversation.messages = loaded.messages
 
     return await loop.run(task)
 

@@ -129,14 +129,15 @@ class ContextAssembler:
     def file_context(self) -> FileContextManager:
         return self._file_context
 
+    @property
+    def dep_graph(self) -> DependencyGraph | None:
+        return self._dep_graph
+
     def assemble(
         self,
         system_prompt: str,
-        tool_definitions: str = "",
     ) -> list[Message]:
         system_content = system_prompt
-        if tool_definitions:
-            system_content += "\n\n" + tool_definitions
 
         system_tokens = self._conversation.tokenizer.count(system_content)
         remaining = (

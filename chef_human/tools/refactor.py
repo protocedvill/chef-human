@@ -9,6 +9,7 @@ from chef_human.tools.diff import compute_diff
 from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
+    from chef_human.agent.symbols.dependencies import DependencyGraph
     from chef_human.agent.symbols.index import SymbolIndex
     from chef_human.agent.workspace import WorkspaceManager
     from chef_human.tools.diff import DiffStore
@@ -57,10 +58,12 @@ class RefactorTool:
         workspace: WorkspaceManager,
         symbol_index: SymbolIndex,
         diff_store: DiffStore | None = None,
+        dep_graph: DependencyGraph | None = None,
     ) -> None:
         self._workspace = workspace
         self._index = symbol_index
         self._diff_store = diff_store
+        self._dep_graph = dep_graph
 
     async def run(
         self,
@@ -117,6 +120,19 @@ class RefactorTool:
                     files_to_rename.append(self._workspace.resolve(fp))
 
             if scope == "all":
+                # Add dependent files via dependency graph
+                if self._dep_graph is not None:
+                    for entry in entries:
+                        try:
+                            deps = self._dep_graph.dependents(Path(entry.file_path))
+                            for d in deps:
+                                ds = str(d)
+                                if ds not in seen:
+                                    seen.add(ds)
+                                    files_to_rename.append(d)
+                        except Exception:
+                            continue
+
                 # Add textual references via grep
                 grep_files = self._find_textual_refs(old_name)
                 for f in grep_files:

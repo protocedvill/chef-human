@@ -182,6 +182,7 @@ def create_agent(
         workspace=context.workspace,
         symbol_index=context.symbol_index,
         file_context=context.file_context,
+        dep_graph=context.dep_graph,
     )
     planner = Planner(llm_backend=backend)
     config = ReActConfig(max_steps=max_steps)

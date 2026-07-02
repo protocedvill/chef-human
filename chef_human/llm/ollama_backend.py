@@ -36,6 +36,7 @@ class OllamaBackend(LLMBackend):
         self._host = host.rstrip("/")
         self._context_length = context_length
         self._client = ollama.Client(host=self._host)
+        self._async_client = ollama.AsyncClient(host=self._host)
 
         try:
             self._client.list()
@@ -61,7 +62,7 @@ class OllamaBackend(LLMBackend):
             [tool_to_dict(t) for t in request.tools] if request.tools else None
         )
 
-        response = self._client.chat(
+        response = await self._async_client.chat(
             model=self._model,
             messages=ollama_messages,
             tools=ollama_tools or None,
@@ -100,8 +101,7 @@ class OllamaBackend(LLMBackend):
             [tool_to_dict(t) for t in request.tools] if request.tools else None
         )
 
-        async_client = ollama.AsyncClient(host=self._host)
-        stream = await async_client.chat(
+        stream = await self._async_client.chat(
             model=self._model,
             messages=ollama_messages,
             tools=ollama_tools or None,
@@ -150,7 +150,7 @@ class OllamaBackend(LLMBackend):
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         embeddings = []
         for text in request.texts:
-            resp = self._client.embeddings(model=self._model, prompt=text)
+            resp = await self._async_client.embeddings(model=self._model, prompt=text)
             embeddings.append(resp["embedding"])
         return EmbeddingResponse(embeddings=embeddings)
 

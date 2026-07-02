@@ -185,6 +185,16 @@ def extract_scratchpad(content: str) -> str | None:
     return matches[-1].group(1).strip()
 
 
+def extract_scratchpad_entries(content: str) -> list[str]:
+    """Extract every scratchpad update from a single model response, in order.
+
+    Unlike `extract_scratchpad` (which keeps only the last match), this
+    returns all of them so the caller can accumulate them into persistent,
+    structured working memory instead of overwriting previous notes.
+    """
+    return [m.group(1).strip() for m in _SCRATCH_PATTERN.finditer(content)]
+
+
 def strip_scratchpad(content: str) -> str:
     """Remove ## Scratchpad: lines from content."""
     return _SCRATCH_PATTERN.sub("", content).strip()

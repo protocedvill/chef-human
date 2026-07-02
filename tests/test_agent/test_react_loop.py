@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from chef_human.agent.planner import Plan, PlanStep, Planner, StepStatus
+from chef_human.agent.planner import Plan, PlanStep, Planner, StepStatus, StepVerdict
 from chef_human.agent.prompts import build_agent_prompt
 from chef_human.agent.react_loop import (
     AgentResult,
@@ -71,6 +71,30 @@ def _make_mock_tool_registry() -> MagicMock:
     return registry
 
 
+class _FakeResolvedPath:
+    """Stand-in for WorkspaceManager.resolve()'s return value in tests.
+    Defaults to reporting as non-existent so the read-before-edit guard
+    treats every path as "new file, nothing to read" unless a test
+    explicitly wants to exercise the guard (see TestReadBeforeEditGuard),
+    which passes exists=True."""
+
+    def __init__(self, path: object, exists: bool = False) -> None:
+        self._path = str(path)
+        self._exists = exists
+
+    def exists(self) -> bool:
+        return self._exists
+
+    def __str__(self) -> str:
+        return self._path
+
+    def __eq__(self, other: object) -> bool:
+        return str(self) == str(other)
+
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+
 def _make_mock_context() -> MagicMock:
     context = MagicMock()
     context.conversation = MagicMock()
@@ -81,13 +105,23 @@ def _make_mock_context() -> MagicMock:
     )
     context._repo_map = MagicMock()
     context._repo_map.generate_tree = MagicMock(return_value="mock tree")
+    context.workspace = MagicMock()
+    context.workspace.resolve = MagicMock(side_effect=lambda p: _FakeResolvedPath(p))
     return context
 
 
 def _make_mock_planner() -> MagicMock:
     planner = MagicMock(spec=Planner)
     planner.generate_plan = AsyncMock()
-    planner.update_plan = AsyncMock()
+    # Default to an empty replanned Plan (a real Plan instance, not an
+    # unconfigured mock) so tests that trigger REPLAN without explicitly
+    # setting update_plan.return_value still get something build_agent_prompt
+    # can safely call plan.current_step() / iterate plan.steps on.
+    planner.update_plan = AsyncMock(return_value=Plan(goal="Replanned", steps=[]))
+    # Default to "complete" so existing tests that don't care about step
+    # verification keep their old behavior (any non-failing turn advances
+    # the plan). Tests that specifically exercise verification override this.
+    planner.verify_step = AsyncMock(return_value=(StepVerdict.complete, "done"))
     planner.format_plan_for_prompt = MagicMock(
         side_effect=lambda p: f"Plan: {p.goal}"
     )
@@ -607,6 +641,7 @@ class TestReActLoopRun:
             tool_registry=registry,
             context_assembler=context,
             planner=planner,
+            config=ReActConfig(require_plan_complete_to_finish=False),
             ui=ui,
         )
         await loop.run("do something")
@@ -674,6 +709,7 @@ class TestReActLoopRun:
 
         planner = _make_mock_planner()
         planner.generate_plan.return_value = _make_default_plan()
+        planner.update_plan.return_value = Plan(goal="Replanned", steps=[])
         context = _make_mock_context()
         registry = _make_mock_tool_registry()
         read_tool = MagicMock()
@@ -1015,7 +1051,7 @@ class TestReActLoopRun:
             tool_registry=registry,
             context_assembler=context,
             planner=planner,
-            config=ReActConfig(max_steps=1, stream=True),
+            config=ReActConfig(max_steps=1, stream=True, require_plan_complete_to_finish=False),
         )
         result = await loop.run("do something")
 
@@ -1154,19 +1190,30 @@ class TestReActLoopRun:
         assert "Second turn" in second_msg.content
 
     @pytest.mark.asyncio
-    async def test_scratchpad_reset_on_replan(self):
+    async def test_scratchpad_persists_across_replan(self):
+        """The scratchpad is the agent's accumulated working memory -- it
+        must survive a re-plan instead of being wiped, since a failed
+        attempt is exactly when that context matters most for the retry."""
         backend = _make_mock_backend()
 
+        call_count = 0
+
         async def side_effect(*args, **kwargs):
-            return CompletionResponse(
-                message=Message(
-                    role=Role.assistant,
-                    content=(
-                        "Failing turn.\n"
-                        "## Scratchpad: some note\n"
-                        '<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>'
-                    ),
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return CompletionResponse(
+                    message=Message(
+                        role=Role.assistant,
+                        content=(
+                            "Failing turn.\n"
+                            "## Scratchpad: [decision] use SQLite\n"
+                            '<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>'
+                        ),
+                    )
                 )
+            return CompletionResponse(
+                message=Message(role=Role.assistant, content="Just thinking, no tools."),
             )
 
         backend.complete.side_effect = side_effect
@@ -1193,12 +1240,987 @@ class TestReActLoopRun:
             tool_registry=registry,
             context_assembler=context,
             planner=planner,
-            config=ReActConfig(max_steps=10, max_retries_per_step=2),
+            config=ReActConfig(max_steps=3, max_retries_per_step=1, max_replans=1),
+        )
+
+        with patch(
+            "chef_human.agent.react_loop.build_agent_prompt", wraps=build_agent_prompt
+        ) as mock_build:
+            await loop.run("do something")
+
+        planner.update_plan.assert_awaited()
+        scratchpad_args = [c.kwargs["scratchpad"] for c in mock_build.call_args_list]
+        assert len(scratchpad_args) >= 2
+        # First prompt is built before the model has written anything.
+        assert "use SQLite" not in scratchpad_args[0]
+        # Every prompt built after the note (including post-replan) still has it.
+        assert all("use SQLite" in s for s in scratchpad_args[1:])
+
+
+class TestStepVerification:
+    @pytest.mark.asyncio
+    async def test_partial_verdict_does_not_advance_step(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "write", "arguments": {"path": "a.py", "content": "x"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = _make_default_plan()
+        planner.generate_plan.return_value = plan
+        planner.verify_step = AsyncMock(
+            return_value=(StepVerdict.partial, "only wrote a stub")
+        )
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        }
+        write_tool.run = AsyncMock(
+            return_value=MagicMock(output="wrote a.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"write": write_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=2, lint_after_write=False),
         )
         await loop.run("do something")
 
-        # After re-plan, the scratchpad should be empty
-        planner.update_plan.assert_awaited()
+        assert plan.steps[0].status == StepStatus.pending
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("not fully done yet" in m for m in tool_msgs)
+        assert any("only wrote a stub" in m for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_not_complete_verdict_does_not_advance_step(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "write", "arguments": {"path": "a.py", "content": "x"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = _make_default_plan()
+        planner.generate_plan.return_value = plan
+        planner.verify_step = AsyncMock(
+            return_value=(StepVerdict.not_complete, "no evidence of progress")
+        )
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        }
+        write_tool.run = AsyncMock(
+            return_value=MagicMock(output="wrote a.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"write": write_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=2, lint_after_write=False),
+        )
+        await loop.run("do something")
+
+        assert plan.steps[0].status == StepStatus.pending
+
+    @pytest.mark.asyncio
+    async def test_complete_verdict_advances_step(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "write", "arguments": {"path": "a.py", "content": "x"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = _make_default_plan()
+        planner.generate_plan.return_value = plan
+        planner.verify_step = AsyncMock(
+            return_value=(StepVerdict.complete, "file fully written")
+        )
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        }
+        write_tool.run = AsyncMock(
+            return_value=MagicMock(output="wrote a.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"write": write_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=2, lint_after_write=False),
+        )
+        await loop.run("do something")
+
+        assert plan.steps[0].status == StepStatus.completed
+
+    @pytest.mark.asyncio
+    async def test_no_pending_steps_skips_verification(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "read", "arguments": {"path": "a.py"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(
+            goal="g", steps=[PlanStep(index=1, description="s", status=StepStatus.completed)]
+        )
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = AsyncMock(
+            return_value=MagicMock(output="contents", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"read": read_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        planner.verify_step.assert_not_awaited()
+
+
+class TestInvestigativeStepBypassesVerification:
+    @pytest.mark.asyncio
+    async def test_read_step_auto_completes_without_llm_verification(self):
+        """A 'read the file' step should be marked complete purely because
+        the read tool succeeded and returned real output -- no LLM
+        verify_step call needed (that's the failure mode that caused the
+        agent to re-read the same file over and over)."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "read", "arguments": {"path": "plan.md"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Read the content of plan.md", status=StepStatus.pending),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = AsyncMock(
+            return_value=MagicMock(output="# Plan\nSome real content", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"read": read_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        assert plan.steps[0].status == StepStatus.completed
+        planner.verify_step.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_investigative_step_still_verified(self):
+        """A step like 'write the implementation' isn't read/identify/
+        check-style, so it should still go through normal LLM verification."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "write", "arguments": {"path": "a.py", "content": "x"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Write the implementation code", status=StepStatus.pending),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        }
+        write_tool.run = AsyncMock(
+            return_value=MagicMock(output="wrote a.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"write": write_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, lint_after_write=False),
+        )
+        await loop.run("do something")
+
+        planner.verify_step.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_investigative_step_without_tool_evidence_still_verified(self):
+        """The no-tool-calls branch (pure reasoning, no actual tool ran)
+        must not auto-complete an investigative step either -- reasoning
+        alone isn't evidence the file was actually read."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(role=Role.assistant, content="I think I've read enough."),
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Read the content of plan.md", status=StepStatus.pending),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        planner.verify_step.assert_awaited_once()
+
+
+class TestAskUserVagueQuestionGuard:
+    @pytest.mark.asyncio
+    async def test_vague_question_blocked_with_active_step(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "ask_user", "arguments": {"question": "What would you like to do next?"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        ask_tool = MagicMock()
+        ask_tool.name = "ask_user"
+        ask_tool.parameters = {
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "required": ["question"],
+        }
+        ask_tool.run = AsyncMock(
+            return_value=MagicMock(output="some answer", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"ask_user": ask_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        ask_tool.run.assert_not_awaited()
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("active plan step" in m for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_specific_question_allowed_with_active_step(self):
+        """ask_user is intercepted and routed through the UI directly
+        (ui.on_ask_user), not dispatched via AskUserTool.run() -- see
+        plan_5.2.md 5.2.16: AskUserTool.run()'s own sys.stdin.readline()
+        deadlocks under the Textual TUI, which owns the terminal."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "ask_user", "arguments": {"question": "Should the ledger use SQLite or an in-memory dict?"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        ask_tool = MagicMock()
+        ask_tool.name = "ask_user"
+        ask_tool.parameters = {
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "required": ["question"],
+        }
+        ask_tool.run = AsyncMock(
+            return_value=MagicMock(output="SQLite", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"ask_user": ask_tool}.get(name)
+
+        ui = MagicMock(spec=NoopUI)
+        ui.on_ask_user = AsyncMock(return_value="SQLite")
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+            ui=ui,
+        )
+        await loop.run("do something")
+
+        ask_tool.run.assert_not_awaited()
+        ui.on_ask_user.assert_awaited_once_with(
+            "Should the ledger use SQLite or an in-memory dict?"
+        )
+
+    @pytest.mark.asyncio
+    async def test_vague_question_allowed_when_no_active_step(self):
+        """Once every plan step is complete, there's nothing to redirect
+        back to -- a vague question is fine (and arguably expected) then."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "ask_user", "arguments": {"question": "What would you like to do next?"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Done already", status=StepStatus.completed),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        ask_tool = MagicMock()
+        ask_tool.name = "ask_user"
+        ask_tool.parameters = {
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "required": ["question"],
+        }
+        ask_tool.run = AsyncMock(
+            return_value=MagicMock(output="some answer", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"ask_user": ask_tool}.get(name)
+
+        ui = MagicMock(spec=NoopUI)
+        ui.on_ask_user = AsyncMock(return_value="some answer")
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+            ui=ui,
+        )
+        await loop.run("do something")
+
+        ask_tool.run.assert_not_awaited()
+        ui.on_ask_user.assert_awaited_once_with("What would you like to do next?")
+
+    @pytest.mark.asyncio
+    async def test_guard_disabled_via_config(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "ask_user", "arguments": {"question": "What would you like to do next?"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        ask_tool = MagicMock()
+        ask_tool.name = "ask_user"
+        ask_tool.parameters = {
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "required": ["question"],
+        }
+        ask_tool.run = AsyncMock(
+            return_value=MagicMock(output="some answer", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"ask_user": ask_tool}.get(name)
+
+        ui = MagicMock(spec=NoopUI)
+        ui.on_ask_user = AsyncMock(return_value="some answer")
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, block_vague_ask_user=False),
+            ui=ui,
+        )
+        await loop.run("do something")
+
+        ask_tool.run.assert_not_awaited()
+        ui.on_ask_user.assert_awaited_once_with("What would you like to do next?")
+
+
+class TestPrematureFinishGuard:
+    @pytest.mark.asyncio
+    async def test_finish_blocked_with_pending_steps(self):
+        """Reproduces the bug: agent reads the plan, then immediately calls
+        finish with a summary claiming work was done, without ever writing
+        anything. finish must be rejected while steps remain pending."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "Done!"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Read plan.md", status=StepStatus.completed),
+            PlanStep(index=2, description="Implement the feature", status=StepStatus.pending),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        result = await loop.run("do something")
+
+        finish_tool.run.assert_not_awaited()
+        assert result.success is False
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("cannot finish yet" in m for m in tool_msgs)
+        assert any("Implement the feature" in m for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_finish_allowed_when_all_steps_complete(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "Done!"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Read plan.md", status=StepStatus.completed),
+            PlanStep(index=2, description="Implement the feature", status=StepStatus.completed),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        result = await loop.run("do something")
+
+        finish_tool.run.assert_awaited_once()
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_finish_allowed_for_plan_with_no_steps(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "Done!"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        result = await loop.run("do something")
+
+        finish_tool.run.assert_awaited_once()
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_guard_disabled_via_config(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "Done!"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Implement the feature", status=StepStatus.pending),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, require_plan_complete_to_finish=False),
+        )
+        result = await loop.run("do something")
+
+        finish_tool.run.assert_awaited_once()
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_blocked_finish_does_not_advance_call_signature_repeat_detection(self):
+        """A blocked finish followed by real progress shouldn't be mistaken
+        for a repeated call -- different tool calls, so no false nudge."""
+        backend = _make_mock_backend()
+        backend.complete.side_effect = [
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content='<tool_call>{"name": "finish", "arguments": {"summary": "Done!"}}</tool_call>',
+                )
+            ),
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content='<tool_call>{"name": "write", "arguments": {"path": "a.py", "content": "x"}}</tool_call>',
+                )
+            ),
+        ]
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Implement the feature", status=StepStatus.pending),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {"type": "object", "properties": {"summary": {"type": "string"}}}
+        finish_tool.run = AsyncMock(return_value=MagicMock(output="done", success=True, error=None))
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        }
+        write_tool.run = AsyncMock(
+            return_value=MagicMock(output="wrote a.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"finish": finish_tool, "write": write_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=2, lint_after_write=False),
+        )
+        await loop.run("do something")
+
+        write_tool.run.assert_awaited_once()
+        finish_tool.run.assert_not_awaited()
+
+
+class TestFeedbackVisibleInUI:
+    @pytest.mark.asyncio
+    async def test_verify_feedback_shown_via_on_tool_result(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "write", "arguments": {"path": "a.py", "content": "x"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = _make_default_plan()
+        planner.generate_plan.return_value = plan
+        planner.verify_step = AsyncMock(
+            return_value=(StepVerdict.partial, "only wrote a stub")
+        )
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        }
+        write_tool.run = AsyncMock(
+            return_value=MagicMock(output="wrote a.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"write": write_tool}.get(name)
+
+        ui = MagicMock()
+        ui.on_tool_result = MagicMock()
+        ui.on_approval_request = AsyncMock(return_value=None)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, lint_after_write=False),
+            ui=ui,
+        )
+        await loop.run("do something")
+
+        calls = [c.args for c in ui.on_tool_result.call_args_list]
+        assert any(name == "plan-check" and "not fully done yet" in msg for name, msg in calls)
+
+    @pytest.mark.asyncio
+    async def test_repeat_nudge_shown_via_on_tool_result(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "ls_tree", "arguments": {}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        ls_tool = MagicMock()
+        ls_tool.name = "ls_tree"
+        ls_tool.parameters = {"type": "object", "properties": {}}
+        ls_tool.run = AsyncMock(
+            return_value=MagicMock(output="tree", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"ls_tree": ls_tool}.get(name)
+
+        ui = MagicMock()
+        ui.on_tool_result = MagicMock()
+        ui.on_approval_request = AsyncMock(return_value=None)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=2),
+            ui=ui,
+        )
+        await loop.run("do something")
+
+        calls = [c.args for c in ui.on_tool_result.call_args_list]
+        assert any(name == "repeat-guard" and "repeated the exact same tool call" in msg for name, msg in calls)
+
+
+class TestReadBeforeEditGuard:
+    @pytest.mark.asyncio
+    async def test_edit_on_unread_existing_file_is_blocked(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "edit", "arguments": {"path": "a.py", "old_string": "x", "new_string": "y"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(
+            side_effect=lambda p: _FakeResolvedPath(p, exists=True)
+        )
+        registry = _make_mock_tool_registry()
+        edit_tool = MagicMock()
+        edit_tool.name = "edit"
+        edit_tool.parameters = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+            },
+            "required": ["path", "old_string", "new_string"],
+        }
+        edit_tool.run = AsyncMock(
+            return_value=MagicMock(output="edited a.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"edit": edit_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        edit_tool.run.assert_not_awaited()
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("haven't read" in m for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_edit_on_new_file_is_allowed(self):
+        """A file that doesn't exist yet has nothing to read -- editing
+        (creating) it should proceed without a prior read."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "edit", "arguments": {"path": "new.py", "old_string": "", "new_string": "x = 1"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()  # default: resolve().exists() is False
+        registry = _make_mock_tool_registry()
+        edit_tool = MagicMock()
+        edit_tool.name = "edit"
+        edit_tool.parameters = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+            },
+            "required": ["path", "old_string", "new_string"],
+        }
+        edit_tool.run = AsyncMock(
+            return_value=MagicMock(output="edited new.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"edit": edit_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        edit_tool.run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_edit_after_read_is_allowed(self):
+        backend = _make_mock_backend()
+        backend.complete.side_effect = [
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content='<tool_call>{"name": "read", "arguments": {"path": "a.py"}}</tool_call>',
+                )
+            ),
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content='<tool_call>{"name": "edit", "arguments": {"path": "a.py", "old_string": "x", "new_string": "y"}}</tool_call>',
+                )
+            ),
+        ]
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(
+            side_effect=lambda p: _FakeResolvedPath(p, exists=True)
+        )
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = AsyncMock(
+            return_value=MagicMock(output="file contents", success=True, error=None)
+        )
+        edit_tool = MagicMock()
+        edit_tool.name = "edit"
+        edit_tool.parameters = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+            },
+            "required": ["path", "old_string", "new_string"],
+        }
+        edit_tool.run = AsyncMock(
+            return_value=MagicMock(output="edited a.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"read": read_tool, "edit": edit_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=2),
+        )
+        await loop.run("do something")
+
+        edit_tool.run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_guard_disabled_via_config(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "edit", "arguments": {"path": "a.py", "old_string": "x", "new_string": "y"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(
+            side_effect=lambda p: _FakeResolvedPath(p, exists=True)
+        )
+        registry = _make_mock_tool_registry()
+        edit_tool = MagicMock()
+        edit_tool.name = "edit"
+        edit_tool.parameters = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+            },
+            "required": ["path", "old_string", "new_string"],
+        }
+        edit_tool.run = AsyncMock(
+            return_value=MagicMock(output="edited a.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"edit": edit_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, require_read_before_edit=False),
+        )
+        await loop.run("do something")
+
+        edit_tool.run.assert_awaited_once()
 
 
 def _make_loop_with_mocks() -> ReActLoop:
@@ -1213,6 +2235,63 @@ def _make_loop_with_mocks() -> ReActLoop:
         context_assembler=context,
         planner=planner,
     )
+
+
+class TestLooksInvestigative:
+    def test_read_step(self):
+        from chef_human.agent.react_loop import _looks_investigative
+        assert _looks_investigative("Read the content of plan.md") is True
+
+    def test_identify_step(self):
+        from chef_human.agent.react_loop import _looks_investigative
+        assert _looks_investigative("Identify the tasks for part 1") is True
+
+    def test_check_step(self):
+        from chef_human.agent.react_loop import _looks_investigative
+        assert _looks_investigative("Check that the config is valid") is True
+
+    def test_case_insensitive(self):
+        from chef_human.agent.react_loop import _looks_investigative
+        assert _looks_investigative("REVIEW the existing tests") is True
+
+    def test_write_step_not_investigative(self):
+        from chef_human.agent.react_loop import _looks_investigative
+        assert _looks_investigative("Write the implementation code") is False
+
+    def test_create_step_not_investigative(self):
+        from chef_human.agent.react_loop import _looks_investigative
+        assert _looks_investigative("Create a new file named foo.py") is False
+
+    def test_test_step_not_investigative(self):
+        from chef_human.agent.react_loop import _looks_investigative
+        assert _looks_investigative("Test the implementation by running it") is False
+
+
+class TestIsVagueNextStepQuestion:
+    def test_exact_phrase_from_bug_report(self):
+        from chef_human.agent.react_loop import _is_vague_next_step_question
+        assert _is_vague_next_step_question("What would you like to do next?") is True
+
+    def test_variant_phrasing(self):
+        from chef_human.agent.react_loop import _is_vague_next_step_question
+        assert _is_vague_next_step_question("What should I do next?") is True
+        assert _is_vague_next_step_question("What do you want me to do?") is True
+
+    def test_case_insensitive(self):
+        from chef_human.agent.react_loop import _is_vague_next_step_question
+        assert _is_vague_next_step_question("WHAT'S NEXT?") is True
+
+    def test_specific_question_not_vague(self):
+        from chef_human.agent.react_loop import _is_vague_next_step_question
+        assert _is_vague_next_step_question(
+            "Should the ledger use SQLite or an in-memory dict?"
+        ) is False
+
+    def test_specific_confirmation_not_vague(self):
+        from chef_human.agent.react_loop import _is_vague_next_step_question
+        assert _is_vague_next_step_question(
+            "Do you want to overwrite the existing hello_world.py?"
+        ) is False
 
 
 class TestIsDestructiveCommand:
@@ -1335,7 +2414,7 @@ class TestParallelToolExecution:
             tool_registry=registry,
             context_assembler=context,
             planner=planner,
-            config=ReActConfig(max_steps=3),
+            config=ReActConfig(max_steps=3, require_plan_complete_to_finish=False),
         )
         result = await loop.run("do something")
         assert result.success is True
@@ -1382,6 +2461,7 @@ class TestParallelToolExecution:
             tool_registry=registry,
             context_assembler=context,
             planner=planner,
+            config=ReActConfig(require_plan_complete_to_finish=False),
         )
         result = await loop.run("do something")
         assert result.success is True
@@ -1502,6 +2582,7 @@ class TestTokenTracking:
             tool_registry=registry,
             context_assembler=context,
             planner=planner,
+            config=ReActConfig(require_plan_complete_to_finish=False),
         )
         result = await loop.run("do something")
         assert result.total_prompt_tokens == 50
@@ -1539,6 +2620,98 @@ class TestTokenTracking:
         result = await loop.run("do something")
         assert result.total_prompt_tokens == 0
         assert result.total_completion_tokens == 0
+
+    @pytest.mark.asyncio
+    async def test_planner_usage_is_included_in_totals(self):
+        """Planner's plan-building call runs on a separate LLM call path
+        from the main reasoning loop -- ReActLoop must wire itself up as
+        planner.on_usage so those tokens count towards the same total
+        (previously they were silently dropped)."""
+        # Real Planner (not a mock) so on_usage actually gets exercised via
+        # its _complete() helper.
+        planner_backend = MagicMock(spec=LLMBackend)
+        planner_backend.complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content='["Do the thing"]'),
+            usage={"prompt_tokens": 40, "completion_tokens": 8},
+        ))
+        planner = Planner(planner_backend)
+
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>',
+            ),
+            usage={"prompt_tokens": 50, "completion_tokens": 10},
+        )
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(return_value=MagicMock(output="done", success=True, error=None))
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(require_plan_complete_to_finish=False),
+        )
+        result = await loop.run("do something")
+
+        # 50 (main loop) + 40 (planner's generate_plan) = 90
+        assert result.total_prompt_tokens == 90
+        assert result.total_completion_tokens == 18
+
+    @pytest.mark.asyncio
+    async def test_planner_usage_reported_to_ui_live(self):
+        """Planner usage must reach the UI via on_token_usage as it
+        happens, not just get folded into the end-of-task total."""
+        planner_backend = MagicMock(spec=LLMBackend)
+        planner_backend.complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content='["Do the thing"]'),
+            usage={"prompt_tokens": 40, "completion_tokens": 8},
+        ))
+        planner = Planner(planner_backend)
+
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>',
+            ),
+            usage=None,
+        )
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(return_value=MagicMock(output="done", success=True, error=None))
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        ui = MagicMock(spec=NoopUI)
+        ui.on_approval_request = AsyncMock(return_value=True)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(require_plan_complete_to_finish=False),
+            ui=ui,
+        )
+        await loop.run("do something")
+
+        ui.on_token_usage.assert_any_call(40, 8)
 
 
 class TestParseFailureFeedback:
@@ -1648,6 +2821,7 @@ class TestParseFailureFeedback:
 
         planner = _make_mock_planner()
         planner.generate_plan.return_value = _make_default_plan()
+        planner.update_plan.return_value = Plan(goal="Replanned", steps=[])
         context = _make_mock_context()
         registry = _make_mock_tool_registry()
         registry.get.return_value = None  # tool doesn't exist
@@ -1701,7 +2875,9 @@ class TestToolTimeout:
             tool_registry=registry,
             context_assembler=context,
             planner=planner,
-            config=ReActConfig(max_steps=3, tool_timeout=30.0),
+            config=ReActConfig(
+                max_steps=3, tool_timeout=30.0, require_plan_complete_to_finish=False
+            ),
         )
         result = await loop.run("do something")
         assert result.success is True
@@ -1954,7 +3130,7 @@ class TestRepeatedToolCallDetection:
             tool_registry=registry,
             context_assembler=context,
             planner=planner,
-            config=ReActConfig(max_steps=5),
+            config=ReActConfig(max_steps=5, require_plan_complete_to_finish=False),
         )
         result = await loop.run("do something")
 

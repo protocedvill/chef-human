@@ -313,6 +313,152 @@ class TestCLIStructure:
         assert "ollama_model" in result.output
         assert "temperature" in result.output
 
+    def test_show_config_shows_model_tip_when_upgrade_available(self, runner):
+        from chef_human.agent.hardware import HardwareInfo
+        from chef_human.config import Settings
+        from chef_human.main import cli
+
+        with (
+            patch(
+                "chef_human.main._resolve_settings",
+                return_value=Settings(ollama_model="qwen2.5-coder:7b"),
+            ),
+            patch(
+                "chef_human.agent.model_advisor.detect_hardware",
+                return_value=HardwareInfo(ram_gb=64.0, vram_gb=None),
+            ),
+        ):
+            result = runner.invoke(cli, ["show-config"])
+        assert result.exit_code == 0
+        assert "Tip:" in result.output
+        assert "recommend-model" in result.output
+
+    def test_show_config_no_tip_when_no_upgrade_available(self, runner):
+        from chef_human.agent.hardware import HardwareInfo
+        from chef_human.main import cli
+
+        with patch(
+            "chef_human.agent.model_advisor.detect_hardware",
+            return_value=HardwareInfo(ram_gb=None, vram_gb=None),
+        ):
+            result = runner.invoke(cli, ["show-config"])
+        assert result.exit_code == 0
+        assert "Tip:" not in result.output
+
+
+class TestRecommendModelCLI:
+    def test_command_in_help(self, runner):
+        from chef_human.main import cli
+
+        result = runner.invoke(cli, ["--help"])
+        assert result.exit_code == 0
+        assert "recommend-model" in result.output
+
+    def test_shows_detected_hardware(self, runner):
+        from chef_human.agent.hardware import HardwareInfo
+        from chef_human.main import cli
+
+        with patch(
+            "chef_human.agent.hardware.detect_hardware",
+            return_value=HardwareInfo(ram_gb=32.0, vram_gb=8.0),
+        ):
+            result = runner.invoke(cli, ["recommend-model"])
+        assert result.exit_code == 0
+        assert "32.0 GB" in result.output
+        assert "8.0 GB" in result.output
+
+    def test_shows_recommendation_when_upgrade_available(self, runner):
+        from chef_human.agent.hardware import HardwareInfo
+        from chef_human.config import Settings
+        from chef_human.main import cli
+
+        with (
+            patch(
+                "chef_human.main._resolve_settings",
+                return_value=Settings(ollama_model="qwen2.5-coder:7b"),
+            ),
+            patch(
+                "chef_human.agent.hardware.detect_hardware",
+                return_value=HardwareInfo(ram_gb=64.0, vram_gb=None),
+            ),
+        ):
+            result = runner.invoke(cli, ["recommend-model"])
+        assert result.exit_code == 0
+        assert "Recommendation:" in result.output
+        assert "ollama pull" in result.output
+
+    def test_shows_already_best_fit_message(self, runner):
+        from chef_human.agent.hardware import HardwareInfo
+        from chef_human.config import Settings
+        from chef_human.main import cli
+
+        with (
+            patch(
+                "chef_human.main._resolve_settings",
+                return_value=Settings(ollama_model="qwen2.5-coder:14b"),
+            ),
+            patch(
+                "chef_human.agent.hardware.detect_hardware",
+                return_value=HardwareInfo(ram_gb=26.0, vram_gb=None),
+            ),
+        ):
+            result = runner.invoke(cli, ["recommend-model"])
+        assert result.exit_code == 0
+        assert "already using the best-fit model" in result.output
+
+    def test_no_hardware_detected_message(self, runner):
+        from chef_human.agent.hardware import HardwareInfo
+        from chef_human.main import cli
+
+        with patch(
+            "chef_human.agent.hardware.detect_hardware",
+            return_value=HardwareInfo(ram_gb=None, vram_gb=None),
+        ):
+            result = runner.invoke(cli, ["recommend-model"])
+        assert result.exit_code == 0
+        assert "Could not detect" in result.output
+
+
+class TestMainSubcommandDispatch:
+    """Regression coverage for the bug where `chef-human <command-name>` for
+    any command not in a hand-maintained set got misrouted into `run` with
+    the command name treated as the task string."""
+
+    def test_show_config_is_not_treated_as_a_task(self):
+        import sys
+        from unittest.mock import patch as mock_patch
+
+        from chef_human.main import main
+
+        with mock_patch.object(sys, "argv", ["chef-human", "show-config"]):
+            with mock_patch("chef_human.main._execute_task") as mock_exec:
+                try:
+                    main()
+                except SystemExit:
+                    pass
+        mock_exec.assert_not_called()
+
+    def test_recommend_model_is_not_treated_as_a_task(self):
+        import sys
+        from unittest.mock import patch as mock_patch
+
+        from chef_human.main import main
+
+        with mock_patch.object(sys, "argv", ["chef-human", "recommend-model"]):
+            with mock_patch("chef_human.main._execute_task") as mock_exec:
+                try:
+                    main()
+                except SystemExit:
+                    pass
+        mock_exec.assert_not_called()
+
+    def test_all_registered_commands_are_dispatch_safe(self):
+        """Every top-level command name must route to itself, not `run`."""
+        from chef_human.main import cli
+
+        for name in cli.commands:
+            assert not name.startswith("-")
+
     def test_model_flag_passed_to_execute_task(self, runner):
         from chef_human.main import cli
 
@@ -513,7 +659,12 @@ class TestExecuteTask:
         ):
             from chef_human.main import _execute_task
 
-            result = await _execute_task("test task", max_steps=5, stream=False)
+            # debug_tui=False (or headless) is required to exercise the
+            # create_agent() wiring path -- debug_tui=True (the default)
+            # now routes through _run_task_in_tui / the split-pane TUI.
+            result = await _execute_task(
+                "test task", max_steps=5, stream=False, debug_tui=False
+            )
 
             assert result.success is True
             assert result.steps_taken == 1

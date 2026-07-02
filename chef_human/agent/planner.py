@@ -4,10 +4,12 @@ import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 
-from chef_human.agent.prompts import PLANNER_SYSTEM_PROMPT
+from chef_human.agent.prompts import PLANNER_SYSTEM_PROMPT, build_verify_prompt
 from chef_human.llm.backend import (
     CompletionRequest,
+    CompletionResponse,
     LLMBackend,
     Message,
     Role,
@@ -20,6 +22,12 @@ class StepStatus(str, Enum):
     completed = "completed"
     failed = "failed"
     skipped = "skipped"
+
+
+class StepVerdict(str, Enum):
+    complete = "complete"
+    partial = "partial"
+    not_complete = "not_complete"
 
 
 @dataclass
@@ -47,12 +55,32 @@ class Plan:
             "steps": [s.to_dict() for s in self.steps],
         }
 
+    def current_step(self) -> PlanStep | None:
+        """The step that should be worked on right now: the first step (in
+        order) that isn't yet completed. Returns None once every step is
+        completed."""
+        return next((s for s in self.steps if s.status == StepStatus.pending), None)
+
 
 class Planner:
     """Generates and updates structured plans for the ReAct loop."""
 
     def __init__(self, llm_backend: LLMBackend) -> None:
         self._llm = llm_backend
+        # Set by ReActLoop so planning/verification LLM calls (which happen
+        # on a separate call path from the main reasoning loop) are counted
+        # towards the same running token total and live UI display -- see
+        # ReActLoop._record_usage.
+        self.on_usage: Callable[[int, int], None] | None = None
+
+    async def _complete(self, request: CompletionRequest) -> CompletionResponse:
+        response = await self._llm.complete(request)
+        if response.usage and self.on_usage is not None:
+            self.on_usage(
+                response.usage.get("prompt_tokens", 0),
+                response.usage.get("completion_tokens", 0),
+            )
+        return response
 
     async def generate_plan(self, task: str, repo_context: str = "") -> Plan:
         messages = [
@@ -64,12 +92,43 @@ class Planner:
             )
         messages.append(Message(role=Role.user, content=f"Task: {task}"))
 
-        response = await self._llm.complete(
+        response = await self._complete(
             CompletionRequest(messages=messages, temperature=0.0, max_tokens=2048)
         )
 
         steps = self._parse_steps(response.message.content)
         return Plan(goal=task, steps=steps)
+
+    async def verify_step(
+        self, plan: Plan, step: PlanStep, evidence: str
+    ) -> tuple[StepVerdict, str]:
+        """Check whether `step` was actually accomplished, based on the
+        evidence (tool results or reasoning text) from the turn that
+        appeared to finish it -- instead of assuming any non-failing turn
+        means the current step is done."""
+        prompt = build_verify_prompt(goal=plan.goal, step=step.description, evidence=evidence)
+        response = await self._complete(
+            CompletionRequest(
+                messages=[Message(role=Role.user, content=prompt)],
+                temperature=0.0,
+                max_tokens=100,
+            )
+        )
+        return self._parse_verdict(response.message.content)
+
+    @staticmethod
+    def _parse_verdict(content: str) -> tuple[StepVerdict, str]:
+        text = content.strip()
+        reason_match = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE)
+        reason = reason_match.group(1).strip() if reason_match else ""
+        upper = text.upper()
+        if "NOT_COMPLETE" in upper or "NOT COMPLETE" in upper:
+            return StepVerdict.not_complete, reason
+        if "PARTIAL" in upper:
+            return StepVerdict.partial, reason
+        if "COMPLETE" in upper:
+            return StepVerdict.complete, reason
+        return StepVerdict.not_complete, reason or "Could not parse verifier response"
 
     async def update_plan(self, plan: Plan, failure_context: str) -> Plan:
         messages = [
@@ -86,7 +145,7 @@ class Planner:
                 f"Output a revised JSON array of remaining steps.",
             ),
         ]
-        response = await self._llm.complete(
+        response = await self._complete(
             CompletionRequest(messages=messages, temperature=0.0, max_tokens=2048)
         )
         steps = self._parse_steps(response.message.content)

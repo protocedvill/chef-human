@@ -176,21 +176,10 @@ Implement a structured ReAct (Reasoning + Acting) loop:
 - Streaming output of model reasoning
 - Colorized diff output
 
-### 5.2 TUI (optional)
+### 5.2 TUI
 
 - Terminal UI with split panes (chat, file tree, diff view)
 - Built with Textual or Bubble Tea (Go)
-
-### 5.3 IDE Extension (optional)
-
-- VS Code extension using Language Server Protocol
-- Inline suggestions, chat panel, file editing
-
-### 5.4 Packaging
-
-- Single binary distribution with embedded models (via Ollama/llama.cpp bundling)
-- Docker image for server mode
-- pip/npm installer
 
 ---
 

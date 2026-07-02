@@ -9,6 +9,7 @@ Requires-Dist: pydantic>=2.0
 Requires-Dist: pydantic-settings>=2.0
 Requires-Dist: rich>=13.0
 Requires-Dist: click>=8.0
+Requires-Dist: textual>=0.60
 Requires-Dist: tomli>=2.0; python_version < "3.11"
 Provides-Extra: llamacpp
 Requires-Dist: llama-cpp-python>=0.3.0; extra == "llamacpp"

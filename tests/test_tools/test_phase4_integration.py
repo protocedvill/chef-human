@@ -114,3 +114,24 @@ class TestPhase4ToolRegistry:
         registry = create_tool_registry(workspace=ws)
         tool = registry.get("lint_fix")
         assert tool is not None
+
+    def test_read_write_edit_receive_file_context_without_symbol_index(self, tmp_path: Path):
+        """file_context wiring for read/write/edit must not require a
+        symbol_index -- large repos on the RAG path have no symbol_index
+        but should still keep read/written files visible in context."""
+        ws = WorkspaceManager(root=tmp_path)
+        tokenizer = ApproxTokenizer()
+        fc = FileContextManager(workspace=ws, tokenizer=tokenizer)
+        registry = create_tool_registry(workspace=ws, file_context=fc)
+
+        assert registry.get("read")._file_context is fc
+        assert registry.get("write")._file_context is fc
+        assert registry.get("edit")._file_context is fc
+
+    def test_read_write_edit_tolerate_missing_file_context(self, tmp_path: Path):
+        ws = WorkspaceManager(root=tmp_path)
+        registry = create_tool_registry(workspace=ws)
+
+        assert registry.get("read")._file_context is None
+        assert registry.get("write")._file_context is None
+        assert registry.get("edit")._file_context is None

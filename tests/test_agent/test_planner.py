@@ -10,6 +10,7 @@ from chef_human.agent.planner import (
     PlanStep,
     Planner,
     StepStatus,
+    StepVerdict,
 )
 from chef_human.llm.backend import CompletionResponse, Message, Role
 
@@ -59,6 +60,41 @@ class TestPlan:
         plan = Plan(goal="Fix the bug", steps=steps)
         assert len(plan.steps) == 2
         assert plan.steps[0].description == "Find the bug"
+
+
+class TestCurrentStep:
+    def test_returns_first_pending_step(self):
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="a", status=StepStatus.completed),
+            PlanStep(index=2, description="b", status=StepStatus.pending),
+            PlanStep(index=3, description="c", status=StepStatus.pending),
+        ])
+        step = plan.current_step()
+        assert step is not None
+        assert step.description == "b"
+
+    def test_returns_none_when_all_completed(self):
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="a", status=StepStatus.completed),
+        ])
+        assert plan.current_step() is None
+
+    def test_returns_none_for_empty_plan(self):
+        plan = Plan(goal="g", steps=[])
+        assert plan.current_step() is None
+
+    def test_ignores_in_progress_and_failed_steps(self):
+        """Only 'pending' counts as the current step -- in_progress is a
+        transient marker set during verification, and failed/skipped steps
+        are done being worked on."""
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="a", status=StepStatus.failed),
+            PlanStep(index=2, description="b", status=StepStatus.in_progress),
+            PlanStep(index=3, description="c", status=StepStatus.pending),
+        ])
+        step = plan.current_step()
+        assert step is not None
+        assert step.description == "c"
 
 
 class TestParseSteps:
@@ -330,6 +366,171 @@ class TestUpdatePlan:
         assert "Permission denied" in user_msg
         assert "Fix" in user_msg
         assert "[✗]" in user_msg
+
+
+class TestParseVerdict:
+    def test_complete(self):
+        verdict, reason = Planner._parse_verdict("VERDICT: COMPLETE\nREASON: file was created")
+        assert verdict == StepVerdict.complete
+        assert reason == "file was created"
+
+    def test_partial(self):
+        verdict, reason = Planner._parse_verdict("VERDICT: PARTIAL\nREASON: only half done")
+        assert verdict == StepVerdict.partial
+        assert reason == "only half done"
+
+    def test_not_complete(self):
+        verdict, reason = Planner._parse_verdict("VERDICT: NOT_COMPLETE\nREASON: nothing happened")
+        assert verdict == StepVerdict.not_complete
+        assert reason == "nothing happened"
+
+    def test_not_complete_with_space_variant(self):
+        verdict, _ = Planner._parse_verdict("VERDICT: NOT COMPLETE\nREASON: no evidence")
+        assert verdict == StepVerdict.not_complete
+
+    def test_case_insensitive(self):
+        verdict, _ = Planner._parse_verdict("verdict: complete\nreason: done")
+        assert verdict == StepVerdict.complete
+
+    def test_unparseable_defaults_to_not_complete(self):
+        verdict, reason = Planner._parse_verdict("I'm not sure what happened here.")
+        assert verdict == StepVerdict.not_complete
+        assert reason == "Could not parse verifier response"
+
+    def test_missing_reason_is_empty_string(self):
+        verdict, reason = Planner._parse_verdict("VERDICT: COMPLETE")
+        assert verdict == StepVerdict.complete
+        assert reason == ""
+
+
+class TestVerifyStep:
+    @pytest.mark.asyncio
+    async def test_returns_parsed_verdict(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content="VERDICT: COMPLETE\nREASON: evidence shows it"),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = Plan(goal="Add a function", steps=[])
+        step = PlanStep(index=1, description="Write the function")
+        verdict, reason = await planner.verify_step(plan, step, "wrote function foo() in utils.py")
+
+        assert verdict == StepVerdict.complete
+        assert reason == "evidence shows it"
+
+    @pytest.mark.asyncio
+    async def test_sends_goal_step_and_evidence(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content="VERDICT: PARTIAL\nREASON: half done"),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = Plan(goal="Add a function", steps=[])
+        step = PlanStep(index=1, description="Write the function")
+        await planner.verify_step(plan, step, "created empty utils.py")
+
+        call_args = mock_complete.await_args
+        request = call_args.args[0]
+        prompt = request.messages[0].content
+        assert "Add a function" in prompt
+        assert "Write the function" in prompt
+        assert "created empty utils.py" in prompt
+
+
+class TestUsageCallback:
+    """Planner's plan-building/verification LLM calls run on a separate call
+    path from ReActLoop's main reasoning loop, so token usage from them was
+    previously invisible to any UI -- on_usage lets a caller (ReActLoop)
+    observe every completion's usage regardless of which Planner method
+    triggered it."""
+
+    @pytest.mark.asyncio
+    async def test_generate_plan_reports_usage(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content='["Step 1"]'),
+            usage={"prompt_tokens": 30, "completion_tokens": 5},
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        received: list[tuple[int, int]] = []
+        planner.on_usage = lambda p, c: received.append((p, c))
+
+        await planner.generate_plan("Do the thing")
+
+        assert received == [(30, 5)]
+
+    @pytest.mark.asyncio
+    async def test_verify_step_reports_usage(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content="VERDICT: COMPLETE\nREASON: ok"),
+            usage={"prompt_tokens": 12, "completion_tokens": 3},
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        received: list[tuple[int, int]] = []
+        planner.on_usage = lambda p, c: received.append((p, c))
+
+        plan = Plan(goal="g", steps=[])
+        step = PlanStep(index=1, description="step")
+        await planner.verify_step(plan, step, "evidence")
+
+        assert received == [(12, 3)]
+
+    @pytest.mark.asyncio
+    async def test_update_plan_reports_usage(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content='["New step"]'),
+            usage={"prompt_tokens": 20, "completion_tokens": 8},
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        received: list[tuple[int, int]] = []
+        planner.on_usage = lambda p, c: received.append((p, c))
+
+        plan = Plan(goal="g", steps=[])
+        await planner.update_plan(plan, "it failed")
+
+        assert received == [(20, 8)]
+
+    @pytest.mark.asyncio
+    async def test_no_usage_no_callback_when_none_set(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content='["Step 1"]'),
+            usage={"prompt_tokens": 30, "completion_tokens": 5},
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        # on_usage defaults to None -- must not raise.
+        await planner.generate_plan("Do the thing")
+
+    @pytest.mark.asyncio
+    async def test_no_callback_when_usage_is_none(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content='["Step 1"]'),
+            usage=None,
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        received: list[tuple[int, int]] = []
+        planner.on_usage = lambda p, c: received.append((p, c))
+
+        await planner.generate_plan("Do the thing")
+
+        assert received == []
 
 
 def _make_mock_backend(steps: list[PlanStep]) -> MagicMock:

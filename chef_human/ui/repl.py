@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 from rich.prompt import Prompt
 
+from chef_human.ui.protocol import ask_via_stdin
+
 if TYPE_CHECKING:
     from chef_human.agent.parser import ParsedToolCall
     from chef_human.agent.planner import Plan
@@ -61,6 +63,12 @@ class ReplUI:
         icon = "✗" if result.startswith("Error:") else "✓"
         summary = result[:100].replace("\n", " ").strip()
         self._console.print(f"  {icon} [bold]{name}[/] → {summary}")
+
+    def on_token_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
+        pass
+
+    async def on_ask_user(self, question: str) -> str:
+        return await ask_via_stdin(question)
 
     def on_replan(self) -> None:
         self._console.print("[bold yellow]↻ Re-planning...[/]")

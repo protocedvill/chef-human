@@ -32,7 +32,7 @@ $PYTHON -m pip install -e ".[dev]" 2>&1 || {
     echo "Falling back to --no-deps install..."
     $PYTHON -m pip install -e ".[dev]" --no-deps
     echo "Installing core dependencies individually..."
-    $PYTHON -m pip install --no-deps ollama rich click python-dotenv tomli pytest ruff pyright pytest-asyncio 2>/dev/null || true
+    $PYTHON -m pip install --no-deps ollama rich click textual python-dotenv tomli pytest ruff pyright pytest-asyncio 2>/dev/null || true
     echo "Core dependencies installed (some optional deps may be missing)."
     echo "To install optional extras later:"
     echo "  pip install -e \".[llamacpp]\"   # llama.cpp backend"
@@ -68,11 +68,17 @@ fi
 
 # 5. Verify
 echo ""
+$PYTHON -c 'import textual' 2>&1 || {
+    echo "Error: textual is required (powers the default split-pane TUI) but failed to import."
+    echo "Install it manually: pip install textual>=0.60"
+    exit 1
+}
 echo "=== Setup complete ==="
 echo ""
 echo "Verify with:"
 echo "  python -c 'from chef_human.llm import create_backend; b = create_backend(); print(b.model_name)'"
 echo ""
 echo "Next steps:"
+echo "  - Run 'chef-human \"some task\"' to try the default split-pane TUI"
 echo "  - Read docs/INSTALL.md  for detailed setup guide"
 echo "  - Read docs/USAGE.md    for usage examples"

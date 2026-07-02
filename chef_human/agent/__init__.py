@@ -166,7 +166,6 @@ def create_context_assembler(
 
 
 def create_agent(
-    debug_tui: bool = False,
     max_steps: int = 25,
     workspace_root: str | None = None,
 ) -> tuple[ReActLoop, ContextAssembler]:
@@ -174,7 +173,6 @@ def create_agent(
     from chef_human.agent.react_loop import ReActConfig, ReActLoop
     from chef_human.llm import create_backend
     from chef_human.tools import create_tool_registry
-    from chef_human.ui.debug_tui import DebugTUI
     from chef_human.ui.protocol import NoopUI
 
     backend = create_backend()
@@ -190,7 +188,6 @@ def create_agent(
         max_steps=max_steps,
         tool_timeout=settings.tool_timeout,
     )
-    ui = DebugTUI() if debug_tui else NoopUI()
 
     loop = ReActLoop(
         llm_backend=backend,
@@ -198,7 +195,7 @@ def create_agent(
         context_assembler=context,
         planner=planner,
         config=config,
-        ui=ui,
+        ui=NoopUI(),
     )
     return loop, context
 

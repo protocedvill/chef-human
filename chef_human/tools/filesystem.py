@@ -8,6 +8,7 @@ from chef_human.tools.diff import compute_diff, find_closest_match
 from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
+    from chef_human.agent.file_context import FileContextManager
     from chef_human.agent.workspace import WorkspaceManager
     from chef_human.tools.diff import DiffStore
 
@@ -25,8 +26,13 @@ class ReadTool:
         "required": ["path"],
     }
 
-    def __init__(self, workspace: WorkspaceManager) -> None:
+    def __init__(
+        self,
+        workspace: WorkspaceManager,
+        file_context: FileContextManager | None = None,
+    ) -> None:
         self._workspace = workspace
+        self._file_context = file_context
 
     async def run(self, path: str, offset: int = 1, limit: int | None = None) -> ToolResult:
         resolved = self._workspace.resolve(path)
@@ -44,6 +50,13 @@ class ReadTool:
             text = resolved.read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot read {path}: {exc}")
+
+        if self._file_context is not None:
+            # Keep the whole file prominently visible in the "## File
+            # Context" section of future prompts (not just buried as one
+            # more tool-result message in conversation history), so a small
+            # model doesn't reflexively re-read a file it already has.
+            self._file_context.remember(path, text)
 
         lines = text.splitlines(keepends=True)
         if offset < 1:
@@ -72,9 +85,15 @@ class WriteTool:
         "required": ["path", "content"],
     }
 
-    def __init__(self, workspace: WorkspaceManager, diff_store: DiffStore | None = None) -> None:
+    def __init__(
+        self,
+        workspace: WorkspaceManager,
+        diff_store: DiffStore | None = None,
+        file_context: FileContextManager | None = None,
+    ) -> None:
         self._workspace = workspace
         self._diff_store = diff_store
+        self._file_context = file_context
 
     async def run(self, path: str, content: str) -> ToolResult:
         resolved = self._workspace.resolve(path)
@@ -95,6 +114,9 @@ class WriteTool:
             resolved.write_text(content, encoding="utf-8")
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
+
+        if self._file_context is not None:
+            self._file_context.remember(path, content)
 
         lines = content.count("\n") + 1
         output_parts: list[str] = [f"Wrote {lines} lines to {path}"]
@@ -124,9 +146,15 @@ class EditTool:
         "required": ["path", "old_string", "new_string"],
     }
 
-    def __init__(self, workspace: WorkspaceManager, diff_store: DiffStore | None = None) -> None:
+    def __init__(
+        self,
+        workspace: WorkspaceManager,
+        diff_store: DiffStore | None = None,
+        file_context: FileContextManager | None = None,
+    ) -> None:
         self._workspace = workspace
         self._diff_store = diff_store
+        self._file_context = file_context
 
     async def run(
         self,
@@ -179,6 +207,9 @@ class EditTool:
             resolved.write_text(new_content, encoding="utf-8")
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
+
+        if self._file_context is not None:
+            self._file_context.remember(path, new_content)
 
         output_parts: list[str] = []
         output_parts.append(f"Applied edit to {path} ({count} occurrence{'s' if count != 1 else ''})")

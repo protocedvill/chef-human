@@ -22,7 +22,7 @@ the task is read from stdin instead.
 
 | Option | Default | Description |
 |---|---|---|
-| `--debug-tui` / `--no-debug-tui` | `--debug-tui` | Show the step-by-step debug TUI |
+| `--debug-tui` / `--no-debug-tui` | `--debug-tui` | Use the split-pane TUI (default) vs. plain streaming output |
 | `--max-steps INT` | `25` | Max agent steps before giving up |
 | `--workspace PATH` | current directory | Workspace root the agent operates in (must exist) |
 | `--no-stream` | off | Disable streaming LLM output |
@@ -50,6 +50,32 @@ chef-human run --resume <session_id>
 ```
 
 Exit code is `1` if the task did not succeed, `0` otherwise.
+
+By default (`--debug-tui`, non-headless), `run` launches inside the split-pane Textual TUI
+(file tree, chat/log, diff preview — see `chef-human tui` below) with your task auto-submitted;
+the TUI exits automatically once that task finishes and the plain-text result summary prints as
+usual. Pass `--no-debug-tui` for the older plain streaming output instead, or `--headless` for
+JSON-only output with no TUI at all (the right choice for CI/scripting).
+
+### `chef-human tui`
+
+Explicitly start the split-pane Textual TUI as an interactive, multi-turn session (no task
+argument — type tasks in the input box). Takes the same `--max-steps`, `--workspace`, `--model`,
+`--temperature`, `--config`, `--resume`/`--continue`, and `--save-dir` options as `run`/`repl`.
+
+```bash
+chef-human tui --workspace .
+```
+
+Layout: a file tree, top-left (click a file to preview it), with a session stats panel below it
+(tasks run, tool calls/errors/replans, cumulative token usage, current status and plan step, and
+recent warnings — e.g. a blocked repeated tool call or a step the agent tried to skip); a chat/log
+pane showing plan, reasoning, and tool activity, top-right; and a diff/preview pane, bottom-right,
+that switches to show the diff the moment a write/edit/patch tool changes something; with an input
+bar at the bottom. Destructive shell commands prompt via a modal Approve/Reject dialog instead of
+a terminal `y/N` prompt. Click-drag in a log pane to select text and `Ctrl+C`/`Cmd+C` to copy it
+to your system clipboard (works in most terminals; notably not macOS Terminal.app — use iTerm2 or
+another terminal there). `Ctrl+Q` quits and auto-saves the session, same as `repl`.
 
 ### `chef-human repl`
 

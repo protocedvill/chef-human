@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from chef_human.agent.context import ContextAssembler
 from chef_human.agent.linter import annotate_diff_with_lint, format_lint_result, run_lint
 from chef_human.agent.parser import (
     ParsedToolCall,
-    extract_scratchpad,
+    extract_scratchpad_entries,
     format_parse_error,
     looks_like_tool_call,
     parse_tool_calls,
@@ -19,9 +20,10 @@ from chef_human.agent.parser import (
     strip_tool_calls,
     validate_arguments,
 )
-from chef_human.agent.planner import Plan, Planner, StepStatus
+from chef_human.agent.planner import Plan, Planner, StepStatus, StepVerdict
 from chef_human.agent.prompts import build_agent_prompt
 from chef_human.agent.retry import RetryAction, RetryManager
+from chef_human.agent.scratchpad import Scratchpad
 from chef_human.llm.backend import (
     CompletionRequest,
     LLMBackend,
@@ -33,10 +35,40 @@ from chef_human.ui.protocol import NoopUI, ReActUI
 
 logger = logging.getLogger(__name__)
 
+# Steps matching these don't produce a durable artifact to point to as
+# evidence -- asking a small model "was this really done?" about a read/
+# investigate-style step is prone to false negatives, which just prompts it
+# to redo the same read over and over.
+_INVESTIGATIVE_KEYWORDS = (
+    "read", "identify", "check", "review", "analyz", "examine", "inspect",
+    "explore", "understand", "look at", "list", "find", "search", "locate",
+)
+
+# Generic "what should I do" questions that ignore an active plan step
+# entirely, rather than asking about a genuine ambiguity.
+_VAGUE_ASK_USER_PATTERNS = (
+    "what would you like to do next",
+    "what should i do next",
+    "what do you want me to do",
+    "what would you like me to do",
+    "what's next",
+    "what next",
+)
+
 
 def _rollback_file(path: str, content: str) -> None:
     """Restore a file to its pre-write content."""
     Path(path).write_text(content)
+
+
+def _looks_investigative(description: str) -> bool:
+    lowered = description.lower()
+    return any(kw in lowered for kw in _INVESTIGATIVE_KEYWORDS)
+
+
+def _is_vague_next_step_question(question: str) -> bool:
+    q = question.lower().strip().rstrip("?")
+    return any(p in q for p in _VAGUE_ASK_USER_PATTERNS)
 
 
 @dataclass
@@ -72,6 +104,9 @@ class ReActConfig:
     save_dir: str | None = None
     lint_after_write: bool = True
     tool_timeout: float = 60.0
+    require_read_before_edit: bool = True
+    block_vague_ask_user: bool = True
+    require_plan_complete_to_finish: bool = True
 
 
 class ReActLoop:
@@ -92,13 +127,29 @@ class ReActLoop:
         self._ui = ui or NoopUI()
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
+        # Planner's own LLM calls (plan-building, step verification) run on
+        # a separate call path from the main reasoning loop below -- wire
+        # them into the same running total and live UI updates.
+        self._planner.on_usage = self._record_usage
+
+    def _record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
+        self._total_prompt_tokens += prompt_tokens
+        self._total_completion_tokens += completion_tokens
+        self._ui.on_token_usage(prompt_tokens, completion_tokens)
 
     async def run(self, task: str) -> AgentResult:
+        logger.info("Task started: %s", task[:200])
         self._ui.on_start(task)
         steps_taken = 0
         plan = await self._plan_task(task)
-        scratchpad = ""
+        logger.info(
+            "Plan generated: %d step(s): %s",
+            len(plan.steps),
+            [s.description for s in plan.steps],
+        )
+        scratchpad = Scratchpad()
         last_call_signature: str | None = None
+        files_read: set[str] = set()
         retry_mgr = RetryManager(
             max_retries_per_step=self._config.max_retries_per_step,
             max_replans=self._config.max_replans,
@@ -110,15 +161,23 @@ class ReActLoop:
 
         try:
             while steps_taken < self._config.max_steps:
+                current = plan.current_step()
+                logger.debug(
+                    "Turn starting: steps_taken=%d/%d, current step=%r",
+                    steps_taken, self._config.max_steps,
+                    current.description if current else "(none -- all complete)",
+                )
                 system_prompt = build_agent_prompt(
                     plan=plan,
                     tool_defs=self._tools.get_definitions(),
-                    scratchpad=scratchpad,
+                    scratchpad=scratchpad.render(),
                 )
                 messages = self._context.assemble(
                     system_prompt=system_prompt,
                 )
                 self._ui.on_reasoning_start()
+                llm_start = time.monotonic()
+                logger.debug("LLM call starting (stream=%s, %d messages)", self._config.stream, len(messages))
                 if self._config.stream:
                     full_content = ""
                     async for token, final_response in self._llm.complete_stream(
@@ -145,16 +204,24 @@ class ReActLoop:
                             max_tokens=self._config.max_tokens_per_response,
                         )
                     )
+                logger.debug(
+                    "LLM call finished in %.1fs (%d chars, usage=%s)",
+                    time.monotonic() - llm_start,
+                    len(response.message.content),
+                    response.usage,
+                )
                 self._ui.on_reasoning(response.message.content)
 
                 if response.usage:
-                    self._total_prompt_tokens += response.usage.get("prompt_tokens", 0)
-                    self._total_completion_tokens += response.usage.get("completion_tokens", 0)
+                    self._record_usage(
+                        response.usage.get("prompt_tokens", 0),
+                        response.usage.get("completion_tokens", 0),
+                    )
 
-                new_scratchpad = extract_scratchpad(response.message.content)
-                if new_scratchpad is not None:
-                    scratchpad = new_scratchpad
-                    logger.debug("Scratchpad updated: %s", scratchpad[:100])
+                new_entries = extract_scratchpad_entries(response.message.content)
+                if new_entries:
+                    scratchpad.add_lines(new_entries)
+                    logger.debug("Scratchpad gained %d new entr%s", len(new_entries), "y" if len(new_entries) == 1 else "ies")
 
                 tool_calls = parse_tool_calls(response.message.content)
                 non_tool_reasoning = strip_scratchpad(response.message.content)
@@ -177,9 +244,12 @@ class ReActLoop:
                             response.message.content,
                             detail="Could not extract valid tool call JSON",
                         )
+                        logger.warning("Response looked like a tool call but failed to parse")
                         self._context.conversation.add_message(
                             Message(role=Role.tool, content=parse_error)
                         )
+                    else:
+                        logger.debug("No tool calls this turn (plain reasoning only)")
 
                     steps_taken += 1
                     if parse_error:
@@ -188,9 +258,17 @@ class ReActLoop:
                         action = retry_mgr.record_iteration(0, 0, [])
 
                     if action == RetryAction.STEP_COMPLETED:
-                        self._mark_step_completed(plan, [])
+                        verify_feedback = await self._verify_and_mark_step(
+                            plan, non_tool_reasoning
+                        )
+                        if verify_feedback:
+                            self._ui.on_tool_result("plan-check", verify_feedback)
+                            self._context.conversation.add_message(
+                                Message(role=Role.tool, content=verify_feedback)
+                            )
 
                     if self._detect_finish(non_tool_reasoning) and not parse_error:
+                        logger.info("Task finished via finish-phrase detection after %d step(s)", steps_taken)
                         return self._make_result(
                             plan=plan,
                             steps_taken=steps_taken,
@@ -213,6 +291,7 @@ class ReActLoop:
                 parallel_candidates: list[tuple[ParsedToolCall, object]] = []
 
                 for tc in tool_calls:
+                    logger.debug("Tool call: %s(%s)", tc.name, tc.arguments)
                     self._ui.on_tool_call(tc)
 
                     tool = self._tools.get(tc.name)
@@ -235,7 +314,59 @@ class ReActLoop:
                         continue
 
                     if tc.name == "finish":
+                        if self._config.require_plan_complete_to_finish:
+                            current = plan.current_step()
+                            if current is not None:
+                                logger.info(
+                                    "Blocked premature finish: unfinished step %r remains",
+                                    current.description,
+                                )
+                                result = self._make_tool_error(
+                                    "You cannot finish yet -- there's an unfinished plan step: "
+                                    f"'{current.description}'. Complete it (and any remaining "
+                                    "steps) before calling finish. A tool result claiming work "
+                                    "is done is not evidence -- you must actually perform the "
+                                    "step (e.g. write/edit the relevant files)."
+                                )
+                                self._ui.on_tool_result(tc.name, result)
+                                tool_results.append(result)
+                                failed_calls += 1
+                                continue
                         finish_call = (tc, tool)
+                        continue
+
+                    if tc.name == "ask_user":
+                        current = plan.current_step()
+                        question = tc.arguments.get("question", "")
+                        if (
+                            self._config.block_vague_ask_user
+                            and current is not None
+                            and _is_vague_next_step_question(question)
+                        ):
+                            logger.info("Blocked vague ask_user: %r", question[:150])
+                            result = self._make_tool_error(
+                                "Don't ask what to do next -- there's an active plan step: "
+                                f"'{current.description}'. Work on it directly instead of "
+                                "asking; only use ask_user for a genuine, specific ambiguity."
+                            )
+                            self._ui.on_tool_result(tc.name, result)
+                            tool_results.append(result)
+                            failed_calls += 1
+                            continue
+
+                        # Route through the active UI rather than AskUserTool.run()'s
+                        # own sys.stdin.readline() -- under the Textual TUI, Textual
+                        # owns the terminal in raw mode, so a plain blocking stdin
+                        # read there both hangs the whole event loop and can never
+                        # actually receive the answer (no visible prompt, nothing
+                        # forwarded to the tool's file descriptor). Each UI decides
+                        # how it collects an answer (a proper modal for the TUI,
+                        # print+stdin for terminal-based UIs).
+                        logger.info("ask_user: %r", question[:200])
+                        answer = await self._ui.on_ask_user(question)
+                        logger.info("ask_user answer: %r", answer[:200])
+                        self._ui.on_tool_result(tc.name, answer)
+                        tool_results.append(answer)
                         continue
 
                     if (
@@ -243,7 +374,9 @@ class ReActLoop:
                         and tc.name == "bash"
                     ):
                         if self._is_destructive_command(tc.arguments.get("command", "")):
+                            logger.info("Requesting approval for destructive command: %s", tc.arguments.get("command", "")[:200])
                             approved = await self._request_approval(tc)
+                            logger.info("Approval result: %s", approved)
                             if not approved:
                                 result = self._make_tool_error(
                                     "Command rejected by user: destructive operation requires approval"
@@ -252,6 +385,23 @@ class ReActLoop:
                                 tool_results.append(result)
                                 failed_calls += 1
                                 continue
+
+                    if (
+                        self._config.require_read_before_edit
+                        and tc.name in ("write", "edit")
+                    ):
+                        read_key = self._unread_existing_file(tc.arguments.get("path", ""), files_read)
+                        if read_key is not None:
+                            logger.info("Blocked %s of unread file: %r", tc.name, read_key)
+                            result = self._make_tool_error(
+                                f"You haven't read '{read_key}' yet this session. Read it "
+                                "first with the `read` tool so this change is based on the "
+                                "file's actual current content, not a guess."
+                            )
+                            self._ui.on_tool_result(tc.name, result)
+                            tool_results.append(result)
+                            failed_calls += 1
+                            continue
 
                     parallel_candidates.append((tc, tool))
 
@@ -271,7 +421,14 @@ class ReActLoop:
                         )
                         for tc, tool in parallel_candidates
                     ]
+                    dispatch_start = time.monotonic()
                     gathered = await asyncio.gather(*coros, return_exceptions=True)
+                    logger.debug(
+                        "Dispatched %d tool call(s) in %.1fs: %s",
+                        len(parallel_candidates),
+                        time.monotonic() - dispatch_start,
+                        [tc.name for tc, _ in parallel_candidates],
+                    )
 
                     for (tc, _tool), tool_result in zip(parallel_candidates, gathered):
                         if isinstance(tool_result, Exception):
@@ -289,6 +446,18 @@ class ReActLoop:
 
                         self._ui.on_tool_result(tc.name, result)
                         tool_results.append(result)
+
+                        # Track files the model has now seen the content of --
+                        # via an explicit read, or because it just wrote/edited
+                        # them itself (so a later edit to the same file isn't
+                        # blocked by the read-before-edit guard below).
+                        if tool_result.success and tc.name in ("read", "write", "edit"):
+                            seen_path = tc.arguments.get("path", "")
+                            if seen_path:
+                                try:
+                                    files_read.add(str(self._context.workspace.resolve(seen_path)))
+                                except Exception:
+                                    pass
 
                         if (
                             self._config.lint_after_write
@@ -346,6 +515,7 @@ class ReActLoop:
                     else:
                         finish_msg = finish_result.output if finish_result.success else finish_result.error or ""
                         self._ui.on_tool_result(tc.name, finish_msg)
+                        logger.info("Task finished via finish tool after %d step(s)", steps_taken)
                         return self._make_result(
                             plan=plan,
                             steps_taken=steps_taken,
@@ -360,6 +530,7 @@ class ReActLoop:
                         "action that makes progress (e.g. write or edit a file) or "
                         "call `finish` if the task is actually already complete."
                     )
+                    self._ui.on_tool_result("repeat-guard", nudge)
                     tool_results.append(nudge)
                     failed_calls += 1
 
@@ -372,16 +543,29 @@ class ReActLoop:
                 action = retry_mgr.record_iteration(total_calls, failed_calls, tool_results)
 
                 if action == RetryAction.STEP_COMPLETED:
-                    self._mark_step_completed(plan, tool_results)
+                    verify_feedback = await self._verify_and_mark_step(
+                        plan, "\n".join(tool_results), has_tool_evidence=True
+                    )
+                    if verify_feedback:
+                        self._ui.on_tool_result("plan-check", verify_feedback)
+                        self._context.conversation.add_message(
+                            Message(role=Role.tool, content=verify_feedback)
+                        )
                 elif action == RetryAction.REPLAN:
+                    logger.info("Replanning after repeated failures (step %d)", steps_taken)
                     self._ui.on_replan()
-                    scratchpad = ""
+                    # Note: the scratchpad is deliberately NOT reset here --
+                    # it's the agent's accumulated working memory (decisions,
+                    # files touched, assumptions, open questions) and is
+                    # exactly what the next attempt needs, not something to
+                    # discard just because this attempt failed.
                     plan = await self._planner.update_plan(
                         plan,
                         failure_context="\n".join(tool_results),
                     )
                     retry_mgr.on_replan()
                 elif action == RetryAction.ESCALATE:
+                    logger.warning("Escalating: persistent failures despite re-planning (step %d)", steps_taken)
                     return self._make_result(
                         plan=plan,
                         steps_taken=steps_taken,
@@ -390,6 +574,7 @@ class ReActLoop:
                         success=False,
                     )
 
+            logger.warning("Max steps (%d) exceeded", self._config.max_steps)
             return self._make_result(
                 plan=plan,
                 steps_taken=steps_taken,
@@ -413,12 +598,39 @@ class ReActLoop:
         except Exception:
             return ""
 
-    def _mark_step_completed(self, plan: Plan, results: list[str]) -> None:
-        for step in plan.steps:
-            if step.status == StepStatus.pending:
-                step.status = StepStatus.in_progress
-                step.status = StepStatus.completed
-                break
+    async def _verify_and_mark_step(
+        self, plan: Plan, evidence: str, has_tool_evidence: bool = False
+    ) -> str | None:
+        """Ask the planner to verify the current pending step is actually
+        done before advancing it, instead of assuming any non-failing turn
+        finished it. Returns feedback to show the model if the step isn't
+        really finished yet, or None if it was marked complete."""
+        step = plan.current_step()
+        if step is None:
+            return None
+
+        step.status = StepStatus.in_progress
+
+        if has_tool_evidence and _looks_investigative(step.description):
+            # Read/identify/check-style steps have no artifact beyond "the
+            # tool ran and returned real output" -- that's sufficient
+            # evidence; skip the extra (failure-prone) LLM judgment call.
+            logger.debug("Step %r auto-completed (investigative, has tool evidence)", step.description)
+            step.status = StepStatus.completed
+            return None
+
+        verdict, reason = await self._planner.verify_step(plan, step, evidence)
+        logger.debug("Step %r verification verdict: %s (%s)", step.description, verdict.value, reason)
+        if verdict == StepVerdict.complete:
+            step.status = StepStatus.completed
+            return None
+
+        step.status = StepStatus.pending
+        return (
+            f"Step {step.index} ('{step.description}') is not fully done yet "
+            f"({verdict.value}): {reason or 'insufficient evidence in the tool results'}. "
+            "Keep working on this step before moving on."
+        )
 
     def _detect_finish(self, content: str) -> bool:
         triggers = [
@@ -428,6 +640,25 @@ class ReActLoop:
             "finished the task",
         ]
         return any(t in content.lower() for t in triggers)
+
+    def _unread_existing_file(self, path: str, files_read: set[str]) -> str | None:
+        """Returns the canonical path if `path` refers to an existing file
+        that hasn't been read (or written/edited) yet this session, else
+        None -- either it's a new file being created, it's already known,
+        or the path couldn't be resolved (in which case we don't block;
+        the tool itself will report the problem)."""
+        if not path:
+            return None
+        try:
+            resolved = self._context.workspace.resolve(path)
+        except Exception:
+            return None
+        key = str(resolved)
+        if key in files_read:
+            return None
+        if not resolved.exists():
+            return None
+        return key
 
     def _is_destructive_command(self, command: str) -> bool:
         from chef_human.tools.shell import DESTRUCTIVE_PREFIXES

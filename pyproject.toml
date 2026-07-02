@@ -9,6 +9,7 @@ dependencies = [
     "pydantic-settings>=2.0",
     "rich>=13.0",
     "click>=8.0",
+    "textual>=0.60",
     "tomli>=2.0; python_version < '3.11'",
 ]
 
@@ -31,9 +32,6 @@ indexing = [
 rag = [
     "faiss-cpu>=1.14",
     "numpy>=1.25",
-]
-tui = [
-    "textual>=0.60",
 ]
 dev = [
     "pytest>=8.0",

@@ -57,39 +57,24 @@ class TestCreateAgent:
 
             mock_ctx_factory.assert_called_once_with(workspace_root="/custom/path")
 
-    def test_debug_tui_uses_debug_tui_class(self):
+    def test_always_uses_noop_ui(self):
+        """create_agent() has no UI of its own -- callers (main.py) attach
+        the split-pane TUI, StreamingUI, ReplUI, etc. as needed. Only the
+        headless/no-TUI CLI path uses create_agent() directly, so it should
+        always default to NoopUI."""
         with (
             patch("chef_human.llm.create_backend"),
             patch("chef_human.agent.create_context_assembler"),
             patch("chef_human.tools.create_tool_registry"),
             patch("chef_human.agent.planner.Planner"),
             patch("chef_human.agent.react_loop.ReActLoop"),
-            patch("chef_human.ui.debug_tui.DebugTUI") as mock_tui,
             patch("chef_human.ui.protocol.NoopUI") as mock_noop,
         ):
             from chef_human.agent import create_agent
 
-            create_agent(debug_tui=True)
-
-            mock_tui.assert_called_once()
-            mock_noop.assert_not_called()
-
-    def test_no_debug_tui_uses_noop_ui(self):
-        with (
-            patch("chef_human.llm.create_backend"),
-            patch("chef_human.agent.create_context_assembler"),
-            patch("chef_human.tools.create_tool_registry"),
-            patch("chef_human.agent.planner.Planner"),
-            patch("chef_human.agent.react_loop.ReActLoop"),
-            patch("chef_human.ui.debug_tui.DebugTUI") as mock_tui,
-            patch("chef_human.ui.protocol.NoopUI") as mock_noop,
-        ):
-            from chef_human.agent import create_agent
-
-            create_agent(debug_tui=False)
+            create_agent()
 
             mock_noop.assert_called_once()
-            mock_tui.assert_not_called()
 
 
 class TestFullLoopIntegration:

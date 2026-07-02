@@ -414,6 +414,30 @@ class TestExtractScratchpad:
         assert result == "path is actually x.py"
 
 
+class TestExtractScratchpadEntries:
+    def test_no_scratchpad_returns_empty_list(self):
+        from chef_human.agent.parser import extract_scratchpad_entries
+        assert extract_scratchpad_entries("Just reasoning text") == []
+
+    def test_single_entry(self):
+        from chef_human.agent.parser import extract_scratchpad_entries
+        result = extract_scratchpad_entries("## Scratchpad: [decision] use SQLite")
+        assert result == ["[decision] use SQLite"]
+
+    def test_multiple_entries_all_kept(self):
+        """Unlike extract_scratchpad, every occurrence is returned, not just
+        the last -- this is what lets the loop accumulate structured notes
+        instead of losing all but the final update each turn."""
+        from chef_human.agent.parser import extract_scratchpad_entries
+        content = (
+            "## Scratchpad: [decision] first thought\n"
+            "some reasoning\n"
+            "## Scratchpad: [file] created a.py\n"
+        )
+        result = extract_scratchpad_entries(content)
+        assert result == ["[decision] first thought", "[file] created a.py"]
+
+
 class TestLooksLikeToolCall:
     def test_tool_call_tag_detected(self):
         from chef_human.agent.parser import looks_like_tool_call

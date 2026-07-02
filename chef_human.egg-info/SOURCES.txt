@@ -13,7 +13,9 @@ chef_human.egg-info/top_level.txt
 chef_human/agent/__init__.py
 chef_human/agent/context.py
 chef_human/agent/file_context.py
+chef_human/agent/hardware.py
 chef_human/agent/linter.py
+chef_human/agent/model_advisor.py
 chef_human/agent/parser.py
 chef_human/agent/persistence.py
 chef_human/agent/planner.py
@@ -21,6 +23,7 @@ chef_human/agent/prompts.py
 chef_human/agent/react_loop.py
 chef_human/agent/repo_map.py
 chef_human/agent/retry.py
+chef_human/agent/scratchpad.py
 chef_human/agent/watcher.py
 chef_human/agent/workspace.py
 chef_human/agent/rag/__init__.py
@@ -56,10 +59,10 @@ chef_human/tools/undo.py
 chef_human/tools/user.py
 chef_human/tools/view_diff.py
 chef_human/ui/__init__.py
-chef_human/ui/debug_tui.py
 chef_human/ui/protocol.py
 chef_human/ui/repl.py
 chef_human/ui/streaming.py
+chef_human/ui/textual_tui.py
 tests/test_agent_integration.py
 tests/test_chatml.py
 tests/test_config.py

@@ -1,10 +1,30 @@
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from chef_human.agent.planner import Plan
     from chef_human.agent.parser import ParsedToolCall
+
+
+async def ask_via_stdin(question: str) -> str:
+    """Blocking print()+stdin.readline() question/answer, for UIs that run
+    in a plain terminal (not one a TUI framework has put into raw/alternate-
+    screen mode, where a synchronous stdin read can't receive real input and
+    would block the whole event loop -- see TuiUI.on_ask_user for that
+    case)."""
+    if not sys.stdin.isatty():
+        return "[no-tty] Cannot ask user in non-interactive mode. Continuing without answer."
+    print(f"\n[Agent asks]: {question}")
+    print("[Type your response, or 'skip' to continue without answering]: ", end="", flush=True)
+    try:
+        response = sys.stdin.readline().strip()
+    except (EOFError, KeyboardInterrupt):
+        response = ""
+    if not response or response.lower() == "skip":
+        return "User skipped the question"
+    return response
 
 
 class ReActUI(Protocol):
@@ -16,8 +36,12 @@ class ReActUI(Protocol):
     def on_reasoning(self, content: str) -> None: ...
     def on_tool_call(self, tool_call: ParsedToolCall) -> None: ...
     def on_tool_result(self, name: str, result: str) -> None: ...
+    def on_token_usage(self, prompt_tokens: int, completion_tokens: int) -> None: ...
     def on_replan(self) -> None: ...
     def on_error(self, message: str) -> None: ...
+
+    async def on_ask_user(self, question: str) -> str:
+        return await ask_via_stdin(question)
 
     async def on_approval_request(
         self, tool_call: ParsedToolCall
@@ -34,8 +58,12 @@ class NoopUI:
     def on_reasoning(self, content: str) -> None: ...
     def on_tool_call(self, tool_call: ParsedToolCall) -> None: ...
     def on_tool_result(self, name: str, result: str) -> None: ...
+    def on_token_usage(self, prompt_tokens: int, completion_tokens: int) -> None: ...
     def on_replan(self) -> None: ...
     def on_error(self, message: str) -> None: ...
+
+    async def on_ask_user(self, question: str) -> str:
+        return await ask_via_stdin(question)
 
     async def on_approval_request(
         self, tool_call: ParsedToolCall

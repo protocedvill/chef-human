@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from chef_human.agent.rag.store import VectorStore
+pytestmark = pytest.mark.rag
+pytest.importorskip("numpy", reason="install chef-human[rag] to test RAG")
+pytest.importorskip("faiss", reason="install chef-human[rag] to test RAG")
+
+from chef_human.agent.rag.store import VectorStore  # noqa: E402
 
 
 @pytest.fixture

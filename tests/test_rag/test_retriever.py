@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import pytest
 
-from chef_human.agent.rag.chunker import CodeChunker
-from chef_human.agent.rag.retriever import RAGRetriever
-from chef_human.agent.rag.store import VectorStore
-from chef_human.agent.workspace import WorkspaceManager
-from chef_human.llm.tokenizer import create_tokenizer
+pytestmark = pytest.mark.rag
+np = pytest.importorskip("numpy", reason="install chef-human[rag] to test RAG")
+pytest.importorskip("faiss", reason="install chef-human[rag] to test RAG")
+
+from chef_human.agent.rag.chunker import CodeChunker  # noqa: E402
+from chef_human.agent.rag.retriever import RAGRetriever  # noqa: E402
+from chef_human.agent.rag.store import VectorStore  # noqa: E402
+from chef_human.agent.workspace import WorkspaceManager  # noqa: E402
+from chef_human.llm.tokenizer import create_tokenizer  # noqa: E402
 
 
 class MockEmbedder:

@@ -29,6 +29,7 @@ class TestSettings:
         assert s.persist_index is True
         assert s.watch_files is False
         assert s.watch_interval == 2.0
+        assert s.rag_enabled is False
 
     def test_frozen(self):
         s = Settings()

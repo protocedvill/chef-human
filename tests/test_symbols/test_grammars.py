@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("tree_sitter", reason="install chef-human[indexing] to test grammars")
+
 from chef_human.agent.symbols.grammars import GrammarLoader
 
 

@@ -4,9 +4,10 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Final, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
-from tree_sitter import Language, Parser, Query, QueryCursor
+if TYPE_CHECKING:
+    from tree_sitter import Language, Query
 
 from chef_human.agent.symbols.grammars import GrammarLoader
 
@@ -170,13 +171,16 @@ class TreeSitterExtractor:
 
     def __init__(self, grammar_loader: GrammarLoader | None = None) -> None:
         try:
-            import tree_sitter  # noqa: F401
-        except ImportError:
+            from tree_sitter import Parser, Query, QueryCursor
+        except ImportError as exc:
             raise ImportError(
                 "tree-sitter is required for TreeSitterExtractor. "
-                "Install: pip install tree-sitter"
-            )
+                "Install with: pip install 'chef-human[indexing]'"
+            ) from exc
         self._loader = grammar_loader or GrammarLoader()
+        self._parser_type = Parser
+        self._query_type = Query
+        self._query_cursor_type = QueryCursor
         self._compiled: dict[str, dict[str, Query]] = {}
 
     def extract(self, file_path: str, content: str) -> list[Symbol]:
@@ -189,7 +193,7 @@ class TreeSitterExtractor:
         if language is None:
             return []
 
-        parser = Parser(language)
+        parser = self._parser_type(language)
         tree = parser.parse(content.encode("utf-8"))
         if tree is None:
             return []
@@ -200,7 +204,7 @@ class TreeSitterExtractor:
         queries = self._get_queries(lang_name, language)
 
         for kind, query in queries.items():
-            cursor = QueryCursor(query)
+            cursor = self._query_cursor_type(query)
             for _pi, captures in cursor.matches(root):
                 name_nodes = captures.get("name")
                 def_nodes = captures.get("def")
@@ -221,7 +225,7 @@ class TreeSitterExtractor:
     def _get_queries(self, lang_name: str, language: Language) -> dict[str, Query]:
         if lang_name not in self._compiled:
             self._compiled[lang_name] = {
-                kind: Query(language, qs)
+                kind: self._query_type(language, qs)
                 for kind, qs in _TS_QUERIES.get(lang_name, {}).items()
             }
         return self._compiled[lang_name]

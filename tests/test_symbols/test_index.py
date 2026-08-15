@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from chef_human.agent.symbols.extractor import TreeSitterExtractor
+from chef_human.agent.symbols.extractor import CompositeExtractor
 from chef_human.agent.symbols.index import SymbolIndex
 from chef_human.agent.workspace import WorkspaceManager
 
@@ -15,12 +15,12 @@ def workspace(tmp_path: Path) -> WorkspaceManager:
 
 
 @pytest.fixture
-def extractor() -> TreeSitterExtractor:
-    return TreeSitterExtractor()
+def extractor() -> CompositeExtractor:
+    return CompositeExtractor()
 
 
 @pytest.fixture
-def index(workspace: WorkspaceManager, extractor: TreeSitterExtractor) -> SymbolIndex:
+def index(workspace: WorkspaceManager, extractor: CompositeExtractor) -> SymbolIndex:
     return SymbolIndex(workspace=workspace, extractor=extractor)
 
 

@@ -907,8 +907,8 @@ class TestModelOverrideActuallyReachesBackendConstruction:
 
         # The first create_backend() call is always the main backend --
         # this is what the widened monkeypatch window (Bug B) targets.
-        # A second call may follow from create_planner_backend() (this
-        # repo's checked-in config.toml sets planner_ollama_model), which
+        # A second call may follow from create_planner_backend() when a
+        # planner_ollama_model is configured, which
         # runs after the window closes -- a separate, narrower, pre-existing
         # gap specific to --config overriding planner_ollama_model, out of
         # scope for this fix.
@@ -943,8 +943,8 @@ class TestModelOverrideActuallyReachesBackendConstruction:
 
         # The first create_backend() call is always the main backend --
         # this is what the widened monkeypatch window (Bug B) targets.
-        # A second call may follow from create_planner_backend() (this
-        # repo's checked-in config.toml sets planner_ollama_model), which
+        # A second call may follow from create_planner_backend() when a
+        # planner_ollama_model is configured, which
         # runs after the window closes -- a separate, narrower, pre-existing
         # gap specific to --config overriding planner_ollama_model, out of
         # scope for this fix.
@@ -982,8 +982,8 @@ class TestModelOverrideActuallyReachesBackendConstruction:
 
         # The first create_backend() call is always the main backend --
         # this is what the widened monkeypatch window (Bug B) targets.
-        # A second call may follow from create_planner_backend() (this
-        # repo's checked-in config.toml sets planner_ollama_model), which
+        # A second call may follow from create_planner_backend() when a
+        # planner_ollama_model is configured, which
         # runs after the window closes -- a separate, narrower, pre-existing
         # gap specific to --config overriding planner_ollama_model, out of
         # scope for this fix.

@@ -150,14 +150,20 @@ def create_context_assembler(
     repo_map = RepoMap(workspace=workspace, tokenizer=tokenizer)
 
     files = workspace.list_files(max_depth=10)
-    if len(files) > settings.max_index_files:
-        return _build_rag_context_assembler(
-            workspace=workspace,
-            tokenizer=tokenizer,
-            file_ctx=file_ctx,
-            repo_map=repo_map,
-            conversation=conversation,
-        )
+    if len(files) > settings.max_index_files and settings.rag_enabled:
+        try:
+            return _build_rag_context_assembler(
+                workspace=workspace,
+                tokenizer=tokenizer,
+                file_ctx=file_ctx,
+                repo_map=repo_map,
+                conversation=conversation,
+            )
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "RAG is enabled, but its experimental dependencies are unavailable. "
+                "Install them with: pip install 'chef-human[rag]'"
+            ) from exc
     return _build_symbol_context_assembler(
         workspace=workspace,
         tokenizer=tokenizer,

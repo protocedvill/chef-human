@@ -4,6 +4,16 @@
 
 Produce a clean install and trustworthy automated signal before changing the user experience.
 
+## Implementation status — 2026-08-16
+
+- Work package 1A is complete: explicit build metadata, Python 3.12/3.13 bounds, clean base extras,
+  `python -m chef_human`, a fail-fast setup script, and isolated wheel verification.
+- Work package 1B is partially complete: live Ollama tests are excluded by default and optional
+  indexing/RAG tests skip cleanly when their extras are absent.
+- Work package 1C is partially complete: CI covers Ruff, package build/wheel smoke checks, and the
+  base suite on Python 3.12 and 3.13. Pyright remains intentionally pending.
+- Work package 1D has not started.
+
 ## Supported baseline
 
 - Python: 3.12 and 3.13.
@@ -94,4 +104,3 @@ Acceptance criteria:
 - Each fix begins with a failing regression test.
 - Safety policy tests cover all registered mutating tools through one shared classification.
 - No correctness fix is accepted solely because an LLM-backed manual run happened to succeed.
-

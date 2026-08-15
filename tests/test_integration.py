@@ -95,9 +95,8 @@ class TestCreateAgent:
         """Default path (no planner model configured): create_backend()
         must be called exactly once, and Planner must get the same backend
         object as ReActLoop -- unchanged from before this feature existed.
-        Explicitly sets planner_ollama_model=None rather than relying on
-        ambient settings, since this repo's own checked-in config.toml sets
-        a real planner model for local dev use."""
+        Explicitly sets planner_ollama_model=None so the behavior remains
+        isolated from ambient or project-specific configuration."""
         from chef_human.config import Settings
 
         default_settings = Settings()

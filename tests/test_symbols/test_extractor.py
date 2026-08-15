@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -57,6 +58,11 @@ class TestRegexExtractor:
         assert result == []
 
 
+@pytest.mark.indexing
+@pytest.mark.skipif(
+    importlib.util.find_spec("tree_sitter") is None,
+    reason="install chef-human[indexing] to test tree-sitter extraction",
+)
 class TestTreeSitterExtractor:
     @pytest.fixture
     def extractor(self):

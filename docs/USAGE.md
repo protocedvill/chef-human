@@ -2,7 +2,7 @@
 
 ## Running the Agent
 
-Once installed (`pip install -e ".[dev]"`) and with Ollama running locally (`ollama serve`, with the
+Once installed (`pip install -e .`) and with Ollama running locally (`ollama serve`, with the
 configured model pulled — default `qwen2.5-coder:7b`), run a task directly:
 
 ```bash
@@ -56,6 +56,11 @@ By default (`--debug-tui`, non-headless), `run` launches inside the split-pane T
 the TUI exits automatically once that task finishes and the plain-text result summary prints as
 usual. Pass `--no-debug-tui` for the older plain streaming output instead, or `--headless` for
 JSON-only output with no TUI at all (the right choice for CI/scripting).
+
+Tree-sitter indexing, semantic refactoring, RAG, and llama.cpp are experimental opt-in capabilities.
+Install them with the extras documented in [INSTALL.md](INSTALL.md). RAG additionally requires
+`rag_enabled = true`; without it, Chef Human retains the regex-based repository map even for large
+repositories.
 
 ### `chef-human tui`
 

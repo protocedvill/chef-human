@@ -27,6 +27,7 @@ class Settings:
     rag_chunk_overlap: int = 64
     rag_max_results: int = 5
     rag_index_dir: str = ".chef-human"
+    rag_enabled: bool = False
     fuzzy_edit: bool = True
     fuzzy_threshold: float = 0.75
     show_diff_in_context: bool = True

@@ -2,8 +2,9 @@
 
 ## Requirements
 
-- **Python** 3.12+
-- **Ollama** (recommended backend) or llama.cpp
+- **Linux** (supported prototype platform)
+- **Python** 3.12 or 3.13
+- **Ollama** (supported backend)
 
 ---
 
@@ -26,28 +27,47 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama pull qwen2.5-coder:7b
 ```
 
-### 3. Install chef-human
+### 3. Create an environment and install Chef Human
 
 ```bash
-pip install -e ".[dev]"
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 ```
 
 ### 4. Verify
 
 ```bash
-python -c "from chef_human.llm import create_backend; b = create_backend(); print(b.model_name)"
+python -m chef_human --help
 ```
 
 ---
 
-## Alternative Backends
+## Experimental capabilities
+
+The base install uses regex symbol extraction when tree-sitter is absent. Experimental features are
+installed explicitly:
+
+```bash
+python -m pip install -e '.[indexing]'  # tree-sitter symbol extraction/refactoring
+python -m pip install -e '.[rag]'       # embeddings + NumPy/FAISS retrieval
+```
+
+RAG is also opt-in at runtime:
+
+```toml
+[chef_human]
+rag_enabled = true
+```
+
+### llama.cpp backend
 
 ### llama.cpp (no Ollama dependency)
 
 Additional install step:
 
 ```bash
-pip install -e ".[dev,llamacpp]"
+python -m pip install -e '.[llamacpp]'
 ```
 
 Then download a GGUF model, e.g. from Hugging Face:
@@ -59,12 +79,6 @@ wget https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwe
 
 Set `llamacpp_model_path` in `config.toml` to point to the downloaded file.
 
-### Embeddings (for RAG / Phase 3)
-
-```bash
-pip install -e ".[embeddings]"
-```
-
 ---
 
 ## Setup Script
@@ -75,12 +89,8 @@ An automated setup script is available:
 bash scripts/setup.sh
 ```
 
-This will:
-1. Check Python version
-2. Install chef-human with dev dependencies
-3. Install Ollama if not present (prompts for confirmation)
-4. Pull the recommended model
-5. Verify installation
+This creates `.venv`, installs the required package dependencies, and verifies the command. It does
+not execute a remote installer or download a multi-gigabyte model. Those actions remain explicit.
 
 ---
 
@@ -108,19 +118,10 @@ export CHEF_LLAMACPP_MODEL_PATH=/path/to/model.gguf
 
 ## Troubleshooting
 
-### pydantic-core build fails
+### Unsupported Python version
 
-If you see an error building `pydantic-core` during install, your environment likely lacks a Rust compiler or a pre-built wheel for your Python version. Workarounds:
-
-- Install pydantic-core from a pre-built wheel (if available for your platform)
-- Install Rust via `rustup`
-- Use a standard Python version (3.12 or 3.13) rather than a beta/RC
-- Install with `--no-deps` and manually install only the packages you need:
-
-```bash
-pip install -e ".[dev]" --no-deps
-pip install --no-deps ollama rich click python-dotenv tomli pytest ruff pyright pytest-asyncio
-```
+Use Python 3.12 or 3.13. Pre-release and newer Python versions are intentionally excluded until the
+project's binary optional dependencies publish compatible wheels.
 
 ### Ollama not found
 

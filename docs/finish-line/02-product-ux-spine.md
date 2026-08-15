@@ -120,3 +120,8 @@ Acceptance criteria:
 - UI screenshots and recordings can be reproduced without nondeterministic model output.
 - The real smoke test is short, opt-in, and produces a diagnostic log on failure.
 
+Implementation note (2026-08-16): the opt-in real-model portion now exists as the tiered capability
+benchmark documented in `docs/BENCHMARKS.md`. It provides disposable fixture repositories,
+deterministic external verification, protected-test integrity checks, JSON reports, and diagnostic
+logs. The scripted replay backend and reproducible UI-capture workflow remain future 2E work; a
+benchmark fixture is not evidence that those acceptance criteria are complete.

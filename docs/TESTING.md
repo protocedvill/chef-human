@@ -53,6 +53,20 @@ CHEF_TEST_LLAMACPP_MODEL=/path/to/model.gguf pytest -m integration_llamacpp
 There are currently no live llama.cpp cases; the marker and prerequisite contract reserve that test
 lane without claiming unsupported coverage.
 
+## Real-agent capability benchmark
+
+Unit and integration tests validate components and backend protocols. The separate opt-in benchmark
+drives the complete application through plan, tool use, file changes, validation, and finish against
+disposable fixture workspaces:
+
+```bash
+python scripts/run_benchmark.py --through smoke
+python scripts/run_benchmark.py --through all --keep-workspaces
+```
+
+It does not run in ordinary CI or download models. See [BENCHMARKS.md](BENCHMARKS.md) for cases,
+scoring, machine-readable reports, and the safety boundary.
+
 ## Static and package checks
 
 Run the same required checks as CI from a Python 3.12 development environment:

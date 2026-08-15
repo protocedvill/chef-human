@@ -18,3 +18,4 @@ bash scripts/setup.sh
 - [Installation](docs/INSTALL.md) — setup, dependencies, troubleshooting
 - [Usage](docs/USAGE.md) — API examples, configuration, testing
 - [Testing](docs/TESTING.md) — test taxonomy, optional extras, live-backend checks
+- [Capability benchmark](docs/BENCHMARKS.md) — tiered real-agent tasks with external verification

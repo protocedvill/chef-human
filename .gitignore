@@ -16,3 +16,4 @@ venv/
 output.txt
 core
 core.*
+benchmark-runs/

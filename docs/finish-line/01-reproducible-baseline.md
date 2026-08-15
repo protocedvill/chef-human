@@ -11,8 +11,9 @@ Produce a clean install and trustworthy automated signal before changing the use
 - Work package 1B is complete: the executable pytest taxonomy separates deterministic units, UI,
   optional indexing/RAG, and opt-in backend integrations; prerequisites skip clearly, workspace
   discovery is isolated, and every advertised CLI command has a help smoke test.
-- Work package 1C is partially complete: CI covers Ruff, package build/wheel smoke checks, and the
-  base suite on Python 3.12 and 3.13. Pyright remains intentionally pending.
+- Work package 1C is complete locally: Ruff, package-scoped Pyright, package build/wheel smoke checks,
+  and the base suite on Python 3.12 and 3.13 are separate required CI jobs with caching, timeouts, and
+  one aggregate gate. Public-branch confirmation and its status badge remain release-time actions.
 - Work package 1D has not started.
 
 ## Supported baseline

@@ -475,6 +475,8 @@ class ChefHumanTUI(App):
             self._pending_answer.set_result("User skipped the question")
 
     async def _run_initial_task(self) -> None:
+        if self._initial_task is None:
+            return
         await self._on_submit(self._initial_task)
         if self._auto_exit_after_initial_task:
             self.exit()

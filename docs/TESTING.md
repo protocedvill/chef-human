@@ -52,3 +52,23 @@ CHEF_TEST_LLAMACPP_MODEL=/path/to/model.gguf pytest -m integration_llamacpp
 
 There are currently no live llama.cpp cases; the marker and prerequisite contract reserve that test
 lane without claiming unsupported coverage.
+
+## Static and package checks
+
+Run the same required checks as CI from a Python 3.12 development environment:
+
+```bash
+python -m ruff check .
+python -m pyright --pythonpath "$(command -v python)"
+python -m build
+```
+
+Pyright checks the authored `chef_human` package against Python 3.12 semantics. Tests remain guarded
+by Ruff and pytest rather than being included in the static type contract: their extensive dynamic
+mocks intentionally do not model every concrete protocol. Optional imports carry narrow
+`reportMissingImports` ignores at the lazy import boundary; other Pyright diagnostics remain enabled.
+
+CI exposes a final `Required CI gate` job which fails unless Ruff, Pyright, both unit-test matrix
+entries, and the package build all pass. Once the workflow is proven on the public default branch,
+that job should be selected as a required branch-protection check. A status badge is deliberately
+deferred until then.

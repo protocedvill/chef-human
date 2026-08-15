@@ -30,7 +30,7 @@ class GrammarLoader:
         if self._core_available is not None:
             return self._core_available
         try:
-            import tree_sitter  # noqa: F401
+            import tree_sitter  # noqa: F401  # pyright: ignore[reportMissingImports]
             self._core_available = True
         except ImportError:
             self._core_available = False
@@ -59,7 +59,7 @@ class GrammarLoader:
 
         pkg_name, func_name = entry
         try:
-            from tree_sitter import Language
+            from tree_sitter import Language  # pyright: ignore[reportMissingImports]
 
             mod = importlib.import_module(pkg_name)
             raw = getattr(mod, func_name)()

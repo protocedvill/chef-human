@@ -15,7 +15,9 @@ class EmbeddingsBackend:
 
     def _lazy_load(self) -> None:
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            from sentence_transformers import (  # pyright: ignore[reportMissingImports]
+                SentenceTransformer,
+            )
 
             logger.info("Loading embedding model: %s", self._model_name)
             self._model = SentenceTransformer(self._model_name)

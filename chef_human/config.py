@@ -4,7 +4,7 @@ import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
 
 @dataclass(frozen=True)
@@ -97,7 +97,10 @@ def load_settings(
     if project_cfg is not None:
         merged.update(_load_toml(str(project_cfg)))
     merged.update(_load_env())
-    return Settings(**merged)
+    # Configuration enters through TOML and environment variables, so the
+    # mapping cannot retain per-key static types. Settings remains the typed
+    # validation boundary for every consumer.
+    return Settings(**cast(dict[str, Any], merged))
 
 
 settings = load_settings()

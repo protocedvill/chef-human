@@ -977,6 +977,34 @@ class TestReActLoopRun:
         assert calls == ["think", "ing"]
 
     @pytest.mark.asyncio
+    async def test_streaming_without_final_response_fails_clearly(self):
+        backend = _make_mock_backend()
+
+        async def _incomplete_stream(
+            req,
+        ) -> AsyncGenerator[tuple[str, CompletionResponse | None], None]:
+            yield "partial", None
+
+        backend.complete_stream = _incomplete_stream
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        ui = MagicMock(spec=NoopUI)
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=1, stream=True),
+            ui=ui,
+        )
+
+        with pytest.raises(RuntimeError, match="stream ended without a final response"):
+            await loop.run("do something")
+
+        ui.on_stream.assert_called_once_with("partial")
+        ui.on_llm_end.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_streaming_false_does_not_call_on_stream(self):
         backend = _make_mock_backend()
         backend.complete.return_value = CompletionResponse(

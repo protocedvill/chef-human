@@ -27,11 +27,12 @@ from chef_human.agent.retry import RetryAction, RetryManager
 from chef_human.agent.scratchpad import Scratchpad
 from chef_human.llm.backend import (
     CompletionRequest,
+    CompletionResponse,
     LLMBackend,
     Message,
     Role,
 )
-from chef_human.tools.registry import ToolRegistry
+from chef_human.tools.registry import Tool, ToolRegistry
 from chef_human.ui.protocol import NoopUI, ReActUI
 
 logger = logging.getLogger(__name__)
@@ -316,6 +317,7 @@ class ReActLoop:
                 self._ui.on_llm_start("reasoning")
                 llm_start = time.monotonic()
                 logger.debug("LLM call starting (stream=%s, %d messages)", self._config.stream, len(messages))
+                response: CompletionResponse | None = None
                 try:
                     if self._config.stream:
                         full_content = ""
@@ -332,6 +334,8 @@ class ReActLoop:
                             else:
                                 full_content += token
                                 self._ui.on_stream(token)
+                        if response is None:
+                            raise RuntimeError("LLM stream ended without a final response")
                         if full_content:
                             response.message.content = full_content
                     else:
@@ -345,6 +349,8 @@ class ReActLoop:
                         )
                 finally:
                     self._ui.on_llm_end()
+                if response is None:
+                    raise RuntimeError("LLM stream ended without a final response")
                 logger.debug(
                     "LLM call finished in %.1fs (%d chars, usage=%s)",
                     time.monotonic() - llm_start,
@@ -427,7 +433,10 @@ class ReActLoop:
                 _signature_calls = [tc for tc in tool_calls if tc.name != "ask_user"]
                 call_signature = (
                     json.dumps(
-                        sorted([[tc.name, tc.arguments] for tc in _signature_calls], key=lambda x: x[0]),
+                        sorted(
+                            ((tc.name, tc.arguments) for tc in _signature_calls),
+                            key=lambda item: item[0],
+                        ),
                         sort_keys=True,
                         default=str,
                     )
@@ -444,8 +453,8 @@ class ReActLoop:
                 # edit/patch call ran. Used to objectively verify file-creation
                 # steps instead of relying on a tool's success-message wording.
                 files_written_this_turn: dict[str, bool] = {}
-                finish_call: tuple[ParsedToolCall, object] | None = None
-                parallel_candidates: list[tuple[ParsedToolCall, object]] = []
+                finish_call: tuple[ParsedToolCall, Tool] | None = None
+                parallel_candidates: list[tuple[ParsedToolCall, Tool]] = []
 
                 for tc in tool_calls:
                     logger.debug("Tool call: %s(%s)", tc.name, tc.arguments)
@@ -627,7 +636,7 @@ class ReActLoop:
                     )
 
                     for (tc, _tool), tool_result in zip(parallel_candidates, gathered):
-                        if isinstance(tool_result, Exception):
+                        if isinstance(tool_result, BaseException):
                             result = self._make_tool_error(f"Execution error: {tool_result}")
                             self._ui.on_tool_result(tc.name, result)
                             tool_results.append(result)

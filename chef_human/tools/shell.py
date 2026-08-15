@@ -76,6 +76,7 @@ class BashTool:
         if is_destructive:
             logger.info("Destructive command detected: %s", command[:80])
 
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
@@ -88,10 +89,11 @@ class BashTool:
                 proc.communicate(), timeout=timeout
             )
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             return ToolResult(success=False, error=f"Command timed out after {timeout}s")
         except Exception as exc:
             return ToolResult(success=False, error=str(exc))

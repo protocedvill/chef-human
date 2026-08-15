@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from chef_human.llm.backend import ToolDefinition
@@ -18,7 +19,8 @@ class Tool(Protocol):
     description: str
     parameters: dict[str, Any]
 
-    async def run(self, **kwargs: Any) -> ToolResult: ...
+    @property
+    def run(self) -> Callable[..., Awaitable[ToolResult]]: ...
 
 
 class ToolRegistry:

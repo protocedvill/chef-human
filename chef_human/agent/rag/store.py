@@ -36,7 +36,7 @@ class VectorStore:
     def add(self, embeddings: list[list[float]], metadata: list[dict[str, Any]]) -> None:
         if not embeddings:
             return
-        import numpy as np
+        import numpy as np  # pyright: ignore[reportMissingImports]  # optional rag extra
 
         arr = np.array(embeddings, dtype=np.float32)
         if arr.ndim == 1:
@@ -45,7 +45,7 @@ class VectorStore:
         self._metadata.extend(metadata)
 
     def search(self, query: list[float], top_k: int = 5) -> list[SearchResult]:
-        import numpy as np
+        import numpy as np  # pyright: ignore[reportMissingImports]  # optional rag extra
 
         if len(self._metadata) == 0:
             return []
@@ -72,7 +72,7 @@ class VectorStore:
         if self._index_dir is None:
             return
         self._index_dir.mkdir(parents=True, exist_ok=True)
-        import faiss
+        import faiss  # pyright: ignore[reportMissingImports]  # optional rag extra
 
         faiss.write_index(self._index, str(self._index_dir / _INDEX_FILENAME))
         meta_path = self._index_dir / _META_FILENAME
@@ -85,7 +85,7 @@ class VectorStore:
         index_dir: str | Path,
         dimension: int,
     ) -> VectorStore | None:
-        import faiss
+        import faiss  # pyright: ignore[reportMissingImports]  # optional rag extra
 
         index_path = Path(index_dir) / _INDEX_FILENAME
         meta_path = Path(index_dir) / _META_FILENAME
@@ -111,6 +111,6 @@ class VectorStore:
         return self._index.ntotal
 
     def _create_index(self) -> Any:
-        import faiss
+        import faiss  # pyright: ignore[reportMissingImports]  # optional rag extra
 
         return faiss.IndexFlatIP(self._dim)

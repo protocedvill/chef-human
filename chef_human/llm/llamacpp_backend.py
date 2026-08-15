@@ -36,7 +36,7 @@ class LlamaCppBackend(LLMBackend):
             raise FileNotFoundError(f"Model not found: {model_path}")
 
         try:
-            from llama_cpp import Llama
+            from llama_cpp import Llama  # pyright: ignore[reportMissingImports]
         except ImportError as e:
             raise ImportError(
                 "llama-cpp-python is required for the LlamaCppBackend. "
@@ -176,4 +176,3 @@ class LlamaCppBackend(LLMBackend):
     @staticmethod
     def strip_tool_calls(text: str) -> str:
         return re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL).strip()
-

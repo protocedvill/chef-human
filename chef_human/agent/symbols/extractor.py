@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 if TYPE_CHECKING:
-    from tree_sitter import Language, Query
+    from tree_sitter import Language, Query  # pyright: ignore[reportMissingImports]
 
 from chef_human.agent.symbols.grammars import GrammarLoader
 
@@ -171,7 +171,11 @@ class TreeSitterExtractor:
 
     def __init__(self, grammar_loader: GrammarLoader | None = None) -> None:
         try:
-            from tree_sitter import Parser, Query, QueryCursor
+            from tree_sitter import (  # pyright: ignore[reportMissingImports]
+                Parser,
+                Query,
+                QueryCursor,
+            )
         except ImportError as exc:
             raise ImportError(
                 "tree-sitter is required for TreeSitterExtractor. "

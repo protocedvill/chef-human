@@ -19,7 +19,7 @@ class Tokenizer(Protocol):
 
 class TiktokenTokenizer:
     def __init__(self, encoding_name: str = "cl100k_base") -> None:
-        import tiktoken
+        import tiktoken  # pyright: ignore[reportMissingImports]
 
         self._enc = tiktoken.get_encoding(encoding_name)
 
@@ -34,7 +34,7 @@ class ApproxTokenizer:
 
 def create_tokenizer(model_name: str = "") -> Tokenizer:
     try:
-        import tiktoken  # noqa: F401
+        import tiktoken  # noqa: F401  # pyright: ignore[reportMissingImports]
 
         key = "default"
         for prefix in BACKEND_ENCODING_MAP:

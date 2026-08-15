@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 
 from chef_human.agent.context import ContextAssembler
-from chef_human.agent.linter import format_lint_result, run_lint
+from chef_human.agent.linter import annotate_diff_with_lint, format_lint_result, run_lint
 from chef_human.agent.parser import (
     ParsedToolCall,
     extract_scratchpad,
@@ -249,6 +249,15 @@ class ReActLoop:
                             file_path = tc.arguments.get("path", "")
                             lint_output = run_lint(file_path)
                             if lint_output:
+                                # Annotate the last tool result's diff if present
+                                last_idx = len(tool_results) - 1
+                                if last_idx >= 0 and "```diff" in tool_results[last_idx]:
+                                    annotated = annotate_diff_with_lint(
+                                        tool_results[last_idx], lint_output
+                                    )
+                                    if annotated:
+                                        tool_results[last_idx] = annotated
+                                # Still append raw lint output for complete issue list
                                 lint_result = format_lint_result(lint_output)
                                 tool_results.append(lint_result)
 

@@ -6,6 +6,7 @@ import pytest
 
 from chef_human.agent.repo_map import RepoMap
 from chef_human.agent.symbols.extractor import (
+    CompositeExtractor,
     RegexExtractor,
     Symbol,
     TreeSitterExtractor,
@@ -272,13 +273,13 @@ class TestRegexExtractorDefaultPatterns:
 # ---------------------------------------------------------------------------
 
 class TestTreeSitterExtractor:
-    def test_import_error_when_not_installed(self):
-        with pytest.raises(ImportError, match="tree-sitter"):
-            TreeSitterExtractor()
+    def test_creates_successfully(self):
+        extractor = TreeSitterExtractor()
+        assert extractor is not None
 
-    def test_create_extractor_fallback(self):
+    def test_create_extractor_returns_composite(self):
         extractor = create_extractor()
-        assert isinstance(extractor, RegexExtractor)
+        assert isinstance(extractor, CompositeExtractor)
 
 
 # ---------------------------------------------------------------------------

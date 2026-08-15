@@ -20,8 +20,19 @@ class Settings:
     embed_model: str = "BAAI/bge-small-en-v1.5"
     temperature: float = 0.0
     workspace: str = ""
+    max_index_files: int = 500
+    rag_chunk_tokens: int = 512
+    rag_chunk_overlap: int = 64
+    rag_max_results: int = 5
+    rag_index_dir: str = ".chef-human"
+    fuzzy_edit: bool = True
+    fuzzy_threshold: float = 0.75
+    show_diff_in_context: bool = True
     max_tool_retries: int = 3
     max_agent_steps: int = 25
+    persist_index: bool = True
+    watch_files: bool = False
+    watch_interval: float = 2.0
 
 
 _ENV_PREFIX = "CHEF_"

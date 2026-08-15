@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.message // \"Claude Code needs your input\"' | { read -r msg; notify-send \"Claude Code\" \"$msg\"; } 2>/dev/null || true"
+          },
+          {
+            "type": "command",
+            "command": "paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}

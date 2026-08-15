@@ -133,6 +133,25 @@ class TestWriteTool:
         result = await write_tool.run(path="multi.txt", content="a\nb\nc")
         assert "3 lines" in result.output
 
+    async def test_diff_on_overwrite(self, write_tool, tmp_path):
+        create_file(tmp_path, "existing.txt", "original content")
+        result = await write_tool.run(path="existing.txt", content="new content")
+        assert result.success
+        assert "```diff" in result.output
+        assert "-original content" in result.output
+        assert "+new content" in result.output
+
+    async def test_no_diff_on_new_file(self, write_tool, tmp_path):
+        result = await write_tool.run(path="brand_new.txt", content="hello")
+        assert result.success
+        assert "```diff" not in result.output
+
+    async def test_no_diff_on_identical_content(self, write_tool, tmp_path):
+        create_file(tmp_path, "same.txt", "content")
+        result = await write_tool.run(path="same.txt", content="content")
+        assert result.success
+        assert "```diff" not in result.output
+
 
 # ---------------------------------------------------------------------------
 # EditTool
@@ -171,6 +190,32 @@ class TestEditTool:
         create_file(tmp_path, "f.txt", "x x x")
         result = await edit_tool.run(path="f.txt", old_string="x", new_string="y", replace_all=True)
         assert "3 occurrences" in result.output
+
+    async def test_diff_in_output(self, edit_tool, tmp_path):
+        create_file(tmp_path, "f.txt", "hello world")
+        result = await edit_tool.run(path="f.txt", old_string="world", new_string="there")
+        assert result.success
+        assert "```diff" in result.output
+        assert "-hello world" in result.output
+        assert "+hello there" in result.output
+
+    async def test_fuzzy_match_succeeds(self, edit_tool, tmp_path):
+        create_file(tmp_path, "f.txt", "def foo():\n    return 42\n")
+        result = await edit_tool.run(path="f.txt", old_string="def foo():\n   return 42", new_string="def foo():\n    return 99", fuzzy=True)
+        assert result.success
+        assert "fuzzy" in result.output
+        assert "```diff" in result.output
+
+    async def test_fuzzy_disabled_still_works_on_exact(self, edit_tool, tmp_path):
+        create_file(tmp_path, "f.txt", "hello world")
+        result = await edit_tool.run(path="f.txt", old_string="world", new_string="there", fuzzy=False)
+        assert result.success
+
+    async def test_fuzzy_disabled_fails_on_nonexistent(self, edit_tool, tmp_path):
+        create_file(tmp_path, "f.txt", "abc")
+        result = await edit_tool.run(path="f.txt", old_string="xyz", new_string="def", fuzzy=False)
+        assert not result.success
+        assert "not found" in result.error
 
 
 # ---------------------------------------------------------------------------

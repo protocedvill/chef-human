@@ -16,5 +16,18 @@ pyright>=1.1
 [embeddings]
 sentence-transformers>=3.0.0
 
+[indexing]
+tree-sitter<1.0,>=0.23
+tree-sitter-python>=0.23
+tree-sitter-javascript>=0.23
+tree-sitter-typescript>=0.23
+tree-sitter-rust>=0.23
+tree-sitter-go>=0.23
+tree-sitter-java>=0.23
+
 [llamacpp]
 llama-cpp-python>=0.3.0
+
+[rag]
+faiss-cpu>=1.14
+numpy>=1.25

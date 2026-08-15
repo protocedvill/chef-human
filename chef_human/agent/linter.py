@@ -1,12 +1,67 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Sequence
 
 logger = logging.getLogger(__name__)
+
+_LINT_LINE_RE = re.compile(r"^(.+?):(\d+):(\d+):\s*(\S+)\s+(.+)$")
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@.*")
+
+
+def annotate_diff_with_lint(diff: str, lint_output: str) -> str:
+    """Overlay lint warnings on a unified diff.
+
+    For each lint warning that references a line in the diff's + side,
+    append an annotation to the relevant hunk line.
+    """
+    if not lint_output or not diff:
+        return diff
+
+    lint_by_line: dict[int, list[str]] = {}
+    for line in lint_output.splitlines():
+        m = _LINT_LINE_RE.match(line)
+        if m:
+            line_num = int(m.group(2))
+            code = m.group(4)
+            message = m.group(5)
+            lint_by_line.setdefault(line_num, []).append(f"# ruff: {code} {message}")
+
+    if not lint_by_line:
+        return diff
+
+    diff_lines = diff.splitlines(keepends=True)
+    result: list[str] = []
+    hunk_new_start = 0
+
+    for raw_line in diff_lines:
+        m = _HUNK_HEADER_RE.match(raw_line)
+        if m:
+            hunk_new_start = int(m.group(2))
+            result.append(raw_line)
+            continue
+
+        if raw_line.startswith("+") and not raw_line.startswith("+++"):
+            current_line = hunk_new_start
+            hunk_new_start += 1
+            annotations = lint_by_line.get(current_line, [])
+            if annotations:
+                stripped = raw_line.rstrip("\n\r")
+                annotation = "; ".join(annotations)
+                result.append(f"{stripped}  {annotation}\n")
+                continue
+            result.append(raw_line)
+        elif raw_line.startswith(" "):
+            hunk_new_start += 1
+            result.append(raw_line)
+        else:
+            result.append(raw_line)
+
+    return "".join(result)
 
 
 def _find_ruff() -> str | None:

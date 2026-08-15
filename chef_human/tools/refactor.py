@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from chef_human.tools.diff import compute_diff
+from chef_human.tools.diff import FileChange, compute_diff
 from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
@@ -201,16 +200,17 @@ class RefactorTool:
         if not dry_run and self._diff_store:
             pending = [r for r in results if r.get("diff")]
             if pending:
-                batch_path = f"batch:refactor_symbol:{old_name}→{new_name}"
-                old_contents = {r["path"]: r["old_content"] for r in pending}
-                new_contents = {r["path"]: r["new_content"] for r in pending}
-                combined_diff = "\n\n".join(r["diff"] for r in pending if r.get("diff"))
-                self._diff_store.record(
-                    batch_path,
-                    combined_diff,
+                self._diff_store.record_transaction(
+                    [
+                        FileChange(
+                            path=r["path"],
+                            old_content=r["old_content"],
+                            new_content=r["new_content"],
+                        )
+                        for r in pending
+                    ],
                     "refactor_symbol",
-                    old_content=json.dumps(old_contents),
-                    new_content=json.dumps(new_contents),
+                    label=f"refactor_symbol:{old_name}→{new_name}",
                 )
 
         # Phase 4: Build output

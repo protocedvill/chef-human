@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 
-pytestmark = pytest.mark.indexing
-pytest.importorskip("tree_sitter", reason="install chef-human[indexing] to test grammars")
+from chef_human.agent.symbols.grammars import GrammarLoader
 
-from chef_human.agent.symbols.grammars import GrammarLoader  # noqa: E402
+pytestmark = pytest.mark.indexing
+_TREE_SITTER_MISSING = importlib.util.find_spec("tree_sitter") is None
 
 
 class TestGrammarLoaderBasics:
@@ -34,6 +36,10 @@ class TestGrammarLoaderBasics:
         assert loader.load("nonexistent") is None
         assert loader.load("nonexistent") is None
 
+    @pytest.mark.skipif(
+        _TREE_SITTER_MISSING,
+        reason="install chef-human[indexing] to test tree-sitter grammars",
+    )
     def test_reset_clears_caches(self):
         loader = GrammarLoader()
         py = loader.load("python")
@@ -44,6 +50,10 @@ class TestGrammarLoaderBasics:
         assert loader._core_available is None
 
 
+@pytest.mark.skipif(
+    _TREE_SITTER_MISSING,
+    reason="install chef-human[indexing] to test tree-sitter grammars",
+)
 class TestGrammarLoaderReal:
     def test_is_available_true(self):
         loader = GrammarLoader()
@@ -107,6 +117,10 @@ class TestGrammarLoaderEdgeCases:
         loader._checked.add("python")
         assert loader.load("python") is None
 
+    @pytest.mark.skipif(
+        _TREE_SITTER_MISSING,
+        reason="install chef-human[indexing] to test tree-sitter grammars",
+    )
     def test_concurrent_instance_independence(self):
         a = GrammarLoader()
         b = GrammarLoader()

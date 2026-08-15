@@ -43,7 +43,10 @@ DESTRUCTIVE_PREFIXES: tuple[str, ...] = (
 
 class BashTool:
     name = "bash"
-    description = "Execute a shell command in the workspace"
+    description = (
+        "Execute a shell command with its working directory set inside the workspace. "
+        "Blacklist, approval, and timeout checks are guardrails, not process isolation."
+    )
     parameters = {
         "type": "object",
         "properties": {

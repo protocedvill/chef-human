@@ -82,6 +82,11 @@ a terminal `y/N` prompt. Click-drag in a log pane to select text and `Ctrl+C`/`C
 to your system clipboard (works in most terminals; notably not macOS Terminal.app — use iTerm2 or
 another terminal there). `Ctrl+Q` quits and auto-saves the session, same as `repl`.
 
+The shell tool is not a sandbox. Setting its working directory to the workspace, blocking a small
+set of known-dangerous commands, asking for approval, and enforcing a timeout are guardrails only.
+A command can still access the network, environment, and files permitted to the current user, or
+spawn child processes. Use a disposable checkout or an external container/VM for untrusted tasks.
+
 ### `chef-human repl`
 
 Interactive multi-turn session against the same conversation/workspace context. Takes the same

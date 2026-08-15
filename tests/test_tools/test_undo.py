@@ -5,7 +5,9 @@ from pathlib import Path
 import pytest
 
 from chef_human.agent.workspace import WorkspaceManager
-from chef_human.tools.diff import DiffStore
+from chef_human.tools.diff import DiffStore, FileChange
+from chef_human.tools.redo import RedoTool
+from chef_human.tools.registry import ToolResult
 from chef_human.tools.undo import UndoTool
 
 
@@ -122,3 +124,32 @@ class TestUndoTool:
         result = await undo_tool.run()
         assert result.success
         assert "```diff" in result.output
+
+    async def test_multi_file_transaction_undoes_and_redoes_as_one_unit(
+        self,
+        workspace: WorkspaceManager,
+        diff_store: DiffStore,
+        undo_tool: UndoTool,
+    ):
+        a = create_file(workspace.root, "a.py", "new a\n")
+        b = create_file(workspace.root, "b.py", "new b\n")
+        diff_store.record_transaction(
+            [
+                FileChange("a.py", "old a\n", "new a\n"),
+                FileChange("b.py", "old b\n", "new b\n"),
+            ],
+            "refactor_symbol",
+        )
+
+        undone = await undo_tool.run()
+        assert undone.success
+        assert a.read_text() == "old a\n"
+        assert b.read_text() == "old b\n"
+        assert await undo_tool.run() == ToolResult(
+            success=False, error="Nothing to undo."
+        )
+
+        redone = await RedoTool(workspace, diff_store).run()
+        assert redone.success
+        assert a.read_text() == "new a\n"
+        assert b.read_text() == "new b\n"

@@ -7,6 +7,7 @@ import sys
 
 import click
 
+from chef_human import config
 from chef_human.agent import create_agent
 from chef_human.agent.context import ContextManager
 from chef_human.agent.persistence import (
@@ -29,12 +30,10 @@ def _resolve_settings(
     temperature: float | None,
     config_path: str | None,
 ) -> "Settings":
-    import chef_human.config as config_module
     from chef_human.config import load_settings
     import dataclasses
 
-    if config_path:
-        return load_settings(config_path=config_path)
+    base = load_settings(config_path=config_path) if config_path else config.settings
 
     overrides: dict[str, object] = {}
     if model is not None:
@@ -43,8 +42,8 @@ def _resolve_settings(
         overrides["temperature"] = temperature
 
     if overrides:
-        return dataclasses.replace(config_module.settings, **overrides)
-    return config_module.settings
+        return dataclasses.replace(base, **overrides)
+    return base
 
 
 def _configure_logging(log_file: str | None) -> None:
@@ -413,19 +412,12 @@ async def _execute_task(
             save_dir=save_dir,
         )
 
-    import chef_human.config as config_module
-
-    old_settings = config_module.settings
-    if any((model, temperature, config_path)):
-        config_module.settings = _resolve_settings(model, temperature, config_path)
-
-    try:
-        loop, _ = create_agent(
-            workspace_root=workspace,
-            max_steps=max_steps,
-        )
-    finally:
-        config_module.settings = old_settings
+    resolved_settings = _resolve_settings(model, temperature, config_path)
+    loop, _ = create_agent(
+        workspace_root=workspace,
+        max_steps=max_steps,
+        settings=resolved_settings,
+    )
 
     loop._config.stream = stream
     loop._config.save_dir = save_dir
@@ -461,24 +453,16 @@ async def _run_task_in_tui(
     """Run a single task inside the split-pane Textual TUI (the default for
     `chef-human run` / `chef-human "task"`), auto-submitting `task` on
     launch and exiting once it completes."""
-    import chef_human.config as config_module
     from chef_human.llm import create_backend, create_planner_backend
 
-    old_settings = config_module.settings
-    if any((model, temperature, config_path)):
-        config_module.settings = _resolve_settings(model, temperature, config_path)
-
-    try:
-        from chef_human.agent import create_context_assembler
-        context = create_context_assembler(workspace_root=workspace)
-        # backend construction (and anything else settings-dependent) must
-        # happen inside this window too -- create_backend() reads
-        # chef_human.config.settings live now, but that's only useful if
-        # the override is still active when it's called.
-        backend = create_backend()
-        resolved_tool_timeout = config_module.settings.tool_timeout
-    finally:
-        config_module.settings = old_settings
+    resolved_settings = _resolve_settings(model, temperature, config_path)
+    from chef_human.agent import create_context_assembler
+    context = create_context_assembler(
+        workspace_root=workspace,
+        settings=resolved_settings,
+    )
+    backend = create_backend(settings=resolved_settings)
+    resolved_tool_timeout = resolved_settings.tool_timeout
 
     from chef_human.agent.planner import Plan, Planner
     from chef_human.agent.react_loop import ReActConfig, ReActLoop
@@ -499,7 +483,9 @@ async def _run_task_in_tui(
         file_context=context.file_context,
         dep_graph=context.dep_graph,
     )
-    planner = Planner(llm_backend=create_planner_backend(backend))
+    planner = Planner(
+        llm_backend=create_planner_backend(backend, settings=resolved_settings)
+    )
 
     app: ChefHumanTUI
     result_holder: list[AgentResult] = []
@@ -593,26 +579,18 @@ async def _run_repl(
     save_dir: str | None = None,
     log_file: str | None = None,
 ) -> None:
-    import chef_human.config as config_module
     from chef_human.llm import create_backend, create_planner_backend
 
     _configure_logging(log_file)
 
-    old_settings = config_module.settings
-    if any((model, temperature, config_path)):
-        config_module.settings = _resolve_settings(model, temperature, config_path)
-
-    try:
-        from chef_human.agent import create_context_assembler
-        context = create_context_assembler(workspace_root=workspace)
-        # backend construction (and anything else settings-dependent) must
-        # happen inside this window too -- create_backend() reads
-        # chef_human.config.settings live now, but that's only useful if
-        # the override is still active when it's called.
-        backend = create_backend()
-        resolved_tool_timeout = config_module.settings.tool_timeout
-    finally:
-        config_module.settings = old_settings
+    resolved_settings = _resolve_settings(model, temperature, config_path)
+    from chef_human.agent import create_context_assembler
+    context = create_context_assembler(
+        workspace_root=workspace,
+        settings=resolved_settings,
+    )
+    backend = create_backend(settings=resolved_settings)
+    resolved_tool_timeout = resolved_settings.tool_timeout
 
     from chef_human.agent.planner import Planner
     from chef_human.agent.react_loop import ReActConfig, ReActLoop
@@ -633,7 +611,9 @@ async def _run_repl(
         file_context=context.file_context,
         dep_graph=context.dep_graph,
     )
-    planner = Planner(llm_backend=create_planner_backend(backend))
+    planner = Planner(
+        llm_backend=create_planner_backend(backend, settings=resolved_settings)
+    )
     ui = ReplUI()
 
     total_prompt_tokens = 0
@@ -793,26 +773,18 @@ async def _run_tui(
     save_dir: str | None = None,
     log_file: str | None = None,
 ) -> None:
-    import chef_human.config as config_module
     from chef_human.llm import create_backend, create_planner_backend
 
     _configure_logging(log_file)
 
-    old_settings = config_module.settings
-    if any((model, temperature, config_path)):
-        config_module.settings = _resolve_settings(model, temperature, config_path)
-
-    try:
-        from chef_human.agent import create_context_assembler
-        context = create_context_assembler(workspace_root=workspace)
-        # backend construction (and anything else settings-dependent) must
-        # happen inside this window too -- create_backend() reads
-        # chef_human.config.settings live now, but that's only useful if
-        # the override is still active when it's called.
-        backend = create_backend()
-        resolved_tool_timeout = config_module.settings.tool_timeout
-    finally:
-        config_module.settings = old_settings
+    resolved_settings = _resolve_settings(model, temperature, config_path)
+    from chef_human.agent import create_context_assembler
+    context = create_context_assembler(
+        workspace_root=workspace,
+        settings=resolved_settings,
+    )
+    backend = create_backend(settings=resolved_settings)
+    resolved_tool_timeout = resolved_settings.tool_timeout
 
     from chef_human.agent.planner import Planner
     from chef_human.agent.react_loop import ReActConfig, ReActLoop
@@ -833,7 +805,9 @@ async def _run_tui(
         file_context=context.file_context,
         dep_graph=context.dep_graph,
     )
-    planner = Planner(llm_backend=create_planner_backend(backend))
+    planner = Planner(
+        llm_backend=create_planner_backend(backend, settings=resolved_settings)
+    )
 
     app: ChefHumanTUI
 

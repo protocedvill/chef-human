@@ -61,6 +61,13 @@ class Plan:
         completed."""
         return next((s for s in self.steps if s.status == StepStatus.pending), None)
 
+    def unresolved_steps(self) -> list[PlanStep]:
+        """Steps that prevent a plan from being reported as complete."""
+        return [s for s in self.steps if s.status != StepStatus.completed]
+
+    def is_complete(self) -> bool:
+        return not self.unresolved_steps()
+
 
 class Planner:
     """Generates and updates structured plans for the ReAct loop."""
@@ -137,12 +144,17 @@ class Planner:
         text = content.strip()
         reason_match = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE)
         reason = reason_match.group(1).strip() if reason_match else ""
-        upper = text.upper()
-        if "NOT_COMPLETE" in upper or "NOT COMPLETE" in upper:
+        verdict_match = re.search(
+            r"^\s*VERDICT:\s*(NOT_COMPLETE|NOT COMPLETE|PARTIAL|COMPLETE)\s*$",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        verdict_text = verdict_match.group(1).upper() if verdict_match else ""
+        if verdict_text in {"NOT_COMPLETE", "NOT COMPLETE"}:
             return StepVerdict.not_complete, reason
-        if "PARTIAL" in upper:
+        if verdict_text == "PARTIAL":
             return StepVerdict.partial, reason
-        if "COMPLETE" in upper:
+        if verdict_text == "COMPLETE":
             return StepVerdict.complete, reason
         return StepVerdict.not_complete, reason or "Could not parse verifier response"
 

@@ -4,7 +4,7 @@ import fnmatch
 import re
 from typing import TYPE_CHECKING, Any
 
-from chef_human.tools.diff import compute_diff, find_closest_match
+from chef_human.tools.diff import FileChange, compute_diff, find_closest_match
 from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
@@ -121,12 +121,13 @@ class WriteTool:
         lines = content.count("\n") + 1
         output_parts: list[str] = [f"Wrote {lines} lines to {path}"]
 
-        if old_content is not None:
-            diff = compute_diff(old_content, content, path=path)
-            if diff:
-                output_parts.append(diff)
-                if self._diff_store:
-                    self._diff_store.record(path, diff, "write", old_content=old_content, new_content=content)
+        diff = compute_diff(old_content or "", content, path=path)
+        if diff and old_content is not None:
+            output_parts.append(diff)
+        if self._diff_store and diff:
+            self._diff_store.record_transaction(
+                [FileChange(path, old_content, content)], "write"
+            )
 
         return ToolResult(output="\n".join(output_parts))
 
@@ -182,6 +183,10 @@ class EditTool:
                 return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
             if self._file_context is not None:
                 self._file_context.remember(path, new_string)
+            if self._diff_store:
+                self._diff_store.record_transaction(
+                    [FileChange(path, None, new_string)], "edit"
+                )
             lines = new_string.count("\n") + 1
             return ToolResult(output=f"Created {path} ({lines} lines)")
 

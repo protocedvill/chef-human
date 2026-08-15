@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from chef_human.agent.linter import _detect_linter, _find_ruff
-from chef_human.tools.diff import compute_diff
+from chef_human.tools.diff import FileChange, compute_diff
 from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
@@ -121,21 +121,19 @@ class LintFixTool:
 
         # Compute diffs
         changed = 0
+        changes: list[FileChange] = []
         all_paths = set(before_map) | set(after_map)
         for fp in sorted(all_paths):
             before = before_map.get(fp, "")
             after = after_map.get(fp, "")
             if before != after:
                 diff = compute_diff(before, after, path=fp)
-                if self._diff_store and diff:
-                    self._diff_store.record(
-                        fp,
-                        diff,
-                        "lint_fix",
-                        old_content=before,
-                        new_content=after,
-                    )
+                if diff:
+                    changes.append(FileChange(fp, before, after))
                 changed += 1
+
+        if self._diff_store and changes:
+            self._diff_store.record_transaction(changes, "lint_fix")
 
         if changed == 0:
             return ToolResult(output="No lint issues found or fixable.")

@@ -83,6 +83,18 @@ class TestCurrentStep:
         plan = Plan(goal="g", steps=[])
         assert plan.current_step() is None
 
+    def test_failed_and_skipped_steps_keep_plan_incomplete(self):
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="failed", status=StepStatus.failed),
+            PlanStep(index=2, description="skipped", status=StepStatus.skipped),
+        ])
+        assert plan.current_step() is None
+        assert not plan.is_complete()
+        assert [step.description for step in plan.unresolved_steps()] == [
+            "failed",
+            "skipped",
+        ]
+
     def test_ignores_in_progress_and_failed_steps(self):
         """Only 'pending' counts as the current step -- in_progress is a
         transient marker set during verification, and failed/skipped steps
@@ -376,6 +388,13 @@ class TestParseVerdict:
         verdict, reason = Planner._parse_verdict("VERDICT: COMPLETE\nREASON: file was created")
         assert verdict == StepVerdict.complete
         assert reason == "file was created"
+
+    def test_complete_verdict_ignores_partial_word_in_reason(self):
+        verdict, reason = Planner._parse_verdict(
+            "VERDICT: COMPLETE\nREASON: previously partial, now done"
+        )
+        assert verdict == StepVerdict.complete
+        assert reason == "previously partial, now done"
 
     def test_partial(self):
         verdict, reason = Planner._parse_verdict("VERDICT: PARTIAL\nREASON: only half done")

@@ -2,8 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from chef_human.agent.workspace import WorkspaceManager
+from chef_human.tools import create_tool_registry
 
-from chef_human.tools.registry import ToolResult, ToolRegistry
+from chef_human.tools.registry import (
+    TOOL_POLICIES,
+    MutationScope,
+    ReadRequirement,
+    ToolResult,
+    ToolRegistry,
+)
 
 
 class FakeTool:
@@ -86,3 +94,37 @@ class TestToolRegistry:
         assert isinstance(tool, FakeTool)
         assert hasattr(tool, "name")
         assert hasattr(tool, "run")
+
+
+class TestBuiltInToolPolicies:
+    def test_every_registered_tool_is_classified(self, tmp_path):
+        registry = create_tool_registry(WorkspaceManager(tmp_path))
+        assert set(registry.list_tools()) <= set(TOOL_POLICIES)
+
+    def test_every_builtin_mutator_has_one_read_strategy(self):
+        mutators = {
+            name: policy for name, policy in TOOL_POLICIES.items() if policy.mutates
+        }
+        assert set(mutators) == {
+            "bash",
+            "edit",
+            "lint_fix",
+            "patch",
+            "redo",
+            "refactor_symbol",
+            "undo",
+            "write",
+        }
+        assert all(
+            policy.read_requirement != ReadRequirement.none
+            for policy in mutators.values()
+        )
+        assert {
+            name
+            for name, policy in mutators.items()
+            if policy.mutation_scope == MutationScope.path
+        } == {"write", "edit", "patch"}
+        assert all(
+            mutators[name].read_requirement == ReadRequirement.explicit_path
+            for name in ("write", "edit", "patch")
+        )

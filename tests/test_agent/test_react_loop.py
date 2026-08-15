@@ -85,6 +85,9 @@ class _FakeResolvedPath:
     def exists(self) -> bool:
         return self._exists
 
+    def read_text(self) -> str:
+        raise OSError("test path has no backing file")
+
     def __str__(self) -> str:
         return self._path
 
@@ -1287,6 +1290,35 @@ class TestReActLoopRun:
 
 class TestStepVerification:
     @pytest.mark.asyncio
+    async def test_reasoning_only_verifier_exception_is_bounded_failure(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(role=Role.assistant, content="I believe this is done.")
+        )
+        planner = _make_mock_planner()
+        plan = _make_default_plan()
+        planner.generate_plan.return_value = plan
+        planner.verify_step = AsyncMock(side_effect=ConnectionError("planner offline"))
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(
+                max_steps=10,
+                max_retries_per_step=1,
+                max_replans=0,
+            ),
+        )
+        result = await loop.run("do something")
+
+        assert not result.success
+        assert result.steps_taken == 1
+        assert plan.steps[0].status == StepStatus.pending
+        assert "verification repeatedly failed" in result.message
+
+    @pytest.mark.asyncio
     async def test_partial_verdict_does_not_advance_step(self):
         backend = _make_mock_backend()
         backend.complete.return_value = CompletionResponse(
@@ -2048,8 +2080,12 @@ class TestAskUserVagueQuestionGuard:
 
 
 class TestPrematureFinishGuard:
+    @pytest.mark.parametrize(
+        "unresolved_status",
+        [StepStatus.pending, StepStatus.failed, StepStatus.skipped],
+    )
     @pytest.mark.asyncio
-    async def test_finish_blocked_with_pending_steps(self):
+    async def test_finish_blocked_with_unresolved_steps(self, unresolved_status):
         """Reproduces the bug: agent reads the plan, then immediately calls
         finish with a summary claiming work was done, without ever writing
         anything. finish must be rejected while steps remain pending."""
@@ -2063,7 +2099,11 @@ class TestPrematureFinishGuard:
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
             PlanStep(index=1, description="Read plan.md", status=StepStatus.completed),
-            PlanStep(index=2, description="Implement the feature", status=StepStatus.pending),
+            PlanStep(
+                index=2,
+                description="Implement the feature",
+                status=unresolved_status,
+            ),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -2507,6 +2547,74 @@ class TestReadBeforeEditGuard:
         await loop.run("do something")
 
         edit_tool.run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_read_then_edit_in_same_turn_runs_in_order(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=(
+                    '<tool_call>{"name": "read", "arguments": {"path": "a.py"}}</tool_call>'
+                    '<tool_call>{"name": "edit", "arguments": {"path": "a.py", '
+                    '"old_string": "x", "new_string": "y"}}</tool_call>'
+                ),
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(
+            side_effect=lambda p: _FakeResolvedPath(p, exists=True)
+        )
+        registry = _make_mock_tool_registry()
+        order: list[str] = []
+
+        async def read_run(**_kwargs):
+            order.append("read")
+            return MagicMock(output="x", success=True, error=None)
+
+        async def edit_run(**_kwargs):
+            order.append("edit")
+            return MagicMock(output="edited", success=True, error=None)
+
+        read_tool = MagicMock(
+            name="read",
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        )
+        read_tool.run = AsyncMock(side_effect=read_run)
+        edit_tool = MagicMock(
+            name="edit",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        )
+        edit_tool.run = AsyncMock(side_effect=edit_run)
+        registry.get.side_effect = lambda name: {
+            "read": read_tool,
+            "edit": edit_tool,
+        }.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, lint_after_write=False),
+        )
+        await loop.run("do something")
+
+        assert order == ["read", "edit"]
 
     @pytest.mark.asyncio
     async def test_guard_disabled_via_config(self):

@@ -32,7 +32,13 @@ from chef_human.llm.backend import (
     Message,
     Role,
 )
-from chef_human.tools.registry import Tool, ToolRegistry
+from chef_human.tools.registry import (
+    TOOL_POLICIES,
+    ReadRequirement,
+    Tool,
+    ToolRegistry,
+    get_tool_policy,
+)
 from chef_human.ui.protocol import NoopUI, ReActUI
 
 logger = logging.getLogger(__name__)
@@ -136,9 +142,9 @@ _PERMISSION_SEEKING_RE = re.compile(
 )
 
 
-def _rollback_file(path: str, content: str) -> None:
+def _rollback_file(path: Path, content: str) -> None:
     """Restore a file to its pre-write content."""
-    Path(path).write_text(content)
+    path.write_text(content)
 
 
 def _looks_investigative(description: str) -> bool:
@@ -167,8 +173,8 @@ def _looks_like_self_reported_vulnerability(summary: str) -> str | None:
 # after one of these actually succeeds. Public (no leading underscore) so
 # UI implementations can reuse it too, e.g. to know when to refresh a file
 # tree widget -- see TuiUI.on_tool_result.
-FILE_MUTATING_TOOLS = (
-    "write", "edit", "patch", "refactor_symbol", "lint_fix", "undo", "redo", "bash",
+FILE_MUTATING_TOOLS = tuple(
+    name for name, policy in TOOL_POLICIES.items() if policy.mutates
 )
 
 
@@ -299,7 +305,7 @@ class ReActLoop:
         try:
             while steps_taken < self._config.max_steps:
                 current = plan.current_step()
-                plan_was_complete_at_turn_start = current is None
+                plan_was_complete_at_turn_start = plan.is_complete()
                 logger.debug(
                     "Turn starting: steps_taken=%d/%d, current step=%r",
                     steps_taken, self._config.max_steps,
@@ -413,13 +419,39 @@ class ReActLoop:
                             self._context.conversation.add_message(
                                 Message(role=Role.tool, content=verify_feedback)
                             )
+                            verify_failure_history.append(verify_feedback)
+                            action = retry_mgr.record_iteration(1, 1, [verify_feedback])
+                        else:
+                            verify_failure_history.clear()
 
-                    if self._detect_finish(non_tool_reasoning) and not parse_error:
+                    if (
+                        self._detect_finish(non_tool_reasoning)
+                        and not parse_error
+                        and plan.is_complete()
+                    ):
                         logger.info("Task finished via finish-phrase detection after %d step(s)", steps_taken)
                         return self._make_result(
                             plan=plan,
                             steps_taken=steps_taken,
                             message=non_tool_reasoning,
+                        )
+                    if action == RetryAction.REPLAN:
+                        self._ui.on_replan()
+                        plan = await self._planner.update_plan(
+                            plan,
+                            failure_context="\n".join(verify_failure_history),
+                        )
+                        retry_mgr.on_replan()
+                        verify_failure_history.clear()
+                    elif action == RetryAction.ESCALATE:
+                        return self._make_result(
+                            plan=plan,
+                            steps_taken=steps_taken,
+                            message=(
+                                "The task could not be completed because step "
+                                "verification repeatedly failed."
+                            ),
+                            success=False,
                         )
                     continue
 
@@ -481,8 +513,9 @@ class ReActLoop:
 
                     if tc.name == "finish":
                         if self._config.require_plan_complete_to_finish:
-                            current = plan.current_step()
-                            if current is not None:
+                            unresolved = plan.unresolved_steps()
+                            if unresolved:
+                                current = unresolved[0]
                                 logger.info(
                                     "Blocked premature finish: unfinished step %r remains",
                                     current.description,
@@ -588,23 +621,6 @@ class ReActLoop:
                                 failed_calls += 1
                                 continue
 
-                    if (
-                        self._config.require_read_before_edit
-                        and tc.name in ("write", "edit")
-                    ):
-                        read_key = self._unread_existing_file(tc.arguments.get("path", ""), files_read)
-                        if read_key is not None:
-                            logger.info("Blocked %s of unread file: %r", tc.name, read_key)
-                            result = self._make_tool_error(
-                                f"You haven't read '{read_key}' yet this session. Read it "
-                                "first with the `read` tool so this change is based on the "
-                                "file's actual current content, not a guess."
-                            )
-                            self._ui.on_tool_result(tc.name, result)
-                            tool_results.append(result)
-                            failed_calls += 1
-                            continue
-
                     parallel_candidates.append((tc, tool))
 
                 if parallel_candidates:
@@ -614,35 +630,51 @@ class ReActLoop:
                     # file existed *before* this turn, for the objective
                     # file-creation facts below.
                     pre_write_content: dict[str, str | None] = {}
-                    for tc, _tool in parallel_candidates:
-                        if tc.name in ("write", "edit", "patch"):
-                            path = tc.arguments.get("path", "")
-                            pre_write_content[path] = self._capture_file_content(path)
-
-                    coros = [
-                        asyncio.wait_for(
-                            tool.run(**tc.arguments),
-                            timeout=self._config.tool_timeout,
-                        )
-                        for tc, tool in parallel_candidates
-                    ]
                     dispatch_start = time.monotonic()
-                    gathered = await asyncio.gather(*coros, return_exceptions=True)
-                    logger.debug(
-                        "Dispatched %d tool call(s) in %.1fs: %s",
-                        len(parallel_candidates),
-                        time.monotonic() - dispatch_start,
-                        [tc.name for tc, _ in parallel_candidates],
-                    )
+                    # Preserve model order. This makes read+edit in one turn
+                    # well-defined and prevents two mutating calls from
+                    # racing on the same path. Tool-level async work remains
+                    # asynchronous; only a single response batch is
+                    # serialized at this safety boundary.
+                    for tc, tool in parallel_candidates:
+                        policy = get_tool_policy(tc.name)
+                        if (
+                            self._config.require_read_before_edit
+                            and policy.read_requirement == ReadRequirement.explicit_path
+                            and policy.path_argument is not None
+                        ):
+                            path = str(tc.arguments.get(policy.path_argument, ""))
+                            read_key = self._unread_existing_file(path, files_read)
+                            if read_key is not None:
+                                logger.info("Blocked %s of unread file: %r", tc.name, read_key)
+                                result = self._make_tool_error(
+                                    f"You haven't read '{read_key}' yet this session. Read it "
+                                    "first with the `read` tool. Calls in one model response "
+                                    "run in order, so `read` immediately followed by this "
+                                    "mutation is allowed."
+                                )
+                                self._ui.on_tool_result(tc.name, result)
+                                tool_results.append(result)
+                                failed_calls += 1
+                                continue
 
-                    for (tc, _tool), tool_result in zip(parallel_candidates, gathered):
-                        if isinstance(tool_result, BaseException):
-                            result = self._make_tool_error(f"Execution error: {tool_result}")
+                        if tc.name in ("write", "edit", "patch"):
+                            write_path = str(tc.arguments.get("path", ""))
+                            pre_write_content[write_path] = self._capture_file_content(
+                                write_path
+                            )
+
+                        try:
+                            tool_result = await asyncio.wait_for(
+                                tool.run(**tc.arguments),
+                                timeout=self._config.tool_timeout,
+                            )
+                        except Exception as exc:
+                            result = self._make_tool_error(f"Execution error: {exc}")
                             self._ui.on_tool_result(tc.name, result)
                             tool_results.append(result)
                             failed_calls += 1
                             continue
-
                         if not tool_result.success:
                             result = f"Error: {tool_result.error}\nOutput: {tool_result.output}"
                             failed_calls += 1
@@ -688,8 +720,9 @@ class ReActLoop:
                             if lint_output:
                                 # If lint has actual errors, roll back the file
                                 original = pre_write_content.get(file_path)
+                                resolved_file = self._context.workspace.resolve(file_path)
                                 if original is not None:
-                                    _rollback_file(file_path, original)
+                                    _rollback_file(resolved_file, original)
                                     rollback_msg = (
                                         f"\n[rollback] Lint errors detected — "
                                         f"file '{file_path}' restored to pre-write state."
@@ -711,6 +744,13 @@ class ReActLoop:
                                 lint_result = format_lint_result(lint_output) + rollback_msg
                                 tool_results.append(lint_result)
                                 failed_calls += 1
+
+                    logger.debug(
+                        "Dispatched %d ordered tool call(s) in %.1fs: %s",
+                        len(parallel_candidates),
+                        time.monotonic() - dispatch_start,
+                        [tc.name for tc, _ in parallel_candidates],
+                    )
 
                 if finish_call is not None:
                     tc, tool = finish_call
@@ -1049,10 +1089,12 @@ class ReActLoop:
         response = input("Approve? (y/N): ").strip().lower()
         return response in ("y", "yes")
 
-    @staticmethod
-    def _capture_file_content(path: str) -> str | None:
+    def _capture_file_content(self, path: str) -> str | None:
         """Read file content before write/edit for potential rollback."""
-        p = Path(path)
+        try:
+            p = self._context.workspace.resolve(path)
+        except Exception:
+            return None
         if p.exists():
             try:
                 return p.read_text()

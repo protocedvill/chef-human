@@ -20,6 +20,14 @@ VENV_DIR="${CH_INSTALL_VENV:-.venv}"
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
     echo "Creating virtual environment at $VENV_DIR with Python $PYTHON_VERSION..."
     "$PYTHON_BIN" -m venv "$VENV_DIR"
+else
+    VENV_VERSION="$($VENV_DIR/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    if [[ "$VENV_VERSION" != "$PYTHON_VERSION" ]]; then
+        echo "Error: Existing environment at $VENV_DIR uses Python $VENV_VERSION," >&2
+        echo "but CH_INSTALL_PYTHON selected Python $PYTHON_VERSION." >&2
+        echo "Choose a different CH_INSTALL_VENV or remove/recreate that environment explicitly." >&2
+        exit 1
+    fi
 fi
 
 VENV_PYTHON="$VENV_DIR/bin/python"

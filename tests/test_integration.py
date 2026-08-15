@@ -33,7 +33,9 @@ class TestCreateAgent:
 
             loop, context = create_agent(max_steps=10)
 
-            mock_ctx_factory.assert_called_once_with(workspace_root=None)
+            mock_ctx_factory.assert_called_once()
+            assert mock_ctx_factory.call_args.kwargs["workspace_root"] is None
+            assert mock_ctx_factory.call_args.kwargs["settings"] is not None
             mock_loop_factory.assert_called_once()
             _, kwargs = mock_loop_factory.call_args
             assert kwargs["config"].max_steps == 10
@@ -55,7 +57,8 @@ class TestCreateAgent:
 
             create_agent(workspace_root="/custom/path")
 
-            mock_ctx_factory.assert_called_once_with(workspace_root="/custom/path")
+            mock_ctx_factory.assert_called_once()
+            assert mock_ctx_factory.call_args.kwargs["workspace_root"] == "/custom/path"
 
     def test_planner_uses_separate_backend_when_configured(self):
         """When settings.planner_ollama_model is set, Planner must receive
@@ -144,13 +147,63 @@ class TestCreateAgent:
             mock_noop.assert_called_once()
 
 
+class TestRagDependencyErrors:
+    def test_missing_optional_dependency_gets_install_hint(self, tmp_path):
+        from chef_human.agent import create_context_assembler
+        from chef_human.config import Settings
+
+        missing = ModuleNotFoundError("No module named 'faiss'", name="faiss")
+        with (
+            patch("chef_human.agent.create_tokenizer"),
+            patch(
+                "chef_human.agent.WorkspaceManager.list_files",
+                return_value=[tmp_path / "a.py"],
+            ),
+            patch(
+                "chef_human.agent._build_rag_context_assembler",
+                side_effect=missing,
+            ),
+        ):
+            with pytest.raises(RuntimeError, match=r"chef-human\[rag\]"):
+                create_context_assembler(
+                    workspace_root=str(tmp_path),
+                    settings=Settings(rag_enabled=True, max_index_files=0),
+                )
+
+    def test_internal_missing_module_is_not_mislabeled_as_optional(self, tmp_path):
+        from chef_human.agent import create_context_assembler
+        from chef_human.config import Settings
+
+        missing = ModuleNotFoundError(
+            "No module named 'chef_human.agent.rag.typo'",
+            name="chef_human.agent.rag.typo",
+        )
+        with (
+            patch("chef_human.agent.create_tokenizer"),
+            patch(
+                "chef_human.agent.WorkspaceManager.list_files",
+                return_value=[tmp_path / "a.py"],
+            ),
+            patch(
+                "chef_human.agent._build_rag_context_assembler",
+                side_effect=missing,
+            ),
+        ):
+            with pytest.raises(ModuleNotFoundError) as exc_info:
+                create_context_assembler(
+                    workspace_root=str(tmp_path),
+                    settings=Settings(rag_enabled=True, max_index_files=0),
+                )
+        assert exc_info.value.name == "chef_human.agent.rag.typo"
+
+
 class TestFullLoopIntegration:
     """End-to-end integration test with all components mocked.
 
     Validates that a full task flows through plan -> reason -> tool call -> result -> finish.
     """
 
-    TOOL_CALLS = """<tool_call>{"name": "read", "arguments": {"path": "test.txt"}}</tool_call>"""
+    TOOL_CALLS = """<tool_call>{"name": "read", "arguments": {"path": "README.md"}}</tool_call>"""
     ALL_DONE = """The task is complete. <finish>All done</finish>"""
 
     @pytest.mark.asyncio
@@ -172,6 +225,12 @@ class TestFullLoopIntegration:
                 message=Message(
                     role=Role.assistant,
                     content=self.ALL_DONE,
+                )
+            ),
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="VERDICT: COMPLETE\nREASON: summary supplied",
                 )
             ),
         ])
@@ -222,7 +281,22 @@ class TestFullLoopIntegration:
             CompletionResponse(
                 message=Message(
                     role=Role.assistant,
+                    content=(
+                        'Retry the read.<tool_call>{"name": "read", '
+                        '"arguments": {"path": "./README.md"}}</tool_call>'
+                    ),
+                )
+            ),
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
                     content=self.ALL_DONE,
+                )
+            ),
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="VERDICT: COMPLETE\nREASON: recovered read succeeded",
                 )
             ),
         ])

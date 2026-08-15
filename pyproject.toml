@@ -17,9 +17,6 @@ dependencies = [
 llamacpp = [
     "llama-cpp-python>=0.3.0",
 ]
-embeddings = [
-    "sentence-transformers>=3.0.0",
-]
 indexing = [
     "tree-sitter>=0.23,<1.0",
     "tree-sitter-python>=0.23",
@@ -53,6 +50,11 @@ build-backend = "setuptools.build_meta"
 line-length = 100
 target-version = "py312"
 exclude = ["docs/archive"]
+
+[tool.ruff.lint]
+# Pin Ruff's historical default rule set so a future Ruff release cannot
+# silently turn new opinionated rule families into release blockers.
+select = ["E4", "E7", "E9", "F"]
 
 [tool.pyright]
 include = ["chef_human"]

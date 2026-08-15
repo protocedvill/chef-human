@@ -101,6 +101,13 @@ def find_closest_match(
 
 
 @dataclass
+class FileChange:
+    path: str
+    old_content: str | None
+    new_content: str | None
+
+
+@dataclass
 class DiffEntry:
     path: str
     diff: str
@@ -108,14 +115,16 @@ class DiffEntry:
     new_content: str | None
     timestamp: float
     tool_name: str
+    changes: tuple[FileChange, ...] = ()
 
 
 @dataclass
 class RedoEntry:
     file_path: str
-    old_content: str
-    new_content: str
+    old_content: str | None
+    new_content: str | None
     tool_name: str
+    changes: tuple[FileChange, ...] = ()
 
 
 class DiffStore:
@@ -143,6 +152,42 @@ class DiffStore:
                 new_content=new_content,
                 timestamp=time.time(),
                 tool_name=tool_name,
+            )
+        )
+        self._redo_stack.clear()
+
+    def record_transaction(
+        self,
+        changes: list[FileChange],
+        tool_name: str,
+        *,
+        label: str | None = None,
+    ) -> None:
+        effective = [change for change in changes if change.old_content != change.new_content]
+        if not effective:
+            return
+        diffs = [
+            compute_diff(
+                change.old_content or "",
+                change.new_content or "",
+                path=change.path,
+            )
+            for change in effective
+        ]
+        path = label or (
+            effective[0].path
+            if len(effective) == 1
+            else f"transaction:{tool_name}:{len(effective)}-files"
+        )
+        self._entries.append(
+            DiffEntry(
+                path=path,
+                diff="\n".join(diff for diff in diffs if diff),
+                old_content=(effective[0].old_content if len(effective) == 1 else None),
+                new_content=(effective[0].new_content if len(effective) == 1 else None),
+                timestamp=time.time(),
+                tool_name=tool_name,
+                changes=tuple(effective),
             )
         )
         self._redo_stack.clear()

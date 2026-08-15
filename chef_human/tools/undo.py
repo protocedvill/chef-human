@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from chef_human.tools.diff import RedoEntry
+from chef_human.tools.diff import FileChange, RedoEntry
 from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
@@ -34,55 +34,67 @@ class UndoTool:
         if entry is None:
             return ToolResult(success=False, error="Nothing to undo.")
 
-        if entry.old_content is None:
-            resolved = self._workspace.resolve(entry.path)
-            resolved.unlink(missing_ok=True)
-            return ToolResult(output=f"Undid {entry.tool_name}: deleted {entry.path} (was new file)")
-
-        is_batch = entry.path.startswith("batch:")
-
-        if is_batch:
-            old_map: dict[str, str] = json.loads(entry.old_content)
-            current_map: dict[str, str] = {}
-            for fp, old_content in old_map.items():
-                resolved = self._workspace.resolve(fp)
-                current = resolved.read_text(encoding="utf-8") if resolved.exists() else ""
-                current_map[fp] = current
-                resolved.parent.mkdir(parents=True, exist_ok=True)
-                resolved.write_text(old_content, encoding="utf-8")
-
-            self._store.push_redo(RedoEntry(
-                file_path=entry.path,
-                old_content=json.dumps(current_map),
-                new_content=entry.old_content,
-                tool_name=entry.tool_name,
-            ))
-
-            output_parts = [
-                f"Undid {entry.tool_name}: restored {len(old_map)} file{'s' if len(old_map) != 1 else ''}",
-            ]
-            return ToolResult(output="\n".join(output_parts))
-
-        resolved = self._workspace.resolve(entry.path)
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        current_content = resolved.read_text(encoding="utf-8") if resolved.exists() else ""
-        resolved.write_text(entry.old_content, encoding="utf-8")
+        changes = entry.changes or (
+            FileChange(entry.path, entry.old_content, entry.new_content),
+        )
+        error = self._apply_atomically(changes, use_new=False)
+        if error is not None:
+            self._store.push_entry(entry)
+            return ToolResult(success=False, error=error)
 
         self._store.push_redo(RedoEntry(
             file_path=entry.path,
-            old_content=current_content,
-            new_content=entry.old_content,
+            old_content=entry.old_content,
+            new_content=entry.new_content,
             tool_name=entry.tool_name,
+            changes=changes,
         ))
 
         from chef_human.tools.diff import compute_diff
 
-        reverse_diff = compute_diff(entry.new_content or "", entry.old_content, path=entry.path)
+        reverse_diff = (
+            compute_diff(entry.new_content or "", entry.old_content or "", path=entry.path)
+            if len(changes) == 1
+            else ""
+        )
 
-        output_parts = [
-            f"Undid {entry.tool_name}: restored {entry.path}",
-        ]
+        if len(changes) == 1 and changes[0].old_content is None:
+            output_parts = [
+                f"Undid {entry.tool_name}: deleted {changes[0].path} (was new file)"
+            ]
+        else:
+            target = changes[0].path if len(changes) == 1 else f"{len(changes)} files"
+            output_parts = [f"Undid {entry.tool_name}: restored {target}"]
         if reverse_diff:
             output_parts.append(reverse_diff)
 
         return ToolResult(output="\n".join(output_parts))
+
+    def _apply_atomically(
+        self, changes: tuple[FileChange, ...], *, use_new: bool
+    ) -> str | None:
+        snapshots: dict[Path, str | None] = {}
+        try:
+            for change in changes:
+                resolved = self._workspace.resolve(change.path)
+                snapshots[resolved] = (
+                    resolved.read_text(encoding="utf-8") if resolved.exists() else None
+                )
+                content = change.new_content if use_new else change.old_content
+                if content is None:
+                    resolved.unlink(missing_ok=True)
+                else:
+                    resolved.parent.mkdir(parents=True, exist_ok=True)
+                    resolved.write_text(content, encoding="utf-8")
+        except Exception as exc:
+            for resolved, content in snapshots.items():
+                try:
+                    if content is None:
+                        resolved.unlink(missing_ok=True)
+                    else:
+                        resolved.parent.mkdir(parents=True, exist_ok=True)
+                        resolved.write_text(content, encoding="utf-8")
+                except Exception:
+                    pass
+            return f"Undo transaction failed and was rolled back: {exc}"
+        return None

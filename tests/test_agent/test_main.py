@@ -580,6 +580,21 @@ class TestResolveSettings:
         _resolve_settings(model="llama3", temperature=None, config_path=None)
         assert settings.ollama_model == original_model
 
+    def test_cli_values_override_explicit_config_file(self, tmp_path):
+        from chef_human.main import _resolve_settings
+
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[chef_human]\nollama_model = "from-file"\ntemperature = 0.2\n'
+        )
+        result = _resolve_settings(
+            model="from-cli",
+            temperature=0.8,
+            config_path=str(config_path),
+        )
+        assert result.ollama_model == "from-cli"
+        assert result.temperature == 0.8
+
 
 class TestToDict:
     def test_agent_result_to_dict(self):
@@ -874,17 +889,13 @@ class TestSessionCLI:
                 assert result.exit_code == 1
 
 
-class TestModelOverrideActuallyReachesBackendConstruction:
+class TestSettingsInjectionReachesBackendConstruction:
     """Regression tests for the bug where --model/--temperature/--config
     were silently no-ops for `run` (non-headless), `repl`, and `tui`:
-    chef_human.llm/chef_human.agent used to snapshot `settings` at their
-    own import time (never seeing main.py's later monkeypatch), and even
-    after fixing that, the monkeypatch window in these three functions
-    closed (restored to the original settings) *before* create_backend()
-    ran. Each test mocks create_backend with a side_effect that captures
-    chef_human.config.settings.ollama_model at the exact moment it's
-    called -- proving the override was still active then, not just that
-    _resolve_settings computed the right value somewhere unused."""
+    rebinding a module singleton could not update names already imported
+    elsewhere. Each test captures the immutable Settings object passed to
+    backend construction, proving the resolved override reaches the actual
+    consumer without global mutation."""
 
     def _mock_context(self):
         context = MagicMock()
@@ -903,8 +914,7 @@ class TestModelOverrideActuallyReachesBackendConstruction:
         seen_models: list[str] = []
 
         def capturing_create_backend(*args, **kwargs):
-            import chef_human.config as config_module
-            seen_models.append(config_module.settings.ollama_model)
+            seen_models.append(kwargs["settings"].ollama_model)
             return MagicMock()
 
         mock_app_cls = MagicMock()
@@ -928,13 +938,7 @@ class TestModelOverrideActuallyReachesBackendConstruction:
                 model="custom-model",
             )
 
-        # The first create_backend() call is always the main backend --
-        # this is what the widened monkeypatch window (Bug B) targets.
-        # A second call may follow from create_planner_backend() when a
-        # planner_ollama_model is configured, which
-        # runs after the window closes -- a separate, narrower, pre-existing
-        # gap specific to --config overriding planner_ollama_model, out of
-        # scope for this fix.
+        # The first call constructs the main backend from the injected settings.
         assert seen_models[0] == "custom-model"
 
     @pytest.mark.asyncio
@@ -944,8 +948,7 @@ class TestModelOverrideActuallyReachesBackendConstruction:
         seen_models: list[str] = []
 
         def capturing_create_backend(*args, **kwargs):
-            import chef_human.config as config_module
-            seen_models.append(config_module.settings.ollama_model)
+            seen_models.append(kwargs["settings"].ollama_model)
             return MagicMock()
 
         mock_ui = MagicMock()
@@ -964,13 +967,7 @@ class TestModelOverrideActuallyReachesBackendConstruction:
                 model="custom-model",
             )
 
-        # The first create_backend() call is always the main backend --
-        # this is what the widened monkeypatch window (Bug B) targets.
-        # A second call may follow from create_planner_backend() when a
-        # planner_ollama_model is configured, which
-        # runs after the window closes -- a separate, narrower, pre-existing
-        # gap specific to --config overriding planner_ollama_model, out of
-        # scope for this fix.
+        # The first call constructs the main backend from the injected settings.
         assert seen_models[0] == "custom-model"
 
     @pytest.mark.asyncio
@@ -980,8 +977,7 @@ class TestModelOverrideActuallyReachesBackendConstruction:
         seen_models: list[str] = []
 
         def capturing_create_backend(*args, **kwargs):
-            import chef_human.config as config_module
-            seen_models.append(config_module.settings.ollama_model)
+            seen_models.append(kwargs["settings"].ollama_model)
             return MagicMock()
 
         mock_app_cls = MagicMock()
@@ -1003,21 +999,13 @@ class TestModelOverrideActuallyReachesBackendConstruction:
                 model="custom-model",
             )
 
-        # The first create_backend() call is always the main backend --
-        # this is what the widened monkeypatch window (Bug B) targets.
-        # A second call may follow from create_planner_backend() when a
-        # planner_ollama_model is configured, which
-        # runs after the window closes -- a separate, narrower, pre-existing
-        # gap specific to --config overriding planner_ollama_model, out of
-        # scope for this fix.
+        # The first call constructs the main backend from the injected settings.
         assert seen_models[0] == "custom-model"
 
     @pytest.mark.asyncio
     async def test_run_task_in_tui_captures_resolved_tool_timeout(self):
-        """tool_timeout is read inside the handle_task closure, which runs
-        at task-submission time -- long after the monkeypatch window has
-        closed. It must be captured into a local during the window, not
-        read from a module-level name at call time."""
+        """The deferred submit callback must retain the resolved timeout
+        from the same injected Settings object as the backend/context."""
         from chef_human.main import _run_task_in_tui
 
         mock_app_cls = MagicMock()

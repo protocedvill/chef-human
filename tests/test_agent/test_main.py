@@ -32,6 +32,29 @@ class TestCLIStructure:
         assert "--debug-tui" in result.output
         assert "--no-stream" in result.output
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ["run", "--help"],
+            ["repl", "--help"],
+            ["tui", "--help"],
+            ["show-config", "--help"],
+            ["recommend-model", "--help"],
+            ["session", "--help"],
+            ["session", "list", "--help"],
+            ["session", "show", "--help"],
+            ["session", "delete", "--help"],
+            ["session", "export", "--help"],
+        ],
+        ids=lambda command: " ".join(command[:-1]),
+    )
+    def test_advertised_command_help_smoke(self, runner, command):
+        from chef_human.main import cli
+
+        result = runner.invoke(cli, command)
+        assert result.exit_code == 0, result.output
+        assert "Usage:" in result.output
+
     def test_run_with_task_argument(self, runner):
         from chef_human.main import cli
 

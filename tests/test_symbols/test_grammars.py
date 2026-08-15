@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.indexing
 pytest.importorskip("tree_sitter", reason="install chef-human[indexing] to test grammars")
 
-from chef_human.agent.symbols.grammars import GrammarLoader
+from chef_human.agent.symbols.grammars import GrammarLoader  # noqa: E402
 
 
 class TestGrammarLoaderBasics:

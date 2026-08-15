@@ -169,19 +169,47 @@ def _parse_tool_calls_from_content(content: str) -> list[dict[str, Any]] | None:
 
     for match in re.finditer(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL):
         try:
-            calls.append(json.loads(match.group(1)))
+            parsed = json.loads(match.group(1))
+            normalized = _normalize_tool_call(parsed)
+            if normalized is not None:
+                calls.append(normalized)
         except json.JSONDecodeError:
             logger.warning("Failed to parse <tool_call>: %s", match.group(1))
 
     if calls:
         return calls
 
-    try:
-        parsed = json.loads(content)
-        if isinstance(parsed, dict) and "name" in parsed:
-            calls.append(parsed)
+    candidates = [content.strip()]
+    candidates.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
+    )
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        normalized = _normalize_tool_call(parsed)
+        if normalized is not None:
+            calls.append(normalized)
             return calls
-    except json.JSONDecodeError:
-        pass
 
     return None
+
+
+def _normalize_tool_call(value: object) -> dict[str, Any] | None:
+    """Return Ollama's native tool-call shape for supported JSON variants."""
+    if not isinstance(value, dict):
+        return None
+    function = value.get("function")
+    if isinstance(function, dict) and function.get("name"):
+        return value
+    name = value.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    return {
+        "function": {
+            "name": name,
+            "arguments": value.get("arguments", {}),
+        }
+    }

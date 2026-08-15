@@ -243,7 +243,10 @@ class TestDiscoverRoot:
         root = WorkspaceManager.discover_root(inner)
         assert root == tmp_path.resolve()
 
-    def test_returns_current_when_no_marker(self, tmp_path: Path):
+    def test_returns_current_when_no_marker(self, tmp_path: Path, monkeypatch):
+        # Isolate discovery from markers that may exist in /tmp or another
+        # host-specific parent of pytest's temporary directory.
+        monkeypatch.setattr(Path, "exists", lambda _path: False)
         root = WorkspaceManager.discover_root(tmp_path)
         assert root == tmp_path.resolve()
 

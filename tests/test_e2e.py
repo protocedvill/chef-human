@@ -19,6 +19,7 @@ from chef_human.config import settings
 pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.integration,
+    pytest.mark.integration_ollama,
     pytest.mark.skipif(
         settings.llm_backend != "ollama",
         reason="E2E test requires Ollama backend",
@@ -26,20 +27,8 @@ pytestmark = [
 ]
 
 
-def _ollama_reachable() -> bool:
-    try:
-        import ollama
-        client = ollama.Client(host=settings.ollama_host)
-        client.list()
-        return True
-    except Exception:
-        return False
-
-
 @pytest.fixture
 def backend():
-    if not _ollama_reachable():
-        pytest.skip("Ollama server is not reachable")
     from chef_human.llm import create_backend
     return create_backend()
 

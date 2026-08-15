@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import sys
+
 import pytest
+
+if sys.version_info >= (3, 14):
+    pytest.skip(
+        "RAG binary dependencies are only supported on Python 3.12 and 3.13",
+        allow_module_level=True,
+    )
 
 pytestmark = pytest.mark.rag
 np = pytest.importorskip("numpy", reason="install chef-human[rag] to test RAG")

@@ -58,7 +58,11 @@ addopts = "-m 'not integration'"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
-    "integration: tests that require a running Ollama server with a model",
+    "unit: deterministic tests that require no live model backend",
+    "integration: opt-in tests that require a live model backend",
+    "integration_ollama: integration tests that require Ollama and the configured model",
+    "integration_llamacpp: integration tests that require llama.cpp and a local GGUF model",
     "indexing: tests for the optional tree-sitter indexing stack",
     "rag: tests for the experimental NumPy/FAISS retrieval stack",
+    "ui: tests for terminal UI adapters and Textual widgets",
 ]

@@ -12,9 +12,14 @@ from chef_human.llm.backend import (
 from chef_human.llm.ollama_backend import OllamaBackend
 
 
+pytestmark = [pytest.mark.integration, pytest.mark.integration_ollama]
+
+
 def ollama_supports_embeddings() -> bool:
     try:
-        client = ollama.Client()
+        from chef_human.config import settings
+
+        client = ollama.Client(host=settings.ollama_host)
         client.embeddings(model="qwen2.5-coder:7b", prompt="test")
         return True
     except ollama.ResponseError as e:
@@ -24,7 +29,6 @@ def ollama_supports_embeddings() -> bool:
 
 
 @pytest.mark.asyncio
-@pytest.mark.integration
 async def test_ollama_basic_chat():
     backend = OllamaBackend()
     resp = await backend.complete(
@@ -38,7 +42,6 @@ async def test_ollama_basic_chat():
 
 
 @pytest.mark.asyncio
-@pytest.mark.integration
 async def test_ollama_tool_call():
     backend = OllamaBackend()
     resp = await backend.complete(
@@ -68,7 +71,6 @@ async def test_ollama_tool_call():
 
 
 @pytest.mark.asyncio
-@pytest.mark.integration
 async def test_ollama_embedding():
     if not ollama_supports_embeddings():
         pytest.skip("Ollama server does not support embeddings (start with --embeddings)")

@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from chef_human.tools.registry import Tool, ToolResult
+from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
     from chef_human.agent.workspace import WorkspaceManager

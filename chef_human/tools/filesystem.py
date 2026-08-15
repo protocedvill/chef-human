@@ -8,6 +8,7 @@ from chef_human.tools.diff import compute_diff, find_closest_match
 from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
+    from chef_human.agent.file_context import FileContextManager
     from chef_human.agent.workspace import WorkspaceManager
     from chef_human.tools.diff import DiffStore
 
@@ -25,8 +26,13 @@ class ReadTool:
         "required": ["path"],
     }
 
-    def __init__(self, workspace: WorkspaceManager) -> None:
+    def __init__(
+        self,
+        workspace: WorkspaceManager,
+        file_context: FileContextManager | None = None,
+    ) -> None:
         self._workspace = workspace
+        self._file_context = file_context
 
     async def run(self, path: str, offset: int = 1, limit: int | None = None) -> ToolResult:
         resolved = self._workspace.resolve(path)
@@ -44,6 +50,13 @@ class ReadTool:
             text = resolved.read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot read {path}: {exc}")
+
+        if self._file_context is not None:
+            # Keep the whole file prominently visible in the "## File
+            # Context" section of future prompts (not just buried as one
+            # more tool-result message in conversation history), so a small
+            # model doesn't reflexively re-read a file it already has.
+            self._file_context.remember(path, text)
 
         lines = text.splitlines(keepends=True)
         if offset < 1:
@@ -72,9 +85,15 @@ class WriteTool:
         "required": ["path", "content"],
     }
 
-    def __init__(self, workspace: WorkspaceManager, diff_store: DiffStore | None = None) -> None:
+    def __init__(
+        self,
+        workspace: WorkspaceManager,
+        diff_store: DiffStore | None = None,
+        file_context: FileContextManager | None = None,
+    ) -> None:
         self._workspace = workspace
         self._diff_store = diff_store
+        self._file_context = file_context
 
     async def run(self, path: str, content: str) -> ToolResult:
         resolved = self._workspace.resolve(path)
@@ -95,6 +114,9 @@ class WriteTool:
             resolved.write_text(content, encoding="utf-8")
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
+
+        if self._file_context is not None:
+            self._file_context.remember(path, content)
 
         lines = content.count("\n") + 1
         output_parts: list[str] = [f"Wrote {lines} lines to {path}"]
@@ -124,9 +146,15 @@ class EditTool:
         "required": ["path", "old_string", "new_string"],
     }
 
-    def __init__(self, workspace: WorkspaceManager, diff_store: DiffStore | None = None) -> None:
+    def __init__(
+        self,
+        workspace: WorkspaceManager,
+        diff_store: DiffStore | None = None,
+        file_context: FileContextManager | None = None,
+    ) -> None:
         self._workspace = workspace
         self._diff_store = diff_store
+        self._file_context = file_context
 
     async def run(
         self,
@@ -139,7 +167,23 @@ class EditTool:
         resolved = self._workspace.resolve(path)
 
         if not resolved.exists():
-            return ToolResult(success=False, error=f"File not found: {path}")
+            if old_string != "":
+                return ToolResult(success=False, error=f"File not found: {path}")
+            # old_string="" against a missing file is an unambiguous
+            # "create it" -- treat it the same way WriteTool would rather
+            # than erroring and forcing the model (or, worse, a needless
+            # ask_user round-trip) to notice and retry with `write` instead.
+            if not self._workspace.is_within_workspace(resolved):
+                return ToolResult(success=False, error=f"Outside workspace: {path}")
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                resolved.write_text(new_string, encoding="utf-8")
+            except Exception as exc:
+                return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
+            if self._file_context is not None:
+                self._file_context.remember(path, new_string)
+            lines = new_string.count("\n") + 1
+            return ToolResult(output=f"Created {path} ({lines} lines)")
 
         if not self._workspace.is_within_workspace(resolved):
             return ToolResult(success=False, error=f"Outside workspace: {path}")
@@ -148,6 +192,41 @@ class EditTool:
             old_content = resolved.read_text(encoding="utf-8")
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot read {path}: {exc}")
+
+        if old_string == "":
+            # str.replace("", new_string) doesn't mean "set the whole
+            # content" -- Python inserts new_string between *every*
+            # character (and at both ends), silently mangling the file
+            # instead of erroring. Since old_string="" already means
+            # "no anchor, just set the content" for a missing file (see
+            # above), treat it the same way here for consistency, rather
+            # than falling into that interleaving footgun.
+            new_content = new_string
+            try:
+                resolved.write_text(new_content, encoding="utf-8")
+            except Exception as exc:
+                return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
+            if self._file_context is not None:
+                self._file_context.remember(path, new_content)
+            # Deliberately phrased like WriteTool's own message ("Wrote N
+            # lines to {path}"), not "replaced the contents of an existing
+            # file" -- that wording was observed causing the step-verifier
+            # LLM to read this as evidence *against* a step like "create a
+            # new file named X" (it read "replaced" as "the file already
+            # existed, so this isn't creation"), even though the file's
+            # resulting content was already correct. The model would then
+            # alternate between `write` (read as creation, verdict:
+            # partial) and this branch (read as NOT creation, verdict:
+            # not_complete) every turn, forever, since the two tools'
+            # wording described the identical action inconsistently.
+            lines = new_content.count("\n") + 1
+            output_parts = [f"Wrote {lines} lines to {path}"]
+            diff = compute_diff(old_content, new_content, path=path)
+            if diff:
+                output_parts.append(diff)
+                if self._diff_store:
+                    self._diff_store.record(path, diff, "edit", old_content=old_content, new_content=new_content)
+            return ToolResult(output="\n".join(output_parts))
 
         matched_old = old_string
         fuzzy_note = ""
@@ -180,6 +259,9 @@ class EditTool:
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
 
+        if self._file_context is not None:
+            self._file_context.remember(path, new_content)
+
         output_parts: list[str] = []
         output_parts.append(f"Applied edit to {path} ({count} occurrence{'s' if count != 1 else ''})")
         if fuzzy_note:
@@ -189,7 +271,7 @@ class EditTool:
         if diff:
             output_parts.append(diff)
             if self._diff_store:
-                self._diff_store.record(path, diff, "edit")
+                self._diff_store.record(path, diff, "edit", old_content=old_content, new_content=new_content)
 
         return ToolResult(output="\n".join(output_parts))
 

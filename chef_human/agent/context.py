@@ -112,6 +112,16 @@ class ContextAssembler:
         self._dep_graph = dep_graph
         self._symbol_retriever = symbol_retriever
         self._rag_retriever = rag_retriever
+        # generate() re-walks the whole workspace tree and re-reads files
+        # for the symbol map -- assemble() runs once per ReAct turn (up to
+        # max_steps times per task), and the repo layout is unchanged
+        # between turns unless a file-mutating tool actually ran. Cache by
+        # budget (the only thing that varies call-to-call) and let the
+        # caller invalidate explicitly after a mutation.
+        self._repo_map_cache: dict[int, str] = {}
+
+    def invalidate_repo_map_cache(self) -> None:
+        self._repo_map_cache.clear()
 
     @property
     def conversation(self) -> ContextManager:
@@ -129,14 +139,15 @@ class ContextAssembler:
     def file_context(self) -> FileContextManager:
         return self._file_context
 
+    @property
+    def dep_graph(self) -> DependencyGraph | None:
+        return self._dep_graph
+
     def assemble(
         self,
         system_prompt: str,
-        tool_definitions: str = "",
     ) -> list[Message]:
         system_content = system_prompt
-        if tool_definitions:
-            system_content += "\n\n" + tool_definitions
 
         system_tokens = self._conversation.tokenizer.count(system_content)
         remaining = (
@@ -153,7 +164,9 @@ class ContextAssembler:
             int(remaining * 0.15),
         )
         if repo_budget > 100:
-            repo_map_text = self._repo_map.generate(max_tokens=repo_budget)
+            if repo_budget not in self._repo_map_cache:
+                self._repo_map_cache[repo_budget] = self._repo_map.generate(max_tokens=repo_budget)
+            repo_map_text = self._repo_map_cache[repo_budget]
             remaining -= self._conversation.tokenizer.count(repo_map_text)
 
         file_text = self._build_file_context()

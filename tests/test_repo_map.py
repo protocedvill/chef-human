@@ -458,24 +458,24 @@ class TestRepoSafeRead:
 
 
 class TestRepoTruncate:
-    def test_below_limit(self):
+    def test_below_limit(self, repo_map):
         text = "hello world"
-        result = RepoMap._truncate_to_tokens(text, 100)
+        result = repo_map._truncate_to_tokens(text, 100)
         assert result == text
 
-    def test_above_limit(self):
+    def test_above_limit(self, repo_map):
         text = "a" * 100
-        result = RepoMap._truncate_to_tokens(text, 10)
+        result = repo_map._truncate_to_tokens(text, 10)
         assert result.endswith("(truncated)")
         assert len(result) < len(text)
 
-    def test_at_exact_limit(self):
+    def test_at_exact_limit(self, repo_map):
         text = "a" * 40
-        result = RepoMap._truncate_to_tokens(text, 10)
+        result = repo_map._truncate_to_tokens(text, 10)
         assert result == text
 
-    def test_empty_string(self):
-        result = RepoMap._truncate_to_tokens("", 10)
+    def test_empty_string(self, repo_map):
+        result = repo_map._truncate_to_tokens("", 10)
         assert result == ""
 
 

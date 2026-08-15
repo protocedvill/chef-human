@@ -13,7 +13,11 @@ _LINT_LINE_RE = re.compile(r"^(.+?):(\d+):(\d+):\s*(\S+)\s+(.+)$")
 _HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@.*")
 
 
-def annotate_diff_with_lint(diff: str, lint_output: str) -> str:
+def annotate_diff_with_lint(
+    diff: str,
+    lint_output: str,
+    linter_name: str = "ruff",
+) -> str:
     """Overlay lint warnings on a unified diff.
 
     For each lint warning that references a line in the diff's + side,
@@ -29,7 +33,7 @@ def annotate_diff_with_lint(diff: str, lint_output: str) -> str:
             line_num = int(m.group(2))
             code = m.group(4)
             message = m.group(5)
-            lint_by_line.setdefault(line_num, []).append(f"# ruff: {code} {message}")
+            lint_by_line.setdefault(line_num, []).append(f"# {linter_name}: {code} {message}")
 
     if not lint_by_line:
         return diff

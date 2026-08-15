@@ -15,6 +15,8 @@ class Settings:
     llamacpp_model_path: str | None = None
     llamacpp_n_gpu_layers: int = 0
     llamacpp_n_threads: int | None = None
+    planner_ollama_model: str | None = None
+    planner_llamacpp_model_path: str | None = None
     max_context_tokens: int = 32768
     max_response_tokens: int = 4096
     embed_model: str = "BAAI/bge-small-en-v1.5"
@@ -33,6 +35,7 @@ class Settings:
     persist_index: bool = True
     watch_files: bool = False
     watch_interval: float = 2.0
+    tool_timeout: float = 60.0
 
 
 _ENV_PREFIX = "CHEF_"

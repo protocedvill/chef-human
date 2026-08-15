@@ -12,3 +12,7 @@ dist/
 venv/
 .env
 .chef-human/
+.claude/
+output.txt
+core
+core.*

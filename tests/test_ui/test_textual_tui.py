@@ -120,7 +120,8 @@ class TestCopyPane:
     copies the full contents of whichever log pane last had focus, rather
     than relying on Textual's built-in mouse-drag selection -- reconstructing
     RichLog's internal viewport/scroll coordinate mapping for drag-select
-    proved fragile in practice (see plan_5.2.md 5.2.8/5.2.10, both of which
+    proved fragile in practice (see docs/archive/plans/plan_5.2.md
+    5.2.8/5.2.10, both of which
     fixed real bugs in that approach but still didn't make it reliable)."""
 
     async def test_ctrl_q_quits(self, tmp_path):

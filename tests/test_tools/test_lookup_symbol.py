@@ -59,10 +59,16 @@ class TestLookupSymbolTool:
         assert "foo_func" in result.output
         assert "mod.py" in result.output
 
-    async def test_lookup_missing_name(self, lookup_tool: LookupSymbolTool):
-        result = await lookup_tool.run(name="nonexistent")
+    async def test_lookup_missing_name_with_no_similar_symbols(self, lookup_tool: LookupSymbolTool):
+        result = await lookup_tool.run(name="CompletelyUnrelatedXyz123")
         assert result.success
-        assert "No symbols found" in result.output
+        assert "implement it from scratch" in result.output.lower()
+
+    async def test_lookup_missing_name_suggests_similar_symbols(self, lookup_tool: LookupSymbolTool):
+        result = await lookup_tool.run(name="foo_funcs")
+        assert result.success
+        assert "No exact match" in result.output
+        assert "foo_func" in result.output
 
     async def test_lookup_by_prefix(self, lookup_tool: LookupSymbolTool):
         result = await lookup_tool.run(prefix="foo")

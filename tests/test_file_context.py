@@ -140,6 +140,42 @@ class TestFileContextManagerRemove:
         fcm.remove("nonexistent.txt")  # should not raise
 
 
+class TestFileContextManagerRemember:
+    def test_seeds_cache_without_reading_disk(self, tmp_path, fcm, workspace):
+        # No file exists on disk at all -- remember() must not need to read it.
+        fcm.remember("new.txt", "content the caller already has")
+        assert fcm.contains("new.txt")
+        resolved = workspace.resolve("new.txt")
+        assert fcm._files[resolved] == "content the caller already has"
+
+    def test_refreshes_stale_cached_content(self, tmp_path, fcm):
+        create_file(tmp_path, "f.txt", content="old on disk")
+        fcm.get("f.txt")  # caches "old on disk"
+        fcm.remember("f.txt", "new content, not yet written to disk")
+        # get() would return stale cached content since it doesn't re-read
+        # when already present -- remember() must override it directly.
+        assert fcm.get("f.txt") == "new content, not yet written to disk"
+
+    def test_appears_in_cached_files(self, fcm):
+        fcm.remember("a.txt", "hello")
+        names = [str(p) for p in fcm.cached_files()]
+        assert any("a.txt" in n for n in names)
+
+    def test_touches_existing_entry_to_most_recent(self, tmp_path, fcm):
+        create_file(tmp_path, "a.txt", content="a")
+        create_file(tmp_path, "b.txt", content="b")
+        fcm.get("a.txt")
+        fcm.get("b.txt")
+        fcm.remember("a.txt", "a updated")
+        # a.txt should now be the most-recently-used, not b.txt
+        assert str(fcm.cached_files()[-1]).endswith("a.txt")
+
+    def test_triggers_eviction_when_over_budget(self, tmp_path, fcm):
+        # fcm fixture: max_tokens=100 (ApproxTokenizer ~= chars/4)
+        fcm.remember("big.txt", "x" * 2000)
+        assert fcm.total_tokens() <= 100 or not fcm.contains("big.txt")
+
+
 class TestFileContextManagerClear:
     def test_empties_cache(self, tmp_path, fcm):
         create_file(tmp_path, "a.txt", content="a")

@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from chef_human.config import Settings, load_settings
-from chef_human.llm import create_backend
+from chef_human.llm import create_backend, create_planner_backend
 
 
 class TestSettings:
@@ -161,7 +161,7 @@ class TestCreateBackend:
         with patch(
             "chef_human.llm.ollama_backend.OllamaBackend"
         ) as MockOllamaBackend:
-            with patch("chef_human.llm.settings") as mock_settings:
+            with patch("chef_human.config.settings") as mock_settings:
                 mock_settings.llm_backend = "ollama"
                 mock_settings.ollama_model = "test-model"
                 mock_settings.ollama_host = "http://localhost:11434"
@@ -171,13 +171,13 @@ class TestCreateBackend:
                 )
 
     def test_raises_for_unknown_backend(self):
-        with patch("chef_human.llm.settings") as mock_settings:
+        with patch("chef_human.config.settings") as mock_settings:
             mock_settings.llm_backend = "invalid"
             with pytest.raises(ValueError, match="Unknown backend: invalid"):
                 create_backend()
 
     def test_raises_when_llamacpp_model_path_none(self):
-        with patch("chef_human.llm.settings") as mock_settings:
+        with patch("chef_human.config.settings") as mock_settings:
             mock_settings.llm_backend = "llamacpp"
             mock_settings.llamacpp_model_path = None
             with pytest.raises(
@@ -189,7 +189,7 @@ class TestCreateBackend:
         with patch(
             "chef_human.llm.llamacpp_backend.LlamaCppBackend"
         ) as MockLlamaCppBackend:
-            with patch("chef_human.llm.settings") as mock_settings:
+            with patch("chef_human.config.settings") as mock_settings:
                 mock_settings.llm_backend = "llamacpp"
                 mock_settings.llamacpp_model_path = "/models/test.gguf"
                 mock_settings.llamacpp_n_gpu_layers = 24
@@ -200,6 +200,88 @@ class TestCreateBackend:
                     n_gpu_layers=24,
                     n_threads=4,
                 )
+
+    def test_model_override_wins_over_ollama_model(self):
+        with patch(
+            "chef_human.llm.ollama_backend.OllamaBackend"
+        ) as MockOllamaBackend:
+            with patch("chef_human.config.settings") as mock_settings:
+                mock_settings.llm_backend = "ollama"
+                mock_settings.ollama_model = "big-model"
+                mock_settings.ollama_host = "http://localhost:11434"
+                _ = create_backend(model_override="small-model")
+                MockOllamaBackend.assert_called_once_with(
+                    model="small-model", host="http://localhost:11434"
+                )
+
+    def test_model_override_wins_over_llamacpp_model_path(self):
+        with patch(
+            "chef_human.llm.llamacpp_backend.LlamaCppBackend"
+        ) as MockLlamaCppBackend:
+            with patch("chef_human.config.settings") as mock_settings:
+                mock_settings.llm_backend = "llamacpp"
+                mock_settings.llamacpp_model_path = "/models/big.gguf"
+                mock_settings.llamacpp_n_gpu_layers = 24
+                mock_settings.llamacpp_n_threads = 4
+                _ = create_backend(model_override="/models/small.gguf")
+                MockLlamaCppBackend.assert_called_once_with(
+                    model_path="/models/small.gguf",
+                    n_gpu_layers=24,
+                    n_threads=4,
+                )
+
+
+class TestCreatePlannerBackend:
+    def test_unconfigured_reuses_main_backend(self):
+        with patch("chef_human.config.settings") as mock_settings:
+            mock_settings.llm_backend = "ollama"
+            mock_settings.planner_ollama_model = None
+            main_backend = object()
+            assert create_planner_backend(main_backend) is main_backend
+
+    def test_configured_ollama_builds_dedicated_backend(self):
+        with patch(
+            "chef_human.llm.ollama_backend.OllamaBackend"
+        ) as MockOllamaBackend:
+            with patch("chef_human.config.settings") as mock_settings:
+                mock_settings.llm_backend = "ollama"
+                mock_settings.planner_ollama_model = "small-model"
+                mock_settings.ollama_model = "big-model"
+                mock_settings.ollama_host = "http://localhost:11434"
+                main_backend = object()
+                result = create_planner_backend(main_backend)
+                assert result is not main_backend
+                MockOllamaBackend.assert_called_once_with(
+                    model="small-model", host="http://localhost:11434"
+                )
+
+    def test_configured_llamacpp_builds_dedicated_backend(self):
+        with patch(
+            "chef_human.llm.llamacpp_backend.LlamaCppBackend"
+        ) as MockLlamaCppBackend:
+            with patch("chef_human.config.settings") as mock_settings:
+                mock_settings.llm_backend = "llamacpp"
+                mock_settings.planner_ollama_model = None
+                mock_settings.planner_llamacpp_model_path = "/models/small.gguf"
+                mock_settings.llamacpp_model_path = "/models/big.gguf"
+                mock_settings.llamacpp_n_gpu_layers = 24
+                mock_settings.llamacpp_n_threads = 4
+                main_backend = object()
+                result = create_planner_backend(main_backend)
+                assert result is not main_backend
+                MockLlamaCppBackend.assert_called_once_with(
+                    model_path="/models/small.gguf",
+                    n_gpu_layers=24,
+                    n_threads=4,
+                )
+
+    def test_unconfigured_llamacpp_reuses_main_backend(self):
+        with patch("chef_human.config.settings") as mock_settings:
+            mock_settings.llm_backend = "llamacpp"
+            mock_settings.planner_ollama_model = None
+            mock_settings.planner_llamacpp_model_path = None
+            main_backend = object()
+            assert create_planner_backend(main_backend) is main_backend
 
 
 class TestProjectConfig:

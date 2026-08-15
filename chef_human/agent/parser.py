@@ -30,7 +30,10 @@ def parse_tool_calls(content: str) -> list[ParsedToolCall]:
         try:
             data = json.loads(raw)
             parsed = _parse_single_call(data, raw)
-            if parsed:
+            if parsed and not any(
+                p.name == parsed.name and p.arguments == parsed.arguments
+                for p in calls
+            ):
                 calls.append(parsed)
         except json.JSONDecodeError:
             logger.warning("Failed to parse <tool_call> JSON: %s", raw[:100])
@@ -185,9 +188,46 @@ def extract_scratchpad(content: str) -> str | None:
     return matches[-1].group(1).strip()
 
 
+def extract_scratchpad_entries(content: str) -> list[str]:
+    """Extract every scratchpad update from a single model response, in order.
+
+    Unlike `extract_scratchpad` (which keeps only the last match), this
+    returns all of them so the caller can accumulate them into persistent,
+    structured working memory instead of overwriting previous notes.
+    """
+    return [m.group(1).strip() for m in _SCRATCH_PATTERN.finditer(content)]
+
+
 def strip_scratchpad(content: str) -> str:
     """Remove ## Scratchpad: lines from content."""
     return _SCRATCH_PATTERN.sub("", content).strip()
+
+
+def looks_like_tool_call(content: str) -> bool:
+    """Check if content appears to attempt a tool call, even if unparseable."""
+    if "<tool_call" in content:
+        return True
+    if re.search(r'"name"\s*:', content) and re.search(r'"arguments"\s*:', content):
+        return True
+    if re.search(r'```(?:json)?\s*\n?\s*\{', content):
+        return True
+    return False
+
+
+def format_parse_error(content: str, detail: str = "") -> str:
+    """Produce a human-readable parse error message for the LLM."""
+    snippet = content.strip()[:200]
+    msg = "Error: Failed to parse tool call from your output.\n"
+    if detail:
+        msg += f"Reason: {detail}\n"
+    msg += f"Your output was:\n{snippet}"
+    if len(content) > 200:
+        msg += "..."
+    msg += (
+        "\n\nFix the format and try again. "
+        "Use <tool_call>{{\"name\": \"tool_name\", \"arguments\": {{...}}}}</tool_call>."
+    )
+    return msg
 
 
 def strip_tool_calls(content: str) -> str:

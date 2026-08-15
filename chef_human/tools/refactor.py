@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -9,6 +10,7 @@ from chef_human.tools.diff import compute_diff
 from chef_human.tools.registry import ToolResult
 
 if TYPE_CHECKING:
+    from chef_human.agent.symbols.dependencies import DependencyGraph
     from chef_human.agent.symbols.index import SymbolIndex
     from chef_human.agent.workspace import WorkspaceManager
     from chef_human.tools.diff import DiffStore
@@ -57,10 +59,12 @@ class RefactorTool:
         workspace: WorkspaceManager,
         symbol_index: SymbolIndex,
         diff_store: DiffStore | None = None,
+        dep_graph: DependencyGraph | None = None,
     ) -> None:
         self._workspace = workspace
         self._index = symbol_index
         self._diff_store = diff_store
+        self._dep_graph = dep_graph
 
     async def run(
         self,
@@ -117,6 +121,19 @@ class RefactorTool:
                     files_to_rename.append(self._workspace.resolve(fp))
 
             if scope == "all":
+                # Add dependent files via dependency graph
+                if self._dep_graph is not None:
+                    for entry in entries:
+                        try:
+                            deps = self._dep_graph.dependents(Path(entry.file_path))
+                            for d in deps:
+                                ds = str(d)
+                                if ds not in seen:
+                                    seen.add(ds)
+                                    files_to_rename.append(d)
+                        except Exception:
+                            continue
+
                 # Add textual references via grep
                 grep_files = self._find_textual_refs(old_name)
                 for f in grep_files:
@@ -167,14 +184,6 @@ class RefactorTool:
                     )
 
                 diff = compute_diff(content, new_content, path=str(file_path))
-                if self._diff_store and diff:
-                    self._diff_store.record(
-                        str(file_path),
-                        diff,
-                        "refactor_symbol",
-                        old_content=content,
-                        new_content=new_content,
-                    )
                 results.append({
                     "path": str(file_path),
                     "count": count,
@@ -188,7 +197,23 @@ class RefactorTool:
                 output=f"No occurrences of '{old_name}' found in the selected files."
             )
 
-        # Phase 3: Build output
+        # Phase 3: Record batch undo entry
+        if not dry_run and self._diff_store:
+            pending = [r for r in results if r.get("diff")]
+            if pending:
+                batch_path = f"batch:refactor_symbol:{old_name}→{new_name}"
+                old_contents = {r["path"]: r["old_content"] for r in pending}
+                new_contents = {r["path"]: r["new_content"] for r in pending}
+                combined_diff = "\n\n".join(r["diff"] for r in pending if r.get("diff"))
+                self._diff_store.record(
+                    batch_path,
+                    combined_diff,
+                    "refactor_symbol",
+                    old_content=json.dumps(old_contents),
+                    new_content=json.dumps(new_contents),
+                )
+
+        # Phase 4: Build output
         if dry_run:
             return self._format_dry_run(old_name, new_name, results)
         return self._format_applied(old_name, new_name, results)

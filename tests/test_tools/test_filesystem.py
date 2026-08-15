@@ -181,6 +181,42 @@ class TestEditTool:
         assert not result.success
         assert "not found" in result.error
 
+    async def test_missing_file_empty_old_string_creates_it(self, edit_tool, tmp_path):
+        result = await edit_tool.run(path="new.txt", old_string="", new_string="hello")
+        assert result.success
+        assert (tmp_path / "new.txt").read_text() == "hello"
+
+    async def test_existing_file_empty_old_string_replaces_whole_content(self, edit_tool, tmp_path):
+        # str.replace("", x) inserts x between every character instead of
+        # setting the whole content -- old_string="" must not fall into
+        # that footgun for a file that already exists.
+        f = tmp_path / "existing.txt"
+        f.write_text("original content")
+        result = await edit_tool.run(
+            path="existing.txt", old_string="", new_string="brand new content", replace_all=True
+        )
+        assert result.success
+        assert f.read_text() == "brand new content"
+
+    async def test_existing_file_empty_old_string_message_matches_write_wording(
+        self, edit_tool, tmp_path
+    ):
+        # Regression test: this branch's message used to say "Replaced
+        # entire contents of {path}", which a step-verifier LLM read as
+        # evidence the file wasn't newly *created* (only that an existing
+        # file's contents were replaced) -- causing perpetual
+        # partial/not_complete oscillation for a step like "create a new
+        # file named X" depending on whether the model happened to call
+        # `write` or `edit` that turn. The message must read the same way
+        # WriteTool's does, since the two are functionally equivalent here.
+        (tmp_path / "existing.txt").write_text("original content")
+        result = await edit_tool.run(
+            path="existing.txt", old_string="", new_string="line one\nline two"
+        )
+        assert result.success
+        assert "replaced" not in result.output.lower()
+        assert result.output.startswith("Wrote 2 lines to existing.txt")
+
     async def test_outside_workspace(self, edit_tool):
         result = await edit_tool.run(path="/etc/hosts", old_string="a", new_string="b")
         assert not result.success
@@ -216,6 +252,99 @@ class TestEditTool:
         result = await edit_tool.run(path="f.txt", old_string="xyz", new_string="def", fuzzy=False)
         assert not result.success
         assert "not found" in result.error
+
+
+# ---------------------------------------------------------------------------
+# FileContextManager integration -- read/write/edit should keep the file
+# prominently visible in the "## File Context" prompt section (not just
+# buried in conversation history), instead of relying on the model to
+# recall it and avoiding redundant re-reads.
+# ---------------------------------------------------------------------------
+
+class TestFileContextIntegration:
+    async def test_read_populates_file_context(self, workspace, tmp_path):
+        from chef_human.agent.file_context import FileContextManager
+        from chef_human.llm.tokenizer import ApproxTokenizer
+
+        fcm = FileContextManager(workspace=workspace, tokenizer=ApproxTokenizer())
+        tool = ReadTool(workspace, file_context=fcm)
+        create_file(tmp_path, "plan.md", "# Plan\nfull content here")
+
+        await tool.run(path="plan.md")
+
+        assert fcm.contains("plan.md")
+        assert fcm.get("plan.md") == "# Plan\nfull content here"
+
+    async def test_read_caches_full_content_even_with_offset_limit(self, workspace, tmp_path):
+        """A partial read (offset/limit) should still seed the cache with
+        the WHOLE file, not just the requested slice -- so a later turn
+        working on a different part of the file doesn't need to re-read."""
+        from chef_human.agent.file_context import FileContextManager
+        from chef_human.llm.tokenizer import ApproxTokenizer
+
+        fcm = FileContextManager(workspace=workspace, tokenizer=ApproxTokenizer())
+        tool = ReadTool(workspace, file_context=fcm)
+        create_file(tmp_path, "f.txt", "a\nb\nc\nd\ne\n")
+
+        await tool.run(path="f.txt", offset=2, limit=2)
+
+        assert fcm.get("f.txt") == "a\nb\nc\nd\ne\n"
+
+    async def test_read_without_file_context_does_not_error(self, tmp_path):
+        tool = ReadTool(WorkspaceManager(root=tmp_path))
+        create_file(tmp_path, "f.txt", "hello")
+        result = await tool.run(path="f.txt")
+        assert result.success
+
+    async def test_write_populates_file_context(self, workspace, tmp_path):
+        from chef_human.agent.file_context import FileContextManager
+        from chef_human.llm.tokenizer import ApproxTokenizer
+
+        fcm = FileContextManager(workspace=workspace, tokenizer=ApproxTokenizer())
+        tool = WriteTool(workspace, file_context=fcm)
+
+        await tool.run(path="new.py", content="x = 1")
+
+        assert fcm.get("new.py") == "x = 1"
+
+    async def test_write_refreshes_stale_file_context(self, workspace, tmp_path):
+        from chef_human.agent.file_context import FileContextManager
+        from chef_human.llm.tokenizer import ApproxTokenizer
+
+        fcm = FileContextManager(workspace=workspace, tokenizer=ApproxTokenizer())
+        read_tool = ReadTool(workspace, file_context=fcm)
+        write_tool = WriteTool(workspace, file_context=fcm)
+        create_file(tmp_path, "f.txt", "original")
+
+        await read_tool.run(path="f.txt")  # caches "original"
+        await write_tool.run(path="f.txt", content="overwritten")
+
+        assert fcm.get("f.txt") == "overwritten"
+
+    async def test_edit_populates_file_context_with_new_content(self, workspace, tmp_path):
+        from chef_human.agent.file_context import FileContextManager
+        from chef_human.llm.tokenizer import ApproxTokenizer
+
+        fcm = FileContextManager(workspace=workspace, tokenizer=ApproxTokenizer())
+        tool = EditTool(workspace, file_context=fcm)
+        create_file(tmp_path, "f.txt", "hello world")
+
+        await tool.run(path="f.txt", old_string="world", new_string="there")
+
+        assert fcm.get("f.txt") == "hello there"
+
+    async def test_edit_does_not_populate_file_context_on_failure(self, workspace, tmp_path):
+        from chef_human.agent.file_context import FileContextManager
+        from chef_human.llm.tokenizer import ApproxTokenizer
+
+        fcm = FileContextManager(workspace=workspace, tokenizer=ApproxTokenizer())
+        tool = EditTool(workspace, file_context=fcm)
+        create_file(tmp_path, "f.txt", "hello world")
+
+        result = await tool.run(path="f.txt", old_string="zzz", new_string="xxx", fuzzy=False)
+
+        assert not result.success
+        assert not fcm.contains("f.txt")
 
 
 # ---------------------------------------------------------------------------

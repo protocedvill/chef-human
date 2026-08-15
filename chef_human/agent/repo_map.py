@@ -141,10 +141,23 @@ class RepoMap:
         except Exception:
             return None
 
-    @staticmethod
-    def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-        chars_per_token = 4
-        max_chars = max_tokens * chars_per_token
-        if len(text) <= max_chars:
+    def _truncate_to_tokens(self, text: str, max_tokens: int) -> str:
+        # Binary-search the longest prefix whose *real* token count (via
+        # the same tokenizer used for the budget check in generate())
+        # fits max_tokens, instead of assuming a fixed chars-per-token
+        # ratio -- a hardcoded ratio can under- or over-truncate relative
+        # to the actual tokenizer, silently blowing the context budget
+        # this truncation exists to enforce.
+        if max_tokens <= 0:
+            return ""
+        suffix = "\n... (truncated)"
+        if self._tokenizer.count(text) <= max_tokens:
             return text
-        return text[:max_chars] + "\n... (truncated)"
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._tokenizer.count(text[:mid] + suffix) <= max_tokens:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo] + suffix

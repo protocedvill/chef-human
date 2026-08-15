@@ -183,6 +183,20 @@ class TestListFiles:
         assert len(files) == 1
         assert files[0].name == "a.py"
 
+    def test_ignores_own_session_cache_dir(self, tmp_path: Path):
+        """chef-human's own persisted state (symbol index, RAG store,
+        saved sessions) lives under .chef-human/ by default -- ls/ls_tree/
+        grep/glob/repo-map/SymbolIndex all route through list_files(), so
+        it must not be treated as part of the codebase being explored."""
+        (tmp_path / "a.py").touch()
+        (tmp_path / ".chef-human/sessions").mkdir(parents=True)
+        (tmp_path / ".chef-human/index.json").touch()
+        (tmp_path / ".chef-human/sessions/session_abc123.json").touch()
+        wm = WorkspaceManager(root=tmp_path)
+        files = wm.list_files()
+        assert len(files) == 1
+        assert files[0].name == "a.py"
+
     def test_respects_max_depth(self, tmp_path: Path):
         (tmp_path / "a/b/c/d/e/f.txt").parent.mkdir(parents=True)
         (tmp_path / "a/b/c/d/e/f.txt").touch()

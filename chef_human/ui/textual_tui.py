@@ -347,7 +347,8 @@ class ChefHumanTUI(App):
 
     # Mouse-drag selection inside a scrolled RichLog requires reconstructing
     # Textual's internal viewport/selection coordinate mapping, which proved
-    # fragile in practice (see plan_5.2.md 5.2.8/5.2.10). Instead, ctrl+c
+    # fragile in practice (see docs/archive/plans/plan_5.2.md 5.2.8/5.2.10).
+    # Instead, ctrl+c
     # copies the *entire* content of whichever log pane last had focus
     # (click a pane to focus it) to the system clipboard -- no drag needed,
     # and it can't desync from scroll position since it copies everything.

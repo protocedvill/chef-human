@@ -17,6 +17,15 @@ IGNORE_PATTERNS: set[str] = {
     "*.pyc",
     "*.pyo",
     ".DS_Store",
+    # chef-human's own persisted state (symbol index, RAG store, saved
+    # sessions -- see DEFAULT_SAVE_DIR in agent/persistence.py and
+    # Settings.rag_index_dir) lives under this directory by default. Every
+    # exploration/indexing path (ls, ls_tree, grep, glob, repo map,
+    # SymbolIndex, RAG file discovery) routes through is_ignored()/
+    # list_files() below, so excluding it here keeps the agent from
+    # treating its own session cache and index as part of the codebase
+    # it's exploring.
+    ".chef-human",
 }
 
 

@@ -84,25 +84,16 @@ Detailed specifications:
 - [Phase 2 — Product and UX spine](02-product-ux-spine.md)
 - [Phase 3/4 — Portfolio release and optional enhancements](03-portfolio-release.md)
 
-## Guided decisions for the owner
+## Owner decisions
 
-These are intentionally few; most implementation choices can proceed without further product input.
+The owner selected the following scope on 2026-08-16:
 
-1. Is the newer `federate-safeBackup` family the work you want recovered as the canonical Phase 5.2
-   version, or are any of those files known to be unwanted? Recommendation: treat the newest coherent
-   family as the recovery candidate, but merge it in a temporary branch/file-by-file rather than
-   blindly replacing all files.
-2. Which interface should be the hero experience: the Textual TUI or the simpler streaming CLI?
-   Recommendation: showcase the TUI in media, but make the streaming CLI the dependable fallback and
-   automation surface.
-3. Is Linux-only acceptable for the portfolio release? Recommendation: officially test Linux first,
-   describe macOS as best-effort, and avoid promising Windows until CI proves it.
-4. Should llama.cpp and large-repository RAG be part of the promised release or explicitly
-   experimental? Recommendation: Ollama is the supported path; llama.cpp, RAG, and semantic refactors
-   are opt-in experimental capabilities.
-5. Do you want to publish the existing development-history plan files? Recommendation: retain one
-   concise roadmap and move the verbose historical plans to an `docs/archive/` area or omit them from
-   the public branch.
+1. Recover the newest coherent backup generation as the canonical implementation.
+2. Use the Textual TUI as the visual showcase and the streaming CLI as the reliability fallback.
+3. Support Linux first.
+4. Label llama.cpp, RAG, and semantic refactoring experimental while retaining explicit stretch plans.
+5. Move verbose historical plans out of the repository root and treat them as archive/reference
+   material rather than the current product roadmap.
 
 ## Definition of “recruiter-ready prototype”
 
@@ -111,4 +102,3 @@ supported machine they can follow one install path, run `chef-human doctor`, sta
 task, approve or reject a change, inspect its diff, and undo it. CI is green, the repository is clean,
 all screenshots match the current UI, and limitations are easy to find. No claim suggests production
 sandboxing, guaranteed autonomous correctness, or support for every model and platform.
-

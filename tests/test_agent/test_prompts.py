@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from chef_human.agent.planner import Plan, PlanStep
+from chef_human.agent.planner import Plan, PlanStep, StepStatus
 from chef_human.agent.prompts import (
     AGENT_FINISH_PROMPT,
     AGENT_SYSTEM_PROMPT,
@@ -109,3 +109,34 @@ class TestBuildAgentPrompt:
     def test_scratchpad_placeholder_present_in_constant(self):
         assert "{scratchpad}" in AGENT_SYSTEM_PROMPT
         assert "## Notes / Scratchpad" in AGENT_SYSTEM_PROMPT
+
+    def test_current_step_placeholder_present_in_constant(self):
+        assert "{current_step}" in AGENT_SYSTEM_PROMPT
+        assert "## Current Step" in AGENT_SYSTEM_PROMPT
+
+    def test_current_step_shows_first_pending_step(self):
+        plan = Plan(goal="Test", steps=[
+            PlanStep(index=1, description="Already done", status=StepStatus.completed),
+            PlanStep(index=2, description="Work on this now", status=StepStatus.pending),
+            PlanStep(index=3, description="Later step", status=StepStatus.pending),
+        ])
+        tool_defs: list[ToolDefinition] = []
+        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+
+        current_section = prompt.split("## Current Step")[1].split("## Project Structure")[0]
+        assert "Work on this now" in current_section
+        assert "Later step" not in current_section
+
+    def test_current_step_none_when_all_complete(self):
+        plan = Plan(goal="Test", steps=[
+            PlanStep(index=1, description="Done", status=StepStatus.completed),
+        ])
+        tool_defs: list[ToolDefinition] = []
+        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        assert "All steps are complete" in prompt
+
+    def test_current_step_empty_plan(self):
+        plan = Plan(goal="Test", steps=[])
+        tool_defs: list[ToolDefinition] = []
+        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        assert "All steps are complete" in prompt

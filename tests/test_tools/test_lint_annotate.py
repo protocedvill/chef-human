@@ -78,3 +78,10 @@ class TestAnnotateDiffWithLint:
         result = annotate_diff_with_lint(diff, lint)
         assert "ruff: F401" in result
         assert "complicated.name.with.dots" in result
+
+    def test_custom_linter_name(self):
+        diff = "@@ -0,0 +1 @@\n+code\n"
+        lint = "foo.py:1:5: F401 unused import"
+        result = annotate_diff_with_lint(diff, lint, linter_name="pylint")
+        assert "pylint: F401" in result
+        assert "# pylint:" in result

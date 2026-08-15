@@ -9,6 +9,7 @@ dependencies = [
     "pydantic-settings>=2.0",
     "rich>=13.0",
     "click>=8.0",
+    "textual>=0.60",
     "tomli>=2.0; python_version < '3.11'",
 ]
 
@@ -40,7 +41,7 @@ dev = [
 ]
 
 [project.scripts]
-chef-human = "chef_human.main:cli"
+chef-human = "chef_human.main:main"
 
 [tool.ruff]
 line-length = 100

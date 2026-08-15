@@ -9,7 +9,7 @@ from chef_human.agent.planner import Plan, PlanStep, Planner, StepStatus
 from chef_human.agent.repo_map import RepoMap
 from chef_human.agent.symbols.extractor import CompositeExtractor
 from chef_human.agent.workspace import WorkspaceManager
-from chef_human.config import settings
+from chef_human import config
 from chef_human.llm.tokenizer import Tokenizer, create_tokenizer
 
 if TYPE_CHECKING:
@@ -31,6 +31,7 @@ def _build_rag_context_assembler(
     from chef_human.agent.symbols.index import SymbolIndex
     from chef_human.llm.embeddings import EmbeddingsBackend
 
+    settings = config.settings
     embedder = EmbeddingsBackend(settings.embed_model)
     chunker = CodeChunker(
         tokenizer=tokenizer,
@@ -57,6 +58,7 @@ def _build_rag_context_assembler(
         file_context=file_ctx,
         repo_map=repo_map,
         rag_retriever=rag_retriever,
+        symbol_index=symbol_index,
     )
 
 
@@ -72,6 +74,7 @@ def _build_symbol_context_assembler(
     from chef_human.agent.symbols.index import SymbolIndex
     from chef_human.agent.symbols.retriever import SymbolRetriever
 
+    settings = config.settings
     extractor = CompositeExtractor()
     symbol_index = SymbolIndex(workspace=workspace, extractor=extractor)
     dep_graph = DependencyGraph(symbol_index)
@@ -131,14 +134,15 @@ def create_context_assembler(
     workspace_root: str | None = None,
     index_on_init: bool = True,
 ) -> ContextAssembler:
+    settings = config.settings
     tokenizer = create_tokenizer(settings.ollama_model)
     root = workspace_root or settings.workspace or None
     workspace = WorkspaceManager(root=root)
-    config = ContextConfig(
+    context_config = ContextConfig(
         max_tokens=settings.max_context_tokens,
         max_response_tokens=settings.max_response_tokens,
     )
-    conversation = ContextManager(config=config, tokenizer=tokenizer)
+    conversation = ContextManager(config=context_config, tokenizer=tokenizer)
     file_ctx = FileContextManager(
         workspace=workspace,
         tokenizer=tokenizer,
@@ -165,35 +169,37 @@ def create_context_assembler(
 
 
 def create_agent(
-    debug_tui: bool = False,
     max_steps: int = 25,
     workspace_root: str | None = None,
 ) -> tuple[ReActLoop, ContextAssembler]:
     from chef_human.agent.planner import Planner
     from chef_human.agent.react_loop import ReActConfig, ReActLoop
-    from chef_human.llm import create_backend
+    from chef_human.llm import create_backend, create_planner_backend
     from chef_human.tools import create_tool_registry
-    from chef_human.ui.debug_tui import DebugTUI
     from chef_human.ui.protocol import NoopUI
 
+    settings = config.settings
     backend = create_backend()
     context = create_context_assembler(workspace_root=workspace_root)
     tool_registry = create_tool_registry(
         workspace=context.workspace,
         symbol_index=context.symbol_index,
         file_context=context.file_context,
+        dep_graph=context.dep_graph,
     )
-    planner = Planner(llm_backend=backend)
-    config = ReActConfig(max_steps=max_steps)
-    ui = DebugTUI() if debug_tui else NoopUI()
+    planner = Planner(llm_backend=create_planner_backend(backend))
+    react_config = ReActConfig(
+        max_steps=max_steps,
+        tool_timeout=settings.tool_timeout,
+    )
 
     loop = ReActLoop(
         llm_backend=backend,
         tool_registry=tool_registry,
         context_assembler=context,
         planner=planner,
-        config=config,
-        ui=ui,
+        config=react_config,
+        ui=NoopUI(),
     )
     return loop, context
 

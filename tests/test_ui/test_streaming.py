@@ -6,7 +6,6 @@ import pytest
 
 from chef_human.agent.parser import ParsedToolCall
 from chef_human.agent.planner import Plan, PlanStep, StepStatus
-from chef_human.ui.protocol import NoopUI
 
 
 @pytest.fixture

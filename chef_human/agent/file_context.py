@@ -52,6 +52,20 @@ class FileContextManager:
         lines = content.splitlines(keepends=True)
         return lines[start - 1 : end]
 
+    def remember(self, path: str | Path, content: str) -> None:
+        """Directly seed/refresh the cache with content the caller already
+        has in hand (e.g. a tool that just read, wrote, or edited the
+        file), instead of `get()`'s lazy-read-if-absent behavior. This
+        avoids both a redundant disk read and returning stale content when
+        a write/edit changes a file that was already cached."""
+        resolved = self._workspace.resolve(path)
+        if resolved in self._files:
+            self._touch(resolved)
+        else:
+            self._access_order.append(resolved)
+        self._files[resolved] = content
+        self._evict_if_needed(resolved)
+
     def remove(self, path: str | Path) -> None:
         resolved = self._workspace.resolve(path)
         self._files.pop(resolved, None)

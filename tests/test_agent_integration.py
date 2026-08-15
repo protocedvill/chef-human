@@ -31,8 +31,8 @@ class TestCreateContextAssembler:
 
     def test_accepts_tool_definitions(self):
         ca = create_context_assembler()
-        result = ca.assemble(system_prompt="Be helpful.", tool_definitions="**tools**")
-        assert "**tools**" in result[0].content
+        result = ca.assemble(system_prompt="Be helpful.")
+        assert "Be helpful." in result[0].content
 
 
 # ---------------------------------------------------------------------------

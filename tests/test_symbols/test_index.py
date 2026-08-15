@@ -178,6 +178,27 @@ def area(x):
     def test_search_unknown(self, index):
         assert index.search("NoMatchAtAll") == []
 
+    def test_find_similar_close_name_typo(self, index):
+        results = index.find_similar("Circl")
+        names = {e.symbol.name for e in results}
+        assert "Circle" in names
+
+    def test_find_similar_naming_variant(self, index):
+        results = index.find_similar("Squares")
+        names = {e.symbol.name for e in results}
+        assert "Square" in names
+
+    def test_find_similar_no_match(self, index):
+        assert index.find_similar("CompletelyUnrelatedXyz123") == []
+
+    def test_find_similar_matches_identical_name(self, index):
+        # find_similar is meant for the miss path, but an exact name is
+        # trivially its own closest match — callers only reach this method
+        # after lookup() already returned nothing for the literal name.
+        results = index.find_similar("Circle")
+        names = {e.symbol.name for e in results}
+        assert "Circle" in names
+
 
 class TestSymbolIndexRefresh:
     def test_refresh_before_build_calls_build(self, workspace, extractor, index):

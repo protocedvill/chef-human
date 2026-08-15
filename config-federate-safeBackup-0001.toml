@@ -1,7 +1,0 @@
-[chef_human]
-llm_backend = "ollama"
-ollama_model = "deepseek-coder:33b"
-planner_ollama_model = "qwen2.5-coder:1.5b"
-ollama_host = "http://localhost:11434"
-max_context_tokens = 32768
-temperature = 0.0

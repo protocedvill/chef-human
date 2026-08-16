@@ -2080,6 +2080,163 @@ class TestAskUserVagueQuestionGuard:
 
 
 class TestPrematureFinishGuard:
+    @pytest.mark.asyncio
+    async def test_finish_is_rechecked_after_bundled_work_completes_plan(self, tmp_path):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=(
+                    '<tool_call>{"name": "write", "arguments": '
+                    '{"path": "hello.py", "content": "print(1)"}}</tool_call>\n'
+                    '<tool_call>{"name": "finish", "arguments": '
+                    '{"summary": "Done!"}}</tool_call>'
+                ),
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(
+            goal="g",
+            steps=[PlanStep(index=1, description="Create hello.py")],
+        )
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(side_effect=lambda path: tmp_path / path)
+        registry = _make_mock_tool_registry()
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        }
+
+        async def do_write(path: str, content: str):
+            (tmp_path / path).write_text(content)
+            return MagicMock(output=f"Wrote {path}", success=True, error=None)
+
+        write_tool.run = AsyncMock(side_effect=do_write)
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {
+            "write": write_tool,
+            "finish": finish_tool,
+        }.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, lint_after_write=False),
+        )
+        result = await loop.run("do something")
+
+        assert result.success is True
+        assert plan.is_complete()
+        write_tool.run.assert_awaited_once()
+        finish_tool.run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_bundled_work_advances_step_before_finish_remains_blocked(self, tmp_path):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=(
+                    '<tool_call>{"name": "write", "arguments": '
+                    '{"path": "hello.py", "content": "print(1)"}}</tool_call>\n'
+                    '<tool_call>{"name": "bash", "arguments": '
+                    '{"command": "python hello.py"}}</tool_call>\n'
+                    '<tool_call>{"name": "finish", "arguments": '
+                    '{"summary": "Done!"}}</tool_call>'
+                ),
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(
+            goal="g",
+            steps=[
+                PlanStep(index=1, description="Create hello.py"),
+                PlanStep(index=2, description="Run hello.py and verify its output"),
+            ],
+        )
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(side_effect=lambda path: tmp_path / path)
+        registry = _make_mock_tool_registry()
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        }
+
+        async def do_write(path: str, content: str):
+            (tmp_path / path).write_text(content)
+            return MagicMock(output=f"Wrote {path}", success=True, error=None)
+
+        write_tool.run = AsyncMock(side_effect=do_write)
+        bash_tool = MagicMock()
+        bash_tool.name = "bash"
+        bash_tool.parameters = {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        }
+        bash_tool.run = AsyncMock(
+            return_value=MagicMock(output="Hello, world!", success=True, error=None)
+        )
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {
+            "write": write_tool,
+            "bash": bash_tool,
+            "finish": finish_tool,
+        }.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, lint_after_write=False),
+        )
+        result = await loop.run("do something")
+
+        assert result.success is False
+        assert plan.steps[0].status == StepStatus.completed
+        assert plan.steps[1].status == StepStatus.pending
+        bash_tool.run.assert_awaited_once()
+        finish_tool.run.assert_not_awaited()
+        tool_messages = [
+            call.args[0].content
+            for call in context.conversation.add_message.call_args_list
+            if call.args[0].role == Role.tool
+        ]
+        assert any("Run hello.py" in message for message in tool_messages)
+
     @pytest.mark.parametrize(
         "unresolved_status",
         [StepStatus.pending, StepStatus.failed, StepStatus.skipped],

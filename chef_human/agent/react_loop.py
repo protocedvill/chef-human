@@ -486,6 +486,7 @@ class ReActLoop:
                 # steps instead of relying on a tool's success-message wording.
                 files_written_this_turn: dict[str, bool] = {}
                 finish_call: tuple[ParsedToolCall, Tool] | None = None
+                deferred_finish_call: tuple[ParsedToolCall, Tool] | None = None
                 parallel_candidates: list[tuple[ParsedToolCall, Tool]] = []
 
                 for tc in tool_calls:
@@ -512,25 +513,6 @@ class ReActLoop:
                         continue
 
                     if tc.name == "finish":
-                        if self._config.require_plan_complete_to_finish:
-                            unresolved = plan.unresolved_steps()
-                            if unresolved:
-                                current = unresolved[0]
-                                logger.info(
-                                    "Blocked premature finish: unfinished step %r remains",
-                                    current.description,
-                                )
-                                result = self._make_tool_error(
-                                    "You cannot finish yet -- there's an unfinished plan step: "
-                                    f"'{current.description}'. Complete it (and any remaining "
-                                    "steps) before calling finish. A tool result claiming work "
-                                    "is done is not evidence -- you must actually perform the "
-                                    "step (e.g. write/edit the relevant files)."
-                                )
-                                self._ui.on_tool_result(tc.name, result)
-                                tool_results.append(result)
-                                failed_calls += 1
-                                continue
                         flagged = _looks_like_self_reported_vulnerability(
                             str(tc.arguments.get("summary", ""))
                         )
@@ -622,6 +604,37 @@ class ReActLoop:
                                 continue
 
                     parallel_candidates.append((tc, tool))
+
+                if (
+                    finish_call is not None
+                    and self._config.require_plan_complete_to_finish
+                    and plan.unresolved_steps()
+                ):
+                    if parallel_candidates:
+                        # A model may bundle substantive work and finish in
+                        # one response. Run and verify the work before judging
+                        # the terminal request; rejecting finish now would make
+                        # the whole turn a partial failure and skip verification.
+                        deferred_finish_call = finish_call
+                        finish_call = None
+                        logger.debug(
+                            "Deferring finish until %d substantive tool call(s) "
+                            "have run and the current step has been verified",
+                            len(parallel_candidates),
+                        )
+                    else:
+                        current = plan.unresolved_steps()[0]
+                        logger.info(
+                            "Blocked premature finish: unfinished step %r remains",
+                            current.description,
+                        )
+                        result = self._make_tool_error(
+                            self._unfinished_plan_message(current.description)
+                        )
+                        self._ui.on_tool_result("finish", result)
+                        tool_results.append(result)
+                        failed_calls += 1
+                        finish_call = None
 
                 if parallel_candidates:
                     # Capture original file content for write/edit/patch tools --
@@ -873,6 +886,62 @@ class ReActLoop:
                     else:
                         verify_failure_history.clear()
 
+                if deferred_finish_call is not None:
+                    unresolved = plan.unresolved_steps()
+                    if unresolved:
+                        current = unresolved[0]
+                        logger.info(
+                            "Deferred finish remains premature: unfinished step %r remains",
+                            current.description,
+                        )
+                        result = self._make_tool_error(
+                            self._unfinished_plan_message(current.description)
+                        )
+                        self._ui.on_tool_result("finish", result)
+                        self._context.conversation.add_message(
+                            Message(role=Role.tool, content=result)
+                        )
+                    else:
+                        tc, tool = deferred_finish_call
+                        try:
+                            finish_result = await asyncio.wait_for(
+                                tool.run(**tc.arguments),
+                                timeout=self._config.tool_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            result = self._make_tool_error(
+                                f"Tool '{tc.name}' timed out after "
+                                f"{self._config.tool_timeout}s"
+                            )
+                            self._ui.on_tool_result(tc.name, result)
+                            self._context.conversation.add_message(
+                                Message(role=Role.tool, content=result)
+                            )
+                            action = retry_mgr.record_iteration(1, 1, [result])
+                        except Exception as exc:
+                            result = self._make_tool_error(f"Execution error: {exc}")
+                            self._ui.on_tool_result(tc.name, result)
+                            self._context.conversation.add_message(
+                                Message(role=Role.tool, content=result)
+                            )
+                            action = retry_mgr.record_iteration(1, 1, [result])
+                        else:
+                            finish_msg = (
+                                finish_result.output
+                                if finish_result.success
+                                else finish_result.error or ""
+                            )
+                            self._ui.on_tool_result(tc.name, finish_msg)
+                            logger.info(
+                                "Task finished via deferred finish tool after %d step(s)",
+                                steps_taken,
+                            )
+                            return self._make_result(
+                                plan=plan,
+                                steps_taken=steps_taken,
+                                message=finish_result.output,
+                            )
+
                 if action == RetryAction.REPLAN:
                     logger.info("Replanning after repeated failures (step %d)", steps_taken)
                     self._ui.on_replan()
@@ -1052,6 +1121,16 @@ class ReActLoop:
             "finished the task",
         ]
         return any(t in content.lower() for t in triggers)
+
+    @staticmethod
+    def _unfinished_plan_message(description: str) -> str:
+        return (
+            "You cannot finish yet -- there's an unfinished plan step: "
+            f"'{description}'. Complete it (and any remaining steps) before "
+            "calling finish. A tool result claiming work is done is not evidence "
+            "-- you must actually perform the step (e.g. write/edit the relevant "
+            "files)."
+        )
 
     def _unread_existing_file(self, path: str, files_read: set[str]) -> str | None:
         """Returns the canonical path if `path` refers to an existing file

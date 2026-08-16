@@ -136,7 +136,8 @@ _VAGUE_ASK_USER_PATTERNS = (
 # me to use next?".
 _PERMISSION_SEEKING_RE = re.compile(
     r"\b(?:do you want|would you like|should i|can i|could i|may i|shall i|"
-    r"have you (?:completed|finished|already done)|"
+    r"have you (?:(?:already )?(?:completed|finished|done|run|executed|tested|"
+    r"verified|checked|created|written|edited|read|installed|configured))|"
     r"is it (?:ok(?:ay)?|fine|alright) (?:to|if)|is that (?:ok(?:ay)?|fine))\b",
     re.IGNORECASE,
 )
@@ -408,9 +409,6 @@ class ReActLoop:
                     if parse_error:
                         action = retry_mgr.record_iteration(1, 1, [parse_error])
                     else:
-                        action = retry_mgr.record_iteration(0, 0, [])
-
-                    if action == RetryAction.STEP_COMPLETED:
                         verify_feedback = await self._verify_and_mark_step(
                             plan, non_tool_reasoning
                         )
@@ -423,6 +421,7 @@ class ReActLoop:
                             action = retry_mgr.record_iteration(1, 1, [verify_feedback])
                         else:
                             verify_failure_history.clear()
+                            action = retry_mgr.record_iteration(0, 0, [])
 
                     if (
                         self._detect_finish(non_tool_reasoning)
@@ -455,14 +454,15 @@ class ReActLoop:
                         )
                     continue
 
-                # ask_user is excluded from the repeat signature -- it's not
-                # a no-op action even when the question text repeats, since
-                # each call round-trips to the user and can get a genuinely
-                # new (if unhelpful) answer. Without this, a legitimately
-                # re-asked clarifying question gets misidentified as a
-                # stalled repeat and triggers the "stop repeating tool
-                # calls" nudge below.
-                _signature_calls = [tc for tc in tool_calls if tc.name != "ask_user"]
+                # Interactive ask_user calls are excluded because a repeated
+                # question can receive a genuinely new answer. In autonomous
+                # mode no answer can arrive, so include them and let the repeat
+                # guard detect a stalled model.
+                _signature_calls = [
+                    tc
+                    for tc in tool_calls
+                    if tc.name != "ask_user" or self._config.disable_ask_user
+                ]
                 call_signature = (
                     json.dumps(
                         sorted(
@@ -549,6 +549,7 @@ class ReActLoop:
                             logger.info("ask_user suppressed (auto mode): %r", question[:150])
                             self._ui.on_tool_result(tc.name, answer)
                             tool_results.append(answer)
+                            failed_calls += 1
                             continue
 
                         if (
@@ -584,6 +585,8 @@ class ReActLoop:
                         logger.info("ask_user answer: %r", answer[:200])
                         self._ui.on_tool_result(tc.name, answer)
                         tool_results.append(answer)
+                        if answer.startswith("[no-tty]"):
+                            failed_calls += 1
                         continue
 
                     if (
@@ -849,9 +852,7 @@ class ReActLoop:
                     )
 
                 steps_taken += 1
-                action = retry_mgr.record_iteration(total_calls, failed_calls, tool_results)
-
-                if action == RetryAction.STEP_COMPLETED:
+                if failed_calls == 0:
                     # A turn "succeeding" only means none of its tool calls
                     # failed -- it says nothing about whether any of them
                     # actually investigated anything. Require at least one
@@ -876,15 +877,16 @@ class ReActLoop:
                             Message(role=Role.tool, content=verify_feedback)
                         )
                         verify_failure_history.append(verify_feedback)
-                        # A non-investigative step whose tool calls keep
-                        # "succeeding" but keeps failing LLM verification
-                        # would otherwise reset to pending forever -- feed
-                        # it into the same failure counter that drives
-                        # replanning/escalation for actual tool failures,
-                        # so it's bounded by max_retries_per_step too.
                         action = retry_mgr.record_iteration(1, 1, [verify_feedback])
                     else:
                         verify_failure_history.clear()
+                        action = retry_mgr.record_iteration(
+                            total_calls, failed_calls, tool_results
+                        )
+                else:
+                    action = retry_mgr.record_iteration(
+                        total_calls, failed_calls, tool_results
+                    )
 
                 if deferred_finish_call is not None:
                     unresolved = plan.unresolved_steps()

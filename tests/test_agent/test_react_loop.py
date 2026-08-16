@@ -1319,6 +1319,86 @@ class TestStepVerification:
         assert "verification repeatedly failed" in result.message
 
     @pytest.mark.asyncio
+    async def test_reasoning_only_verifier_rejections_accumulate(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(role=Role.assistant, content="I think this is done.")
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        planner.verify_step = AsyncMock(
+            return_value=(StepVerdict.not_complete, "no evidence")
+        )
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=2, max_retries_per_step=2),
+        )
+        await loop.run("do something")
+
+        planner.update_plan.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_successful_tools_do_not_reset_verification_failures(self):
+        backend = _make_mock_backend()
+        backend.complete.side_effect = [
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content=(
+                        '<tool_call>{"name": "bash", "arguments": '
+                        '{"command": "python check_one.py"}}</tool_call>'
+                    ),
+                )
+            ),
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content=(
+                        '<tool_call>{"name": "bash", "arguments": '
+                        '{"command": "python check_two.py"}}</tool_call>'
+                    ),
+                )
+            ),
+        ]
+        planner = _make_mock_planner()
+        plan = _make_default_plan()
+        planner.generate_plan.return_value = plan
+        planner.verify_step = AsyncMock(
+            return_value=(StepVerdict.not_complete, "no useful evidence")
+        )
+        registry = _make_mock_tool_registry()
+        bash_tool = MagicMock()
+        bash_tool.name = "bash"
+        bash_tool.parameters = {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        }
+        bash_tool.run = AsyncMock(
+            return_value=MagicMock(output="ok", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"bash": bash_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(
+                max_steps=2,
+                max_retries_per_step=2,
+                lint_after_write=False,
+            ),
+        )
+        await loop.run("do something")
+
+        planner.update_plan.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_partial_verdict_does_not_advance_step(self):
         backend = _make_mock_backend()
         backend.complete.return_value = CompletionResponse(
@@ -1990,6 +2070,55 @@ class TestAskUserVagueQuestionGuard:
             if c.args[0].role == Role.tool
         ]
         assert any("auto mode" in m.lower() for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_repeated_disabled_questions_trigger_replan(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=(
+                    '<tool_call>{"name": "ask_user", "arguments": '
+                    '{"question": "Have you run the tests?"}}</tool_call>'
+                ),
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        ask_tool = MagicMock()
+        ask_tool.name = "ask_user"
+        ask_tool.parameters = {
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "required": ["question"],
+        }
+        registry.get.side_effect = lambda name: {"ask_user": ask_tool}.get(name)
+        ui = MagicMock(spec=NoopUI)
+        ui.on_ask_user = AsyncMock(return_value="yes")
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(
+                max_steps=2,
+                max_retries_per_step=2,
+                disable_ask_user=True,
+            ),
+            ui=ui,
+        )
+        await loop.run("do something")
+
+        ui.on_ask_user.assert_not_awaited()
+        planner.verify_step.assert_not_awaited()
+        planner.update_plan.assert_awaited_once()
+        assert any(
+            call.args[0] == "repeat-guard"
+            for call in ui.on_tool_result.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_vague_question_allowed_when_no_active_step(self):
@@ -2906,6 +3035,23 @@ class TestIsLowValueAskUserQuestion:
     def test_permission_seeking_is_it_ok(self):
         from chef_human.agent.react_loop import _is_low_value_ask_user_question
         assert _is_low_value_ask_user_question("Is it ok if I overwrite hello_world.py?") is True
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "Have you run the tests?",
+            "Have you executed hello.py?",
+            "Have you tested the program?",
+            "Have you verified the output?",
+            "Have you checked the file?",
+            "Have you created the module?",
+            "Have you configured the project?",
+        ],
+    )
+    def test_status_confirmation_questions_are_low_value(self, question):
+        from chef_human.agent.react_loop import _is_low_value_ask_user_question
+
+        assert _is_low_value_ask_user_question(question) is True
 
     def test_vague_next_step_still_caught(self):
         from chef_human.agent.react_loop import _is_low_value_ask_user_question

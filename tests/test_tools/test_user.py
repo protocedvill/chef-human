@@ -19,7 +19,8 @@ class TestAskUserTool:
         with patch("sys.stdin.isatty", return_value=False):
             tool = AskUserTool()
             result = await tool.run("What do you think?")
-            assert "Continuing without answer" in result.output
+            assert "No answer is coming" in result.output
+            assert "do not ask again" in result.output
 
     async def test_interactive_works_with_isatty(self):
         """When stdin is a TTY, the tool attempts to read input."""

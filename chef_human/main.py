@@ -421,6 +421,10 @@ async def _execute_task(
 
     loop._config.stream = stream
     loop._config.save_dir = save_dir
+    if headless:
+        # Headless mode promises a non-interactive, machine-readable result.
+        # It cannot stop for ask_user or emit prompts alongside the JSON.
+        loop._config.disable_ask_user = True
 
     from chef_human.ui.streaming import StreamingUI
 

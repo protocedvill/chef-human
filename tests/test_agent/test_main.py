@@ -708,6 +708,27 @@ class TestExecuteTask:
             assert result.success is True
             assert result.steps_taken == 1
 
+    @pytest.mark.asyncio
+    async def test_headless_mode_disables_ask_user(self):
+        mock_loop = MagicMock()
+        mock_loop.run = AsyncMock(
+            return_value=AgentResult(
+                plan=Plan(goal="test", steps=[]),
+                steps_taken=1,
+                message="Done",
+            )
+        )
+
+        with patch(
+            "chef_human.main.create_agent",
+            return_value=(mock_loop, MagicMock()),
+        ):
+            from chef_human.main import _execute_task
+
+            await _execute_task("test task", headless=True, stream=False)
+
+        assert mock_loop._config.disable_ask_user is True
+
 
 class TestSessionCLI:
     def test_session_group_in_help(self, runner):

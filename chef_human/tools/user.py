@@ -11,7 +11,10 @@ logger = logging.getLogger(__name__)
 
 class AskUserTool:
     name = "ask_user"
-    description = "Ask the user a question when you need clarification or approval"
+    description = (
+        "Ask the user only for a genuine unresolved design decision or ambiguous "
+        "requirement; never ask them to perform or confirm the current plan step"
+    )
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -24,7 +27,11 @@ class AskUserTool:
         logger.info("User asked: %s", question)
         if not sys.stdin.isatty():
             return ToolResult(
-                output="[no-tty] Cannot ask user in non-interactive mode. Continuing without answer."
+                output=(
+                    "[no-tty] Cannot ask user in non-interactive mode. No answer "
+                    "is coming; do not ask again. Proceed using the current plan "
+                    "and your best judgment."
+                )
             )
         print(f"\n[Agent asks]: {question}")
         print("[Type your response, or 'skip' to continue without answering]: ", end="", flush=True)

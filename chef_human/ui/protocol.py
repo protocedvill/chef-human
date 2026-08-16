@@ -15,7 +15,11 @@ async def ask_via_stdin(question: str) -> str:
     would block the whole event loop -- see TuiUI.on_ask_user for that
     case)."""
     if not sys.stdin.isatty():
-        return "[no-tty] Cannot ask user in non-interactive mode. Continuing without answer."
+        return (
+            "[no-tty] Cannot ask user in non-interactive mode. No answer is "
+            "coming; do not ask again. Proceed using the current plan and your "
+            "best judgment."
+        )
     print(f"\n[Agent asks]: {question}")
     print("[Type your response, or 'skip' to continue without answering]: ", end="", flush=True)
     try:

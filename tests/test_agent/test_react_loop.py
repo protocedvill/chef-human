@@ -1609,6 +1609,49 @@ class TestStepVerification:
         planner.verify_step.assert_not_awaited()
 
 
+class TestPlanningPreflight:
+    def _context_rooted_at(self, tmp_path):
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(side_effect=lambda p: tmp_path / p)
+        return context
+
+    @pytest.mark.asyncio
+    async def test_plan_task_passes_file_existence_facts_to_planner(self, tmp_path):
+        (tmp_path / "SPEC.md").write_text(
+            "Implement `slugify(value: str) -> str` in `slugify.py`.\n"
+        )
+        (tmp_path / "test_slugify.py").write_text("from slugify import slugify\n")
+
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = Plan(goal="g", steps=[])
+        context = self._context_rooted_at(tmp_path)
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._plan_task(
+            "Read SPEC.md and test_slugify.py, then implement slugify.py. "
+            "Do not modify the tests."
+        )
+
+        planner.generate_plan.assert_awaited_once()
+        call = planner.generate_plan.await_args
+        assert call is not None
+        assert call.kwargs["planning_facts"] == {
+            "SPEC.md": True,
+            "test_slugify.py": True,
+            "slugify.py": False,
+        }
+        assert "### Planning Facts" in call.kwargs["repo_context"]
+        assert "- slugify.py: missing" in call.kwargs["repo_context"]
+
+
 class TestObjectiveFileVerification:
     """_verify_and_mark_step's objective-file-creation bypass: for a step
     that names a specific file and reads like "create/write X", check the
@@ -1663,6 +1706,33 @@ class TestObjectiveFileVerification:
         )
         await loop.run("do something")
 
+        assert plan.steps[0].status == StepStatus.completed
+        planner.verify_step.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_creation_step_completes_from_plan_time_missing_to_now_existing(self, tmp_path):
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Create a new file named slugify.py", status=StepStatus.pending),
+        ])
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+        loop._planning_facts = {"slugify.py": False}
+        (tmp_path / "slugify.py").write_text("def slugify(value):\n    return value\n")
+
+        feedback = await loop._verify_and_mark_step(
+            plan,
+            evidence="The file now exists.",
+            has_tool_evidence=False,
+        )
+
+        assert feedback is None
         assert plan.steps[0].status == StepStatus.completed
         planner.verify_step.assert_not_awaited()
 
@@ -2007,6 +2077,80 @@ class TestInvestigativeStepBypassesVerification:
         read_tool.run.assert_awaited_once_with(path="test_slugify.py")
         planner.verify_step.assert_not_awaited()
         assert plan.steps[0].status == StepStatus.completed
+
+    @pytest.mark.asyncio
+    async def test_reasoning_only_file_creation_step_demands_mutating_tool_evidence(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(role=Role.assistant, content="I created slugify.py and can move on."),
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(
+                index=1,
+                description="Create a new file named slugify.py",
+                status=StepStatus.pending,
+            ),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        planner.verify_step.assert_not_awaited()
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("still needs real file-change evidence" in m for m in tool_msgs)
+        assert any("`write`/`edit`" in m for m in tool_msgs)
+        assert any("`slugify.py`" in m for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_reasoning_only_implementation_step_demands_mutating_tool_evidence(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(role=Role.assistant, content="The implementation is complete."),
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(
+                index=1,
+                description="Implement the slugify function in slugify.py according to SPEC.md",
+                status=StepStatus.pending,
+            ),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        planner.verify_step.assert_not_awaited()
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("still needs real file-change evidence" in m for m in tool_msgs)
+        assert any("`write`/`edit`" in m for m in tool_msgs)
+        assert any("`slugify.py`" in m for m in tool_msgs)
 
     @pytest.mark.asyncio
     async def test_unrelated_successful_tool_call_does_not_auto_complete(self):

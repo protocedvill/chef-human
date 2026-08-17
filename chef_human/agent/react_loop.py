@@ -76,6 +76,10 @@ _FILE_TARGET_RE = re.compile(r"[`'\"]?([\w\-./]+\.\w{1,10})[`'\"]?")
 # hello_world.py runs correctly") still need real judgment, so they're
 # deliberately excluded.
 _FILE_CREATION_VERBS = ("create", "write", "make", "add", "generate")
+_FILE_MUTATION_VERBS = (
+    *_FILE_CREATION_VERBS,
+    "implement", "edit", "update", "modify", "change", "refactor",
+)
 _EXECUTION_STEP_KEYWORDS = ("run", "test", "verify", "execute", "check")
 _DIRECT_READ_PREFIX_RE = re.compile(r"^\s*read\b", re.IGNORECASE)
 
@@ -87,6 +91,16 @@ def _looks_like_file_creation_step(description: str) -> set[str]:
     never a regression."""
     lowered = description.lower()
     if not any(v in lowered for v in _FILE_CREATION_VERBS):
+        return set()
+    return {m.group(1) for m in _FILE_TARGET_RE.finditer(description)}
+
+
+def _looks_like_file_mutation_step(description: str) -> set[str]:
+    """Filenames this step names, if the step reads like it should leave a
+    durable file artifact behind. Used to prevent reasoning-only turns from
+    hallucinating progress on implementation/edit steps."""
+    lowered = description.lower()
+    if not any(v in lowered for v in _FILE_MUTATION_VERBS):
         return set()
     return {m.group(1) for m in _FILE_TARGET_RE.finditer(description)}
 
@@ -143,6 +157,15 @@ def _execution_step_feedback(step: PlanStep) -> str:
         f"Step {step.index} ('{step.description}') still needs real execution evidence. "
         "Reasoning alone does not count for a run/verify step; use a tool like `bash` to "
         "run the command or test in this turn."
+    )
+
+
+def _file_mutation_step_feedback(step: PlanStep, target_names: set[str]) -> str:
+    targets = ", ".join(f"`{name}`" for name in sorted(target_names))
+    return (
+        f"Step {step.index} ('{step.description}') still needs real file-change evidence. "
+        "Reasoning alone does not count for a create/implement/edit step; use a mutating "
+        f"tool like `write`/`edit` on {targets} in this turn."
     )
 
 
@@ -307,6 +330,7 @@ class ReActLoop:
         self._planner.on_llm_start = self._ui.on_llm_start
         self._planner.on_llm_end = self._ui.on_llm_end
         self._recent_verification_events: deque[str] = deque(maxlen=8)
+        self._planning_facts: dict[str, bool] = {}
 
     def _record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
         self._total_prompt_tokens += prompt_tokens
@@ -1130,7 +1154,22 @@ class ReActLoop:
         doc_context = self._get_referenced_document_contents(task)
         if doc_context:
             repo_context = f"{repo_context}\n\n{doc_context}" if repo_context else doc_context
-        plan = await self._planner.generate_plan(task, repo_context=repo_context)
+        planning_facts = self._collect_planning_facts(task, doc_context)
+        self._planning_facts = dict(planning_facts)
+        if planning_facts:
+            facts_text = "\n".join(
+                f"- {path}: {'exists' if exists else 'missing'}"
+                for path, exists in sorted(planning_facts.items())
+            )
+            planning_context = f"### Planning Facts\n\n{facts_text}"
+            repo_context = (
+                f"{repo_context}\n\n{planning_context}" if repo_context else planning_context
+            )
+        plan = await self._planner.generate_plan(
+            task,
+            repo_context=repo_context,
+            planning_facts=planning_facts,
+        )
         self._ui.on_plan(plan)
         return plan
 
@@ -1164,6 +1203,36 @@ class ReActLoop:
                 continue
             sections.append(f"### Contents of {filename}\n\n{content}")
         return "\n\n".join(sections)
+
+    def _collect_planning_facts(
+        self,
+        task: str,
+        doc_context: str = "",
+        *,
+        max_files: int = 16,
+    ) -> dict[str, bool]:
+        """Resolve simple file-existence questions before planning.
+
+        This avoids plans that defer obvious conditions into vague steps like
+        "create X if it does not exist" or "inspect X (if any)" when the
+        workspace state is already cheaply knowable."""
+        workspace = self._context.workspace
+        candidates: dict[str, None] = {}
+        for source in (task, doc_context):
+            for match in _FILE_TARGET_RE.finditer(source):
+                candidates[match.group(1)] = None
+                if len(candidates) >= max_files:
+                    break
+            if len(candidates) >= max_files:
+                break
+
+        facts: dict[str, bool] = {}
+        for filename in candidates:
+            try:
+                facts[filename] = bool(workspace.resolve(filename).exists())
+            except Exception:
+                continue
+        return facts
 
     async def _verify_and_mark_step(
         self,
@@ -1213,6 +1282,22 @@ class ReActLoop:
 
         target_names = _looks_like_file_creation_step(step.description)
         if target_names:
+            for target_name in target_names:
+                initially_existed = self._planning_facts.get(target_name)
+                if initially_existed is not False:
+                    continue
+                try:
+                    target_path = self._context.workspace.resolve(target_name)
+                except Exception:
+                    continue
+                if target_path.exists() and target_path.stat().st_size > 0:
+                    logger.debug(
+                        "Step %r auto-completed (objective: %s was missing at plan time and now exists on disk)",
+                        step.description,
+                        target_name,
+                    )
+                    step.status = StepStatus.completed
+                    return None
             for path_str in files_written_this_turn:
                 p = Path(path_str)
                 if p.name in target_names and p.exists() and p.stat().st_size > 0:
@@ -1227,6 +1312,11 @@ class ReActLoop:
                     )
                     step.status = StepStatus.completed
                     return None
+
+        mutation_targets = _looks_like_file_mutation_step(step.description)
+        if mutation_targets and not files_written_this_turn:
+            step.status = StepStatus.pending
+            return _file_mutation_step_feedback(step, mutation_targets)
 
         if _looks_like_execution_step(step.description) and successful_commands_this_turn:
             logger.debug(

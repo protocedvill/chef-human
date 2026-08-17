@@ -7,6 +7,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from collections import deque
 
 
 from chef_human.agent.context import ContextAssembler
@@ -75,6 +76,8 @@ _FILE_TARGET_RE = re.compile(r"[`'\"]?([\w\-./]+\.\w{1,10})[`'\"]?")
 # hello_world.py runs correctly") still need real judgment, so they're
 # deliberately excluded.
 _FILE_CREATION_VERBS = ("create", "write", "make", "add", "generate")
+_EXECUTION_STEP_KEYWORDS = ("run", "test", "verify", "execute", "check")
+_DIRECT_READ_PREFIX_RE = re.compile(r"^\s*read\b", re.IGNORECASE)
 
 
 def _looks_like_file_creation_step(description: str) -> set[str]:
@@ -86,6 +89,13 @@ def _looks_like_file_creation_step(description: str) -> set[str]:
     if not any(v in lowered for v in _FILE_CREATION_VERBS):
         return set()
     return {m.group(1) for m in _FILE_TARGET_RE.finditer(description)}
+
+
+def _named_step_files(description: str) -> list[str]:
+    seen: dict[str, None] = {}
+    for match in _FILE_TARGET_RE.finditer(description):
+        seen[match.group(1)] = None
+    return list(seen)
 
 
 def _file_facts(files_written_this_turn: dict[str, bool]) -> str:
@@ -105,6 +115,44 @@ def _file_facts(files_written_this_turn: dict[str, bool]) -> str:
             f"newly_created_this_turn={exists and not existed_before}"
         )
     return "\n".join(lines)
+
+
+def _looks_like_execution_step(description: str) -> bool:
+    lowered = description.lower()
+    return any(keyword in lowered for keyword in _EXECUTION_STEP_KEYWORDS)
+
+
+def _execution_step_feedback(step: PlanStep) -> str:
+    named_files = _named_step_files(step.description)
+    lowered = step.description.lower()
+    if named_files and "python" in lowered:
+        target = named_files[0]
+        return (
+            f"Step {step.index} ('{step.description}') still needs real execution evidence. "
+            "Reasoning alone does not count for a run/verify step; use the `bash` tool now "
+            f"to run `python {target}` and capture the output in this turn."
+        )
+    if named_files:
+        targets = ", ".join(f"`{name}`" for name in named_files)
+        return (
+            f"Step {step.index} ('{step.description}') still needs real execution evidence. "
+            "Reasoning alone does not count for a run/verify step; use a tool like `bash` "
+            f"to run or test {targets} in this turn."
+        )
+    return (
+        f"Step {step.index} ('{step.description}') still needs real execution evidence. "
+        "Reasoning alone does not count for a run/verify step; use a tool like `bash` to "
+        "run the command or test in this turn."
+    )
+
+
+def _direct_read_targets(description: str) -> list[str]:
+    if not _DIRECT_READ_PREFIX_RE.search(description):
+        return []
+    seen: dict[str, None] = {}
+    for match in _FILE_TARGET_RE.finditer(description):
+        seen[match.group(1)] = None
+    return list(seen)
 
 # Matches doc-like filenames mentioned in a task string (e.g. "implement
 # plan.md") so their content can be read and fed to the planner -- without
@@ -258,11 +306,30 @@ class ReActLoop:
         self._planner.on_usage = self._record_usage
         self._planner.on_llm_start = self._ui.on_llm_start
         self._planner.on_llm_end = self._ui.on_llm_end
+        self._recent_verification_events: deque[str] = deque(maxlen=8)
 
     def _record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
         self._total_prompt_tokens += prompt_tokens
         self._total_completion_tokens += completion_tokens
         self._ui.on_token_usage(prompt_tokens, completion_tokens)
+
+    def _record_verification_event(self, label: str, content: str) -> None:
+        text = content.strip()
+        if not text:
+            return
+        self._recent_verification_events.append(f"{label}: {text[:1000]}")
+
+    def _recent_verification_history(self) -> str:
+        if not self._recent_verification_events:
+            return ""
+        return "\n\n".join(self._recent_verification_events)
+
+    def _has_recent_non_finish_evidence(self) -> bool:
+        for entry in self._recent_verification_events:
+            if entry.startswith("tool-call:finish:") or entry.startswith("finish-rejected:"):
+                continue
+            return True
+        return False
 
     async def run(self, task: str) -> AgentResult:
         logger.info("Task started: %s", task[:200])
@@ -393,6 +460,8 @@ class ReActLoop:
 
                 if not tool_calls:
                     parse_error = None
+                    auto_tool_results: list[str] = []
+                    auto_read_success = False
                     if looks_like_tool_call(response.message.content):
                         parse_error = format_parse_error(
                             response.message.content,
@@ -404,13 +473,54 @@ class ReActLoop:
                         )
                     else:
                         logger.debug("No tool calls this turn (plain reasoning only)")
+                        current = plan.current_step()
+                        direct_read_targets = (
+                            _direct_read_targets(current.description)
+                            if current is not None
+                            else []
+                        )
+                        if direct_read_targets:
+                            read_tool = self._tools.get("read")
+                            if read_tool is not None:
+                                for target in direct_read_targets:
+                                    try:
+                                        read_result = await asyncio.wait_for(
+                                            read_tool.run(path=target),
+                                            timeout=self._config.tool_timeout,
+                                        )
+                                    except Exception as exc:
+                                        read_output = self._make_tool_error(
+                                            f"Execution error: {exc}"
+                                        )
+                                    else:
+                                        if read_result.success:
+                                            read_output = read_result.output
+                                            auto_read_success = True
+                                            try:
+                                                files_read.add(
+                                                    str(self._context.workspace.resolve(target))
+                                                )
+                                            except Exception:
+                                                pass
+                                        else:
+                                            read_output = (
+                                                f"Error: {read_result.error}\n"
+                                                f"Output: {read_result.output}"
+                                            )
+                                    self._ui.on_tool_result("read", read_output)
+                                    auto_tool_results.append(read_output)
+                                    self._context.conversation.add_message(
+                                        Message(role=Role.tool, content=read_output)
+                                    )
 
                     steps_taken += 1
                     if parse_error:
                         action = retry_mgr.record_iteration(1, 1, [parse_error])
                     else:
                         verify_feedback = await self._verify_and_mark_step(
-                            plan, non_tool_reasoning
+                            plan,
+                            "\n".join(auto_tool_results) if auto_tool_results else non_tool_reasoning,
+                            has_tool_evidence=auto_read_success,
                         )
                         if verify_feedback:
                             self._ui.on_tool_result("plan-check", verify_feedback)
@@ -485,6 +595,7 @@ class ReActLoop:
                 # edit/patch call ran. Used to objectively verify file-creation
                 # steps instead of relying on a tool's success-message wording.
                 files_written_this_turn: dict[str, bool] = {}
+                successful_commands_this_turn: list[str] = []
                 finish_call: tuple[ParsedToolCall, Tool] | None = None
                 deferred_finish_call: tuple[ParsedToolCall, Tool] | None = None
                 parallel_candidates: list[tuple[ParsedToolCall, Tool]] = []
@@ -492,6 +603,10 @@ class ReActLoop:
                 for tc in tool_calls:
                     logger.debug("Tool call: %s(%s)", tc.name, tc.arguments)
                     self._ui.on_tool_call(tc)
+                    self._record_verification_event(
+                        f"tool-call:{tc.name}",
+                        json.dumps(tc.arguments, sort_keys=True, default=str),
+                    )
 
                     tool = self._tools.get(tc.name)
                     if tool is None:
@@ -626,18 +741,7 @@ class ReActLoop:
                             len(parallel_candidates),
                         )
                     else:
-                        current = plan.unresolved_steps()[0]
-                        logger.info(
-                            "Blocked premature finish: unfinished step %r remains",
-                            current.description,
-                        )
-                        result = self._make_tool_error(
-                            self._unfinished_plan_message(current.description)
-                        )
-                        self._ui.on_tool_result("finish", result)
-                        tool_results.append(result)
-                        failed_calls += 1
-                        finish_call = None
+                        logger.info("Finish requested with unresolved step(s); asking verifier first")
 
                 if parallel_candidates:
                     # Capture original file content for write/edit/patch tools --
@@ -696,9 +800,14 @@ class ReActLoop:
                             failed_calls += 1
                         else:
                             result = tool_result.output
+                            if tc.name == "bash":
+                                successful_commands_this_turn.append(
+                                    str(tc.arguments.get("command", ""))
+                                )
 
                         self._ui.on_tool_result(tc.name, result)
                         tool_results.append(result)
+                        self._record_verification_event(f"tool:{tc.name}", result)
 
                         if tool_result.success and tc.name in FILE_MUTATING_TOOLS:
                             self._context.invalidate_repo_map_cache()
@@ -770,32 +879,52 @@ class ReActLoop:
 
                 if finish_call is not None:
                     tc, tool = finish_call
-                    try:
-                        finish_result = await asyncio.wait_for(
-                            tool.run(**tc.arguments),
-                            timeout=self._config.tool_timeout,
+                    unresolved = plan.unresolved_steps()
+                    if (
+                        self._config.require_plan_complete_to_finish
+                        and unresolved
+                    ):
+                        finish_summary = str(tc.arguments.get("summary", ""))
+                        finish_feedback = await self._verify_finish_request(
+                            plan,
+                            immediate_evidence="\n".join(tool_results),
+                            finish_summary=finish_summary,
+                            files_written_this_turn=files_written_this_turn,
+                            successful_commands_this_turn=successful_commands_this_turn,
                         )
-                    except asyncio.TimeoutError:
-                        result = self._make_tool_error(
-                            f"Tool '{tc.name}' timed out after {self._config.tool_timeout}s"
-                        )
-                        self._ui.on_tool_result(tc.name, result)
-                        tool_results.append(result)
-                        failed_calls += 1
-                    except Exception as exc:
-                        result = self._make_tool_error(f"Execution error: {exc}")
-                        self._ui.on_tool_result(tc.name, result)
-                        tool_results.append(result)
-                        failed_calls += 1
-                    else:
-                        finish_msg = finish_result.output if finish_result.success else finish_result.error or ""
-                        self._ui.on_tool_result(tc.name, finish_msg)
-                        logger.info("Task finished via finish tool after %d step(s)", steps_taken)
-                        return self._make_result(
-                            plan=plan,
-                            steps_taken=steps_taken,
-                            message=finish_result.output,
-                        )
+                        if finish_feedback is not None:
+                            self._ui.on_tool_result("finish", finish_feedback)
+                            tool_results.append(finish_feedback)
+                            self._record_verification_event("finish-rejected", finish_feedback)
+                            failed_calls += 1
+                            finish_call = None
+                    if finish_call is not None:
+                        try:
+                            finish_result = await asyncio.wait_for(
+                                tool.run(**tc.arguments),
+                                timeout=self._config.tool_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            result = self._make_tool_error(
+                                f"Tool '{tc.name}' timed out after {self._config.tool_timeout}s"
+                            )
+                            self._ui.on_tool_result(tc.name, result)
+                            tool_results.append(result)
+                            failed_calls += 1
+                        except Exception as exc:
+                            result = self._make_tool_error(f"Execution error: {exc}")
+                            self._ui.on_tool_result(tc.name, result)
+                            tool_results.append(result)
+                            failed_calls += 1
+                        else:
+                            finish_msg = finish_result.output if finish_result.success else finish_result.error or ""
+                            self._ui.on_tool_result(tc.name, finish_msg)
+                            logger.info("Task finished via finish tool after %d step(s)", steps_taken)
+                            return self._make_result(
+                                plan=plan,
+                                steps_taken=steps_taken,
+                                message=finish_result.output,
+                            )
 
                 if is_repeat_call and finish_call is None:
                     nudge = (
@@ -850,6 +979,7 @@ class ReActLoop:
                     self._context.conversation.add_message(
                         Message(role=Role.tool, content=result_text)
                     )
+                    self._record_verification_event("tool-result", result_text)
 
                 steps_taken += 1
                 if failed_calls == 0:
@@ -870,6 +1000,7 @@ class ReActLoop:
                         "\n".join(tool_results),
                         has_tool_evidence=has_real_investigative_evidence,
                         files_written_this_turn=files_written_this_turn,
+                        successful_commands_this_turn=successful_commands_this_turn,
                     )
                     if verify_feedback:
                         self._ui.on_tool_result("plan-check", verify_feedback)
@@ -1040,17 +1171,21 @@ class ReActLoop:
         evidence: str,
         has_tool_evidence: bool = False,
         files_written_this_turn: dict[str, bool] | None = None,
+        successful_commands_this_turn: list[str] | None = None,
+        finish_summary: str = "",
+        step_override: PlanStep | None = None,
     ) -> str | None:
         """Ask the planner to verify the current pending step is actually
         done before advancing it, instead of assuming any non-failing turn
         finished it. Returns feedback to show the model if the step isn't
         really finished yet, or None if it was marked complete."""
-        step = plan.current_step()
+        step = step_override or plan.current_step()
         if step is None:
             return None
 
         step.status = StepStatus.in_progress
         files_written_this_turn = files_written_this_turn or {}
+        successful_commands_this_turn = successful_commands_this_turn or []
 
         if has_tool_evidence and _looks_investigative(step.description):
             # Read/identify/check-style steps have no artifact beyond "the
@@ -1059,6 +1194,22 @@ class ReActLoop:
             logger.debug("Step %r auto-completed (investigative, has tool evidence)", step.description)
             step.status = StepStatus.completed
             return None
+
+        if _looks_investigative(step.description) and not has_tool_evidence:
+            step.status = StepStatus.pending
+            named_files = _named_step_files(step.description)
+            if named_files:
+                targets = ", ".join(f"`{name}`" for name in named_files)
+                return (
+                    f"Step {step.index} ('{step.description}') still needs real tool evidence. "
+                    f"Reasoning alone does not count for an investigative step; use a read-only "
+                    f"tool like `read`/`grep`/`ls` on {targets} in this turn."
+                )
+            return (
+                f"Step {step.index} ('{step.description}') still needs real tool evidence. "
+                "Reasoning alone does not count for an investigative step; use a relevant "
+                "read-only tool in this turn."
+            )
 
         target_names = _looks_like_file_creation_step(step.description)
         if target_names:
@@ -1077,6 +1228,19 @@ class ReActLoop:
                     step.status = StepStatus.completed
                     return None
 
+        if _looks_like_execution_step(step.description) and successful_commands_this_turn:
+            logger.debug(
+                "Step %r auto-completed (objective: successful command(s) %s)",
+                step.description,
+                successful_commands_this_turn,
+            )
+            step.status = StepStatus.completed
+            return None
+
+        if _looks_like_execution_step(step.description) and not has_tool_evidence:
+            step.status = StepStatus.pending
+            return _execution_step_feedback(step)
+
         facts = _file_facts(files_written_this_turn)
         if facts:
             evidence = (
@@ -1085,7 +1249,13 @@ class ReActLoop:
             )
 
         try:
-            verdict, reason = await self._planner.verify_step(plan, step, evidence)
+            verdict, reason = await self._planner.verify_step(
+                plan,
+                step,
+                evidence,
+                recent_history=self._recent_verification_history(),
+                finish_summary=finish_summary,
+            )
         except Exception as exc:
             # Unlike tool-call dispatch (which wraps every call in
             # try/except so a backend hiccup becomes a recorded failure,
@@ -1114,6 +1284,51 @@ class ReActLoop:
             f"({verdict.value}): {reason or 'insufficient evidence in the tool results'}. "
             "Keep working on this step before moving on."
         )
+
+    async def _verify_finish_request(
+        self,
+        plan: Plan,
+        *,
+        immediate_evidence: str,
+        finish_summary: str,
+        files_written_this_turn: dict[str, bool],
+        successful_commands_this_turn: list[str],
+    ) -> str | None:
+        unresolved = plan.unresolved_steps()
+        if not unresolved:
+            return None
+
+        if (
+            not immediate_evidence.strip()
+            and not files_written_this_turn
+            and not successful_commands_this_turn
+            and not self._has_recent_non_finish_evidence()
+        ):
+            current = unresolved[0]
+            return self._unfinished_plan_message(current.description)
+
+        for step in unresolved:
+            original_status = step.status
+            try:
+                step.status = StepStatus.pending
+                feedback = await self._verify_and_mark_step(
+                    plan,
+                    immediate_evidence,
+                    has_tool_evidence=False,
+                    files_written_this_turn=files_written_this_turn,
+                    successful_commands_this_turn=successful_commands_this_turn,
+                    finish_summary=finish_summary,
+                    step_override=step,
+                )
+                if feedback is not None:
+                    return (
+                        "Finish request rejected after verification. "
+                        f"{feedback}"
+                    )
+            finally:
+                if step.status != StepStatus.completed:
+                    step.status = original_status
+        return None
 
     def _detect_finish(self, content: str) -> bool:
         triggers = [

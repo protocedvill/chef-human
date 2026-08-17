@@ -16,6 +16,12 @@ Rules:
 - Each step must be actionable with the available tools (read, write, edit, grep, glob, ls, bash)
 - Steps should be ordered by dependency
 - Each step should have a clear completion criterion
+- Prefer minimal outcome-based steps. Do not decompose work into editor mechanics like "open in
+  nano", "save and close", or "create an empty file, then edit it" unless the user explicitly
+  asked for those mechanics.
+- Do not add prerequisite or environment setup steps (for example "install Python", "create a
+  virtual environment", or "install dependencies") unless the task explicitly asks for setup or
+  the prompt already contains concrete evidence that setup is required.
 - If the task involves implementing or changing something in an existing codebase, the plan's
   first step(s) must be to explore the relevant existing code (ls/glob/grep/read on the actual
   source files) before any step that writes or edits files. Do not plan straight from a task
@@ -87,8 +93,14 @@ STEP_VERIFY_PROMPT = """You are checking whether a single step of a plan has act
 Overall goal: {goal}
 Step to verify: {step}
 
-Evidence from this turn:
+Immediate evidence:
 {evidence}
+
+Recent tool and command history:
+{recent_history}
+
+Finish request summary:
+{finish_summary}
 
 Respond with exactly two lines and nothing else:
 VERDICT: COMPLETE, PARTIAL, or NOT_COMPLETE
@@ -110,12 +122,21 @@ def build_planner_prompt(task: str, repo_context: str = "") -> str:
     return prompt
 
 
-def build_verify_prompt(goal: str, step: str, evidence: str) -> str:
+def build_verify_prompt(
+    goal: str,
+    step: str,
+    evidence: str,
+    *,
+    recent_history: str = "",
+    finish_summary: str = "",
+) -> str:
     return STEP_VERIFY_PROMPT.format(
         goal=goal,
         step=step,
         evidence=evidence.strip()
-        or "(no tool calls this turn -- only reasoning text was produced)",
+        or "(no immediate tool calls this turn -- only reasoning text was produced)",
+        recent_history=recent_history.strip() or "(no recent tool history available)",
+        finish_summary=finish_summary.strip() or "(no finish request summary provided)",
     )
 
 

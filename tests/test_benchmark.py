@@ -50,10 +50,28 @@ class TestCaseSelection:
 
 
 class TestRunCase:
+    def test_prepare_agent_path_exposes_python_shim(self, tmp_path):
+        env = benchmark._prepare_agent_path(tmp_path)
+        shim = tmp_path / ".benchmark-bin" / "python"
+
+        assert shim.exists()
+        assert shim.stat().st_mode & 0o111
+        assert env["PATH"].split(":")[0] == str(tmp_path / ".benchmark-bin")
+
+    def test_prepare_agent_path_resolves_relative_workspace(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        relative_workspace = Path("relative-workspace")
+
+        env = benchmark._prepare_agent_path(relative_workspace)
+
+        assert env["PATH"].split(":")[0] == str(
+            (tmp_path / "relative-workspace" / ".benchmark-bin").resolve()
+        )
+
     def test_pass_requires_agent_and_external_verifier(self, tmp_path, monkeypatch):
         calls: list[list[str]] = []
 
-        def fake_run(command, *, cwd, timeout):
+        def fake_run(command, *, cwd, timeout, env=None):
             calls.append(list(command))
             if len(calls) == 1:
                 (cwd / "result.py").write_text("print('ok')\n")
@@ -86,6 +104,25 @@ class TestRunCase:
         assert calls[0][-2:] == ["--model", "test-model"]
         assert calls[1][0] == benchmark.sys.executable
 
+    def test_agent_receives_absolute_workspace_path(self, tmp_path, monkeypatch):
+        commands: list[list[str]] = []
+
+        def fake_run(command, *, cwd, timeout, env=None):
+            commands.append(list(command))
+            if len(commands) == 1:
+                (cwd / "result.py").write_text("print('ok')\n")
+                return _completed(command, stdout='{"success": true}')
+            return _completed(command, stdout="ok\n")
+
+        monkeypatch.setattr(benchmark, "_run_process", fake_run)
+        workspace = tmp_path / "nested" / "workspace"
+        benchmark.run_case(_case(), workspace, model=None, agent_timeout=60)
+
+        workspace_index = commands[0].index("--workspace") + 1
+        assert commands[0][workspace_index] == str(workspace.resolve())
+        log_index = commands[0].index("--log-file") + 1
+        assert commands[0][log_index] == str((workspace / "agent.log").resolve())
+
     def test_verifier_can_fail_after_agent_reports_success(self, tmp_path, monkeypatch):
         responses = iter(
             [
@@ -96,7 +133,7 @@ class TestRunCase:
         monkeypatch.setattr(
             benchmark,
             "_run_process",
-            lambda command, *, cwd, timeout: next(responses),
+            lambda command, *, cwd, timeout, env=None: next(responses),
         )
 
         result = benchmark.run_case(
@@ -111,7 +148,7 @@ class TestRunCase:
     def test_modifying_protected_test_fails_integrity(self, tmp_path, monkeypatch):
         calls = 0
 
-        def fake_run(command, *, cwd: Path, timeout):
+        def fake_run(command, *, cwd: Path, timeout, env=None):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -134,7 +171,7 @@ class TestRunCase:
     def test_generated_cache_files_are_not_reported_as_changes(self, tmp_path, monkeypatch):
         calls = 0
 
-        def fake_run(command, *, cwd: Path, timeout):
+        def fake_run(command, *, cwd: Path, timeout, env=None):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -155,7 +192,7 @@ class TestRunCase:
     def test_timeout_still_runs_external_verifier(self, tmp_path, monkeypatch):
         calls = 0
 
-        def fake_run(command, *, cwd: Path, timeout):
+        def fake_run(command, *, cwd: Path, timeout, env=None):
             nonlocal calls
             calls += 1
             if calls == 1:

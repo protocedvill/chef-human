@@ -195,6 +195,54 @@ class TestParseSteps:
         assert len(steps) >= 1
 
 
+class TestNormalizeSteps:
+    def test_drops_environment_setup_hallucination_when_task_does_not_request_it(self):
+        steps = [
+            PlanStep(index=1, description="Install Python if it is not already installed"),
+            PlanStep(index=2, description="Write hello.py with the required content"),
+            PlanStep(index=3, description="Run hello.py and verify the output"),
+        ]
+        normalized = Planner._normalize_steps(
+            "Create hello.py that prints Hello, world!",
+            steps,
+        )
+
+        assert [step.description for step in normalized] == [
+            "Write hello.py with the required content",
+            "Run hello.py and verify the output",
+        ]
+
+    def test_keeps_environment_setup_steps_when_task_explicitly_requests_setup(self):
+        steps = [
+            PlanStep(index=1, description="Create a virtual environment"),
+            PlanStep(index=2, description="Install dependencies from requirements.txt"),
+        ]
+        normalized = Planner._normalize_steps(
+            "Set up a Python virtualenv and install the project requirements",
+            steps,
+        )
+
+        assert [step.description for step in normalized] == [
+            "Create a virtual environment",
+            "Install dependencies from requirements.txt",
+        ]
+
+    def test_drops_editor_mechanics_steps(self):
+        steps = [
+            PlanStep(index=1, description="Open hello.py for editing using nano"),
+            PlanStep(index=2, description="Save and close the file"),
+            PlanStep(index=3, description="Write the required content to hello.py"),
+        ]
+        normalized = Planner._normalize_steps(
+            "Create hello.py that prints Hello, world!",
+            steps,
+        )
+
+        assert [step.description for step in normalized] == [
+            "Write the required content to hello.py",
+        ]
+
+
 class TestFormatPlanForPrompt:
     def test_empty_plan(self):
         plan = Plan(goal="test")

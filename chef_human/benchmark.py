@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -222,6 +223,27 @@ def _write_seed(workspace: Path, files: dict[str, str]) -> None:
         path.write_text(content, encoding="utf-8")
 
 
+def _prepare_agent_path(workspace: Path) -> dict[str, str]:
+    """Ensure benchmark workspaces expose a stable `python` command.
+
+    The benchmark tasks ask the agent to "run with Python", and many local
+    models naturally choose `python ...`. On this machine the supported
+    interpreter is available as `python3.12`/`sys.executable`, but not as a
+    `python` shell command. Seed a tiny shim in the disposable workspace so
+    the benchmark measures agent behavior rather than host PATH quirks."""
+    shim_dir = (workspace / ".benchmark-bin").resolve()
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    python_shim = shim_dir / "python"
+    python_shim.write_text(
+        f"#!/bin/sh\nexec {json.dumps(sys.executable)} \"$@\"\n",
+        encoding="utf-8",
+    )
+    python_shim.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{shim_dir}:{env.get('PATH', '')}"
+    return env
+
+
 def _parse_agent_json(stdout: str) -> dict[str, Any]:
     try:
         value = json.loads(stdout)
@@ -241,11 +263,12 @@ def _parse_agent_json(stdout: str) -> dict[str, Any]:
 
 
 def _run_process(
-    command: Sequence[str], *, cwd: Path, timeout: int
+    command: Sequence[str], *, cwd: Path, timeout: int, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
         cwd=cwd,
+        env=env,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -262,6 +285,7 @@ def run_case(
 ) -> BenchmarkResult:
     workspace.mkdir(parents=True, exist_ok=False)
     _write_seed(workspace, case.seed_files)
+    agent_env = _prepare_agent_path(workspace)
     before = _snapshot(workspace)
     protected = {name: before[name] for name in case.protected_files}
     command = [
@@ -273,11 +297,11 @@ def run_case(
         "--headless",
         "--no-stream",
         "--workspace",
-        str(workspace),
+        str(workspace.resolve()),
         "--max-steps",
         str(case.max_steps),
         "--log-file",
-        str(workspace / "agent.log"),
+        str((workspace / "agent.log").resolve()),
     ]
     if model:
         command.extend(("--model", model))
@@ -287,7 +311,7 @@ def run_case(
     agent_data: dict[str, Any] = {}
     errors: list[str] = []
     try:
-        agent = _run_process(command, cwd=workspace, timeout=agent_timeout)
+        agent = _run_process(command, cwd=workspace, timeout=agent_timeout, env=agent_env)
         agent_exit_code = agent.returncode
         agent_data = _parse_agent_json(agent.stdout)
         if not agent_data:
@@ -312,6 +336,7 @@ def run_case(
             verify_command,
             cwd=workspace,
             timeout=case.verification.timeout_seconds,
+            env=agent_env,
         )
         verifier_output = (verified.stdout + verified.stderr).strip()
         verifier_success = verified.returncode == 0

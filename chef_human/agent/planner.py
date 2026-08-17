@@ -72,6 +72,23 @@ class Plan:
 class Planner:
     """Generates and updates structured plans for the ReAct loop."""
 
+    _STEP_PREFIX_RE = re.compile(r"^step\s+\d+\s*[:.\-]\s*", re.IGNORECASE)
+    _ENV_SETUP_RE = re.compile(
+        r"\b(?:install|set up|setup|configure|create)\b.*\b(?:python|pip|dependency|dependencies|"
+        r"virtualenv|venv|environment|requirements)\b",
+        re.IGNORECASE,
+    )
+    _EDITOR_MECHANICS_RE = re.compile(
+        r"\b(?:open\b.*\b(?:editor|nano|vim|vi|emacs)\b|save and close|close the file|"
+        r"create an empty file|touch\s+[\w./-]+)\b",
+        re.IGNORECASE,
+    )
+    _TASK_SETUP_RE = re.compile(
+        r"\b(?:install|setup|set up|configure|bootstrap|venv|virtualenv|requirements|dependency|"
+        r"dependencies|python)\b",
+        re.IGNORECASE,
+    )
+
     def __init__(self, llm_backend: LLMBackend) -> None:
         self._llm = llm_backend
         # Set by ReActLoop so planning/verification LLM calls (which happen
@@ -118,17 +135,29 @@ class Planner:
             activity="planning",
         )
 
-        steps = self._parse_steps(response.message.content)
+        steps = self._normalize_steps(task, self._parse_steps(response.message.content))
         return Plan(goal=task, steps=steps)
 
     async def verify_step(
-        self, plan: Plan, step: PlanStep, evidence: str
+        self,
+        plan: Plan,
+        step: PlanStep,
+        evidence: str,
+        *,
+        recent_history: str = "",
+        finish_summary: str = "",
     ) -> tuple[StepVerdict, str]:
         """Check whether `step` was actually accomplished, based on the
         evidence (tool results or reasoning text) from the turn that
         appeared to finish it -- instead of assuming any non-failing turn
         means the current step is done."""
-        prompt = build_verify_prompt(goal=plan.goal, step=step.description, evidence=evidence)
+        prompt = build_verify_prompt(
+            goal=plan.goal,
+            step=step.description,
+            evidence=evidence,
+            recent_history=recent_history,
+            finish_summary=finish_summary,
+        )
         response = await self._complete(
             CompletionRequest(
                 messages=[Message(role=Role.user, content=prompt)],
@@ -177,7 +206,7 @@ class Planner:
             CompletionRequest(messages=messages, temperature=0.0, max_tokens=2048),
             activity="replanning",
         )
-        steps = self._parse_steps(response.message.content)
+        steps = self._normalize_steps(plan.goal, self._parse_steps(response.message.content))
 
         revised = Plan(goal=plan.goal)
         for s in plan.steps:
@@ -192,16 +221,44 @@ class Planner:
                 revised.steps.append(s)
         return revised
 
-    # The model routinely echoes "Step N:" back into a step's own
-    # description text (especially when revising a plan whose prompt shows
-    # steps formatted that way) -- strip it so a step doesn't end up
-    # doubly-numbered wherever its description is displayed, e.g.
-    # "Step 3 ('Step 3: Continue writing ...')".
-    _STEP_PREFIX_RE = re.compile(r"^step\s+\d+\s*[:.\-]\s*", re.IGNORECASE)
-
     @classmethod
     def _clean_description(cls, description: str) -> str:
         return cls._STEP_PREFIX_RE.sub("", description.strip())
+
+    @classmethod
+    def _normalize_steps(cls, task: str, steps: list[PlanStep]) -> list[PlanStep]:
+        """Remove low-value plan noise that traps smaller local models.
+
+        This is deliberately conservative: if normalization would erase every
+        step, the original cleaned plan is kept instead."""
+        allow_setup_steps = bool(cls._TASK_SETUP_RE.search(task))
+        normalized: list[PlanStep] = []
+        seen_descriptions: set[str] = set()
+
+        for step in steps:
+            description = cls._clean_description(step.description)
+            if not description:
+                continue
+            if not allow_setup_steps and cls._ENV_SETUP_RE.search(description):
+                continue
+            if cls._EDITOR_MECHANICS_RE.search(description):
+                continue
+            key = description.casefold()
+            if key in seen_descriptions:
+                continue
+            seen_descriptions.add(key)
+            normalized.append(
+                PlanStep(index=len(normalized) + 1, description=description)
+            )
+
+        if normalized:
+            return normalized
+
+        return [
+            PlanStep(index=i + 1, description=cls._clean_description(step.description))
+            for i, step in enumerate(steps)
+            if cls._clean_description(step.description)
+        ]
 
     def _parse_steps(self, content: str) -> list[PlanStep]:
         array_match = re.search(r"\[.*\]", content, re.DOTALL)

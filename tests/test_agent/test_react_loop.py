@@ -1526,6 +1526,50 @@ class TestStepVerification:
         assert plan.steps[0].status == StepStatus.completed
 
     @pytest.mark.asyncio
+    async def test_successful_bash_auto_completes_execution_step(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "bash", "arguments": {"command": "python hello.py"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(
+                index=1,
+                description="Run hello.py using Python and verify the output",
+                status=StepStatus.pending,
+            ),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        bash_tool = MagicMock()
+        bash_tool.name = "bash"
+        bash_tool.parameters = {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        }
+        bash_tool.run = AsyncMock(
+            return_value=MagicMock(output="Hello, world!\n", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"bash": bash_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, lint_after_write=False),
+        )
+        await loop.run("do something")
+
+        planner.verify_step.assert_not_awaited()
+        assert plan.steps[0].status == StepStatus.completed
+
+    @pytest.mark.asyncio
     async def test_no_pending_steps_skips_verification(self):
         backend = _make_mock_backend()
         backend.complete.return_value = CompletionResponse(
@@ -1710,7 +1754,14 @@ class TestObjectiveFileVerification:
         )
         await loop.run("do something")
 
-        planner.verify_step.assert_awaited_once()
+        planner.verify_step.assert_not_awaited()
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("still needs real execution evidence" in m for m in tool_msgs)
+        assert any("`bash`" in m for m in tool_msgs)
 
     @pytest.mark.asyncio
     async def test_objective_facts_included_in_evidence_for_llm_judge(self, tmp_path):
@@ -1873,7 +1924,89 @@ class TestInvestigativeStepBypassesVerification:
         )
         await loop.run("do something")
 
-        planner.verify_step.assert_awaited_once()
+        planner.verify_step.assert_not_awaited()
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("still needs real tool evidence" in m for m in tool_msgs)
+        assert any("`plan.md`" in m for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_execution_step_without_tool_evidence_demands_bash(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(role=Role.assistant, content="Let's run hello.py using Python."),
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(
+                index=1,
+                description="Run hello.py using Python and verify the output",
+                status=StepStatus.pending,
+            ),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        planner.verify_step.assert_not_awaited()
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("still needs real execution evidence" in m for m in tool_msgs)
+        assert any("`bash`" in m for m in tool_msgs)
+        assert any("`python hello.py`" in m for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_reasoning_only_direct_read_step_auto_reads_named_file(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(role=Role.assistant, content="I should inspect the file."),
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Read the contents of test_slugify.py", status=StepStatus.pending),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = AsyncMock(
+            return_value=MagicMock(output="file contents", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"read": read_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        read_tool.run.assert_awaited_once_with(path="test_slugify.py")
+        planner.verify_step.assert_not_awaited()
+        assert plan.steps[0].status == StepStatus.completed
 
     @pytest.mark.asyncio
     async def test_unrelated_successful_tool_call_does_not_auto_complete(self):
@@ -1923,11 +2056,13 @@ class TestInvestigativeStepBypassesVerification:
         )
         await loop.run("do something")
 
-        # The mock planner's verify_step defaults to "complete" -- the
-        # actual behavior under test is *that it got called at all*
-        # (proving real verification ran instead of the auto-complete
-        # bypass firing on an ask_user-only turn).
-        planner.verify_step.assert_awaited_once()
+        planner.verify_step.assert_not_awaited()
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("still needs real tool evidence" in m for m in tool_msgs)
 
 
 class TestAskUserVagueQuestionGuard:

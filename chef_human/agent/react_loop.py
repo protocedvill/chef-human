@@ -112,7 +112,11 @@ def _named_step_files(description: str) -> list[str]:
     return list(seen)
 
 
-def _file_facts(files_written_this_turn: dict[str, bool]) -> str:
+def _file_facts(
+    files_written: dict[str, bool],
+    *,
+    created_label: str = "newly_created_this_turn",
+) -> str:
     """One line per file touched this turn, checked directly against disk
     right now -- not inferred from a tool's success-message wording (which
     is what caused a step like "create a new file named X" to flip between
@@ -120,13 +124,13 @@ def _file_facts(files_written_this_turn: dict[str, bool]) -> str:
     `write` or `edit` that turn, even though the file's actual content on
     disk was correct either way)."""
     lines = []
-    for path_str, existed_before in files_written_this_turn.items():
+    for path_str, existed_before in files_written.items():
         p = Path(path_str)
         exists = p.exists()
         line_count = len(p.read_text(errors="replace").splitlines()) if exists else 0
         lines.append(
             f"- {p.name}: exists={exists}, lines={line_count}, "
-            f"newly_created_this_turn={exists and not existed_before}"
+            f"{created_label}={exists and not existed_before}"
         )
     return "\n".join(lines)
 
@@ -284,6 +288,36 @@ class AgentResult:
 
 
 @dataclass
+class StepEvidence:
+    # path -> whether the file already existed before the first successful
+    # write/edit recorded for this step
+    files_written: dict[str, bool] = None
+    successful_commands: list[str] = None
+
+    def __post_init__(self) -> None:
+        if self.files_written is None:
+            self.files_written = {}
+        if self.successful_commands is None:
+            self.successful_commands = []
+
+    def merge_turn(
+        self,
+        files_written_this_turn: dict[str, bool],
+        successful_commands_this_turn: list[str],
+    ) -> None:
+        for path_str, existed_before in files_written_this_turn.items():
+            previous = self.files_written.get(path_str)
+            # Preserve the earliest write fact: once a file was observed as
+            # newly created for this step, later rewrites should not erase it.
+            self.files_written[path_str] = (
+                existed_before if previous is None else previous and existed_before
+            )
+        for command in successful_commands_this_turn:
+            if command and command not in self.successful_commands:
+                self.successful_commands.append(command)
+
+
+@dataclass
 class ReActConfig:
     max_steps: int = 25
     max_retries_per_step: int = 3
@@ -331,6 +365,7 @@ class ReActLoop:
         self._planner.on_llm_end = self._ui.on_llm_end
         self._recent_verification_events: deque[str] = deque(maxlen=8)
         self._planning_facts: dict[str, bool] = {}
+        self._step_evidence: dict[str, StepEvidence] = {}
 
     def _record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
         self._total_prompt_tokens += prompt_tokens
@@ -354,6 +389,18 @@ class ReActLoop:
                 continue
             return True
         return False
+
+    @staticmethod
+    def _step_evidence_key(step: PlanStep) -> str:
+        return step.description.strip().casefold()
+
+    def _step_evidence_for(self, step: PlanStep) -> StepEvidence:
+        key = self._step_evidence_key(step)
+        evidence = self._step_evidence.get(key)
+        if evidence is None:
+            evidence = StepEvidence()
+            self._step_evidence[key] = evidence
+        return evidence
 
     async def run(self, task: str) -> AgentResult:
         logger.info("Task started: %s", task[:200])
@@ -1255,6 +1302,10 @@ class ReActLoop:
         step.status = StepStatus.in_progress
         files_written_this_turn = files_written_this_turn or {}
         successful_commands_this_turn = successful_commands_this_turn or []
+        step_evidence = self._step_evidence_for(step)
+        step_evidence.merge_turn(files_written_this_turn, successful_commands_this_turn)
+        accumulated_files_written = step_evidence.files_written
+        accumulated_commands = step_evidence.successful_commands
 
         if has_tool_evidence and _looks_investigative(step.description):
             # Read/identify/check-style steps have no artifact beyond "the
@@ -1314,7 +1365,7 @@ class ReActLoop:
                     return None
 
         mutation_targets = _looks_like_file_mutation_step(step.description)
-        if mutation_targets and not files_written_this_turn:
+        if mutation_targets and not accumulated_files_written:
             step.status = StepStatus.pending
             return _file_mutation_step_feedback(step, mutation_targets)
 
@@ -1331,11 +1382,28 @@ class ReActLoop:
             step.status = StepStatus.pending
             return _execution_step_feedback(step)
 
-        facts = _file_facts(files_written_this_turn)
-        if facts:
-            evidence = (
-                "Objective facts (checked directly against disk, not from "
-                f"tool output text):\n{facts}\n\nEvidence from this turn:\n{evidence}"
+        evidence_sections: list[str] = []
+        accumulated_facts = _file_facts(
+            accumulated_files_written,
+            created_label="created_during_step",
+        )
+        if accumulated_facts:
+            evidence_sections.append(
+                "Objective facts (checked directly against disk, accumulated across "
+                f"turns for this step):\n{accumulated_facts}"
+            )
+        if accumulated_commands:
+            commands_text = "\n".join(f"- {command}" for command in accumulated_commands)
+            evidence_sections.append(
+                "Successful commands accumulated for this step:\n"
+                f"{commands_text}"
+            )
+        if evidence_sections:
+            evidence = "\n\n".join(
+                [
+                    *evidence_sections,
+                    f"Immediate evidence from this turn:\n{evidence}",
+                ]
             )
 
         try:

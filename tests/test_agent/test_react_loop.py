@@ -1737,6 +1737,51 @@ class TestObjectiveFileVerification:
         planner.verify_step.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_mutation_step_reuses_prior_turn_write_evidence(self, tmp_path):
+        planner = _make_mock_planner()
+        planner.verify_step = AsyncMock(side_effect=[
+            (StepVerdict.partial, "tests have not been run yet"),
+            (StepVerdict.complete, "implementation verified"),
+        ])
+        plan = Plan(goal="g", steps=[
+            PlanStep(
+                index=1,
+                description="Implement the slugify function in slugify.py according to the specifications.",
+                status=StepStatus.pending,
+            ),
+        ])
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+        slugify_path = str(tmp_path / "slugify.py")
+        (tmp_path / "slugify.py").write_text("def slugify(value):\n    return value\n")
+
+        first_feedback = await loop._verify_and_mark_step(
+            plan,
+            evidence="Wrote slugify.py",
+            files_written_this_turn={slugify_path: False},
+        )
+        second_feedback = await loop._verify_and_mark_step(
+            plan,
+            evidence="....\nOK",
+            successful_commands_this_turn=["python test_slugify.py"],
+        )
+
+        assert first_feedback is not None
+        assert second_feedback is None
+        assert plan.steps[0].status == StepStatus.completed
+        assert planner.verify_step.await_count == 2
+        second_evidence = planner.verify_step.await_args_list[1].args[2]
+        assert "slugify.py: exists=True" in second_evidence
+        assert "created_during_step=True" in second_evidence
+        assert "python test_slugify.py" in second_evidence
+
+    @pytest.mark.asyncio
     async def test_bypass_does_not_fire_for_a_different_file(self, tmp_path):
         """The step names hello_world.py, but the file actually touched
         this turn is something else -- must not auto-complete."""
@@ -1879,7 +1924,7 @@ class TestObjectiveFileVerification:
         planner.verify_step.assert_awaited_once()
         _, _, evidence_arg = planner.verify_step.await_args.args
         assert "Objective facts" in evidence_arg
-        assert "hello_world.py: exists=True, lines=2, newly_created_this_turn=True" in evidence_arg
+        assert "hello_world.py: exists=True, lines=2, created_during_step=True" in evidence_arg
 
 
 class TestInvestigativeStepBypassesVerification:

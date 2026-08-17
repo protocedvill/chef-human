@@ -242,6 +242,66 @@ class TestNormalizeSteps:
             "Write the required content to hello.py",
         ]
 
+    def test_resolves_conditional_create_for_missing_file(self):
+        steps = [
+            PlanStep(index=1, description="Create slugify.py if it does not exist"),
+            PlanStep(index=2, description="Implement slugify.py"),
+        ]
+        normalized = Planner._normalize_steps(
+            "Implement slugify.py without modifying tests",
+            steps,
+            planning_facts={"slugify.py": False},
+        )
+
+        assert [step.description for step in normalized] == [
+            "Create slugify.py",
+            "Implement slugify.py",
+        ]
+
+    def test_drops_conditional_create_and_optional_explore_for_existing_or_missing_fact(self):
+        steps = [
+            PlanStep(index=1, description="Create slugify.py if it does not exist"),
+            PlanStep(index=2, description="Explore the existing code in slugify.py to understand its current state (if any)"),
+            PlanStep(index=3, description="Implement slugify.py"),
+        ]
+        normalized = Planner._normalize_steps(
+            "Implement slugify.py without modifying tests",
+            steps,
+            planning_facts={"slugify.py": True},
+        )
+
+        assert [step.description for step in normalized] == [
+            "Explore the existing code in slugify.py to understand its current state (if any)",
+            "Implement slugify.py",
+        ]
+
+        normalized_missing = Planner._normalize_steps(
+            "Implement slugify.py without modifying tests",
+            steps,
+            planning_facts={"slugify.py": False},
+        )
+
+        assert [step.description for step in normalized_missing] == [
+            "Create slugify.py",
+            "Implement slugify.py",
+        ]
+
+    def test_drops_write_tests_when_task_forbids_modifying_tests(self):
+        steps = [
+            PlanStep(index=1, description="Implement slugify.py"),
+            PlanStep(index=2, description="Write unit tests for slugify in test_slugify.py"),
+            PlanStep(index=3, description="Run the tests"),
+        ]
+        normalized = Planner._normalize_steps(
+            "Implement slugify.py. Do not modify the specification or tests.",
+            steps,
+        )
+
+        assert [step.description for step in normalized] == [
+            "Implement slugify.py",
+            "Run the tests",
+        ]
+
 
 class TestFormatPlanForPrompt:
     def test_empty_plan(self):
@@ -344,6 +404,28 @@ class TestGeneratePlan:
         messages = request.messages
         assert len(messages) == 3  # system + repo + user
         assert "src/" in messages[1].content
+
+    @pytest.mark.asyncio
+    async def test_planning_facts_influence_normalization(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='["Create slugify.py if it does not exist", "Implement slugify.py"]',
+            ),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = await planner.generate_plan(
+            "Implement slugify.py without modifying tests",
+            planning_facts={"slugify.py": False},
+        )
+
+        assert [step.description for step in plan.steps] == [
+            "Create slugify.py",
+            "Implement slugify.py",
+        ]
 
 
 class TestUpdatePlan:
@@ -458,6 +540,13 @@ class TestParseVerdict:
         verdict, _ = Planner._parse_verdict("VERDICT: NOT COMPLETE\nREASON: no evidence")
         assert verdict == StepVerdict.not_complete
 
+    def test_bare_verdict_with_prose_reason(self):
+        verdict, reason = Planner._parse_verdict(
+            "NOT_COMPLETE\n\nThe evidence shows that slugify.py was created but not implemented."
+        )
+        assert verdict == StepVerdict.not_complete
+        assert reason == "The evidence shows that slugify.py was created but not implemented."
+
     def test_case_insensitive(self):
         verdict, _ = Planner._parse_verdict("verdict: complete\nreason: done")
         assert verdict == StepVerdict.complete
@@ -509,6 +598,75 @@ class TestVerifyStep:
         assert "Add a function" in prompt
         assert "Write the function" in prompt
         assert "created empty utils.py" in prompt
+
+    @pytest.mark.asyncio
+    async def test_repairs_invalid_verifier_response(self):
+        mock_complete = AsyncMock(side_effect=[
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="I think the file was probably created.",
+                ),
+            ),
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="VERDICT: COMPLETE\nREASON: evidence shows it",
+                ),
+            ),
+        ])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = Plan(goal="Add a function", steps=[])
+        step = PlanStep(index=1, description="Write the function")
+
+        verdict, reason = await planner.verify_step(plan, step, "created empty utils.py")
+
+        assert verdict == StepVerdict.complete
+        assert reason == "evidence shows it"
+        assert mock_complete.await_count == 2
+        repair_request = mock_complete.await_args_list[1].args[0]
+        assert "did not follow the required format" in repair_request.messages[0].content
+        assert "I think the file was probably created." in repair_request.messages[0].content
+
+    @pytest.mark.asyncio
+    async def test_logs_raw_response_when_verdict_cannot_be_repaired(self, caplog):
+        mock_complete = AsyncMock(side_effect=[
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="I think the file was probably created.",
+                ),
+            ),
+            CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="Still looks complete to me.",
+                ),
+            ),
+        ])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = Plan(goal="Add a function", steps=[])
+        step = PlanStep(index=1, description="Write the function")
+
+        with caplog.at_level("DEBUG", logger="chef_human.agent.planner"):
+            verdict, reason = await planner.verify_step(plan, step, "created empty utils.py")
+
+        assert verdict == StepVerdict.not_complete
+        assert reason == "Could not parse verifier response"
+        assert any(
+            "Raw verifier response could not be parsed" in record.message
+            for record in caplog.records
+        )
+        assert any(
+            "Verifier repair response could not be parsed" in record.message
+            for record in caplog.records
+        )
 
 
 class TestUsageCallback:

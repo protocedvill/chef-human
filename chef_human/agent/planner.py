@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -14,6 +15,17 @@ from chef_human.llm.backend import (
     Message,
     Role,
 )
+
+logger = logging.getLogger(__name__)
+
+_VERIFIER_REPAIR_PROMPT = """Your previous response did not follow the required format.
+
+Previous invalid response:
+{invalid_response}
+
+Re-emit the same judgment using exactly two lines and nothing else:
+VERDICT: COMPLETE, PARTIAL, or NOT_COMPLETE
+REASON: <one short sentence>"""
 
 
 class StepStatus(str, Enum):
@@ -73,6 +85,7 @@ class Planner:
     """Generates and updates structured plans for the ReAct loop."""
 
     _STEP_PREFIX_RE = re.compile(r"^step\s+\d+\s*[:.\-]\s*", re.IGNORECASE)
+    _FILE_TARGET_RE = re.compile(r"[`'\"]?([\w\-./]+\.\w{1,10})[`'\"]?")
     _ENV_SETUP_RE = re.compile(
         r"\b(?:install|set up|setup|configure|create)\b.*\b(?:python|pip|dependency|dependencies|"
         r"virtualenv|venv|environment|requirements)\b",
@@ -86,6 +99,22 @@ class Planner:
     _TASK_SETUP_RE = re.compile(
         r"\b(?:install|setup|set up|configure|bootstrap|venv|virtualenv|requirements|dependency|"
         r"dependencies|python)\b",
+        re.IGNORECASE,
+    )
+    _CONDITIONAL_CREATE_RE = re.compile(
+        r"^\s*(create|write|add|generate)\b.+\bif it does not exist\b",
+        re.IGNORECASE,
+    )
+    _OPTIONAL_EXPLORE_RE = re.compile(
+        r"^\s*(?:explore|inspect|read|check)\b.+\bif any\b",
+        re.IGNORECASE,
+    )
+    _DO_NOT_MODIFY_TESTS_RE = re.compile(
+        r"\bdo not modify\b.+\btests?\b|\bdo not modify the specification or tests\b",
+        re.IGNORECASE,
+    )
+    _WRITE_TESTS_RE = re.compile(
+        r"\b(?:write|add|create|update|modify)\b.+\btests?\b",
         re.IGNORECASE,
     )
 
@@ -120,7 +149,12 @@ class Planner:
             )
         return response
 
-    async def generate_plan(self, task: str, repo_context: str = "") -> Plan:
+    async def generate_plan(
+        self,
+        task: str,
+        repo_context: str = "",
+        planning_facts: dict[str, bool] | None = None,
+    ) -> Plan:
         messages = [
             Message(role=Role.system, content=PLANNER_SYSTEM_PROMPT),
         ]
@@ -135,7 +169,11 @@ class Planner:
             activity="planning",
         )
 
-        steps = self._normalize_steps(task, self._parse_steps(response.message.content))
+        steps = self._normalize_steps(
+            task,
+            self._parse_steps(response.message.content),
+            planning_facts=planning_facts,
+        )
         return Plan(goal=task, steps=steps)
 
     async def verify_step(
@@ -166,7 +204,35 @@ class Planner:
             ),
             activity="verifying step",
         )
-        return self._parse_verdict(response.message.content)
+        verdict, reason = self._parse_verdict(response.message.content)
+        if reason != "Could not parse verifier response":
+            return verdict, reason
+
+        logger.debug(
+            "Raw verifier response could not be parsed: %r",
+            response.message.content,
+        )
+        repair_prompt = _VERIFIER_REPAIR_PROMPT.format(
+            invalid_response=response.message.content.strip()
+            or "(empty response)",
+        )
+        repaired = await self._complete(
+            CompletionRequest(
+                messages=[Message(role=Role.user, content=repair_prompt)],
+                temperature=0.0,
+                max_tokens=100,
+            ),
+            activity="repairing verifier response",
+        )
+        repaired_verdict, repaired_reason = self._parse_verdict(
+            repaired.message.content
+        )
+        if repaired_reason == "Could not parse verifier response":
+            logger.debug(
+                "Verifier repair response could not be parsed: %r",
+                repaired.message.content,
+            )
+        return repaired_verdict, repaired_reason
 
     @staticmethod
     def _parse_verdict(content: str) -> tuple[StepVerdict, str]:
@@ -179,6 +245,14 @@ class Planner:
             re.IGNORECASE | re.MULTILINE,
         )
         verdict_text = verdict_match.group(1).upper() if verdict_match else ""
+        if not verdict_text:
+            bare_lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if bare_lines:
+                first_line = bare_lines[0].upper()
+                if first_line in {"NOT_COMPLETE", "NOT COMPLETE", "PARTIAL", "COMPLETE"}:
+                    verdict_text = first_line
+                    if not reason and len(bare_lines) > 1:
+                        reason = " ".join(bare_lines[1:]).strip()
         if verdict_text in {"NOT_COMPLETE", "NOT COMPLETE"}:
             return StepVerdict.not_complete, reason
         if verdict_text == "PARTIAL":
@@ -226,12 +300,22 @@ class Planner:
         return cls._STEP_PREFIX_RE.sub("", description.strip())
 
     @classmethod
-    def _normalize_steps(cls, task: str, steps: list[PlanStep]) -> list[PlanStep]:
+    def _normalize_steps(
+        cls,
+        task: str,
+        steps: list[PlanStep],
+        *,
+        planning_facts: dict[str, bool] | None = None,
+    ) -> list[PlanStep]:
         """Remove low-value plan noise that traps smaller local models.
 
         This is deliberately conservative: if normalization would erase every
         step, the original cleaned plan is kept instead."""
         allow_setup_steps = bool(cls._TASK_SETUP_RE.search(task))
+        protected_tests = bool(cls._DO_NOT_MODIFY_TESTS_RE.search(task))
+        planning_facts = {
+            path.casefold(): exists for path, exists in (planning_facts or {}).items()
+        }
         normalized: list[PlanStep] = []
         seen_descriptions: set[str] = set()
 
@@ -242,6 +326,12 @@ class Planner:
             if not allow_setup_steps and cls._ENV_SETUP_RE.search(description):
                 continue
             if cls._EDITOR_MECHANICS_RE.search(description):
+                continue
+            if protected_tests and cls._WRITE_TESTS_RE.search(description):
+                continue
+
+            description = cls._resolve_conditional_step(description, planning_facts)
+            if not description:
                 continue
             key = description.casefold()
             if key in seen_descriptions:
@@ -259,6 +349,39 @@ class Planner:
             for i, step in enumerate(steps)
             if cls._clean_description(step.description)
         ]
+
+    @classmethod
+    def _resolve_conditional_step(
+        cls,
+        description: str,
+        planning_facts: dict[str, bool],
+    ) -> str:
+        if not planning_facts:
+            return description
+
+        file_targets = [m.group(1) for m in cls._FILE_TARGET_RE.finditer(description)]
+        if not file_targets:
+            return description
+
+        target = file_targets[0]
+        exists = planning_facts.get(target.casefold())
+        if exists is None:
+            return description
+
+        if cls._CONDITIONAL_CREATE_RE.search(description):
+            if exists:
+                return ""
+            return re.sub(
+                r"\s+if it does not exist\b",
+                "",
+                description,
+                flags=re.IGNORECASE,
+            ).strip()
+
+        if cls._OPTIONAL_EXPLORE_RE.search(description) and not exists:
+            return ""
+
+        return description
 
     def _parse_steps(self, content: str) -> list[PlanStep]:
         array_match = re.search(r"\[.*\]", content, re.DOTALL)

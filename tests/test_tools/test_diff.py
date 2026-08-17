@@ -212,3 +212,36 @@ class TestDiffStore:
         store.record("a.py", "d1", "edit")
         assert store.pop_last("missing.py") is None
         assert len(store.get_all()) == 1
+
+    def test_record_transaction_copies_filechange_not_aliases(self):
+        # Mutating the caller's FileChange objects after the call must not
+        # affect what's already recorded -- record_transaction must copy,
+        # not store the caller's instances by reference.
+        from chef_human.tools.diff import FileChange
+
+        change = FileChange("a.py", "old", "new")
+        store = DiffStore()
+        store.record_transaction([change], "write")
+
+        change.old_content = "MUTATED"
+        change.new_content = "MUTATED"
+
+        recorded = store.get_all()[0].changes[0]
+        assert recorded.old_content == "old"
+        assert recorded.new_content == "new"
+
+    def test_record_clears_redo_stack(self):
+        from chef_human.tools.diff import RedoEntry
+
+        store = DiffStore()
+        store.push_redo(RedoEntry("a.py", "old", "new", "edit"))
+        store.record("b.py", "d1", "write")
+        assert store.pop_redo() is None
+
+    def test_record_transaction_clears_redo_stack(self):
+        from chef_human.tools.diff import FileChange, RedoEntry
+
+        store = DiffStore()
+        store.push_redo(RedoEntry("a.py", "old", "new", "edit"))
+        store.record_transaction([FileChange("b.py", "x", "y")], "write")
+        assert store.pop_redo() is None

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from chef_human.tools.diff import FileChange, compute_diff, find_closest_match
@@ -108,9 +110,8 @@ class WriteTool:
             except Exception:
                 old_content = None
 
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-
         try:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
             resolved.write_text(content, encoding="utf-8")
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
@@ -176,8 +177,8 @@ class EditTool:
             # ask_user round-trip) to notice and retry with `write` instead.
             if not self._workspace.is_within_workspace(resolved):
                 return ToolResult(success=False, error=f"Outside workspace: {path}")
-            resolved.parent.mkdir(parents=True, exist_ok=True)
             try:
+                resolved.parent.mkdir(parents=True, exist_ok=True)
                 resolved.write_text(new_string, encoding="utf-8")
             except Exception as exc:
                 return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
@@ -315,6 +316,21 @@ class GrepTool:
         "required": ["pattern"],
     }
 
+    # Wall-clock cap on the whole search. re.search on a pathological pattern
+    # (e.g. "(a+)+b") can backtrack catastrophically; asyncio.wait_for can't
+    # preempt that mid-search since it's synchronous CPU work, so the search
+    # runs in a worker thread instead. That thread can't actually be killed
+    # if it's genuinely stuck (Python has no safe way to do that) -- this
+    # timeout only stops the *event loop* from being blocked, so other
+    # concurrently dispatched tool calls can still proceed. MAX_LINE_LENGTH
+    # is what actually bounds the worst case to something fast: catastrophic
+    # backtracking's cost is roughly exponential in input length, so capping
+    # the length capped bounds it to genuinely fast rather than merely
+    # finite-in-principle. This is defense-in-depth, not a hardened sandbox
+    # (matches BashTool's stated "guardrails, not process isolation").
+    SEARCH_TIMEOUT = 10.0
+    MAX_LINE_LENGTH = 2000
+
     def __init__(self, workspace: WorkspaceManager) -> None:
         self._workspace = workspace
 
@@ -332,34 +348,72 @@ class GrepTool:
         except re.error as exc:
             return ToolResult(success=False, error=f"Invalid regex: {exc}")
 
-        matches: list[str] = []
         try:
-            for entry in base.rglob("*"):
-                if not entry.is_file():
+            matches, permission_denied = await asyncio.wait_for(
+                asyncio.to_thread(self._search, base, compiled, include),
+                timeout=self.SEARCH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return ToolResult(
+                success=False,
+                error=f"Search timed out after {self.SEARCH_TIMEOUT}s -- pattern may be "
+                "pathologically slow (catastrophic backtracking); try a simpler regex",
+            )
+
+        if not matches:
+            if permission_denied:
+                return ToolResult(
+                    success=False, error=f"Permission denied while searching {path or str(base)}"
+                )
+            return ToolResult(output="No matches found")
+
+        output = "\n".join(matches[:100])
+        if len(matches) > 100:
+            output += f"\n... and {len(matches) - 100} more matches"
+        if permission_denied:
+            output += "\n(warning: search stopped early -- permission denied on a subdirectory)"
+
+        return ToolResult(output=output)
+
+    def _search(
+        self, base: Path, compiled: re.Pattern[str], include: str | None
+    ) -> tuple[list[str], bool]:
+        matches: list[str] = []
+        permission_denied = False
+
+        def on_error(_exc: OSError) -> None:
+            # rglob() silently swallows PermissionError from an inaccessible
+            # subdirectory during traversal (verified: it never reaches an
+            # except clause around rglob() at all) -- Path.walk()'s on_error
+            # callback is the one hook that actually surfaces this, so the
+            # gap can be reported instead of the search just going quiet.
+            nonlocal permission_denied
+            permission_denied = True
+
+        # follow_symlinks=False (the default) means a symlinked directory
+        # inside the workspace pointing outside it is never descended into
+        # at all, unlike rglob(). A symlinked *file* still appears in
+        # filenames though, so is_within_workspace is still checked below.
+        for dirpath, _dirnames, filenames in base.walk(on_error=on_error):
+            for name in filenames:
+                entry = dirpath / name
+                if not self._workspace.is_within_workspace(entry):
                     continue
-                if include and not fnmatch.fnmatch(entry.name, include):
+                if include and not fnmatch.fnmatch(name, include):
                     continue
                 if self._workspace.is_ignored(entry):
                     continue
 
                 try:
                     for line_num, line in enumerate(entry.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+                        if len(line) > self.MAX_LINE_LENGTH:
+                            continue
                         if compiled.search(line):
                             rel = entry.relative_to(self._workspace.root)
                             matches.append(f"{rel}:{line_num}: {line.rstrip()}")
                 except Exception:
                     continue
-        except PermissionError:
-            pass
-
-        if not matches:
-            return ToolResult(output="No matches found")
-
-        output = "\n".join(matches[:100])
-        if len(matches) > 100:
-            output += f"\n... and {len(matches) - 100} more matches"
-
-        return ToolResult(output=output)
+        return matches, permission_denied
 
 
 class GlobTool:
@@ -388,9 +442,15 @@ class GlobTool:
 
         results: list[str] = []
         for entry in sorted(base.rglob(pattern)):
-            if entry.is_file() and not self._workspace.is_ignored(entry):
-                rel = entry.relative_to(self._workspace.root)
-                results.append(str(rel))
+            if not entry.is_file() or self._workspace.is_ignored(entry):
+                continue
+            # rglob follows symlinks; a symlink inside the workspace can
+            # point outside it, so re-check every matched entry rather than
+            # trusting the one check on `base`.
+            if not self._workspace.is_within_workspace(entry):
+                continue
+            rel = entry.relative_to(self._workspace.root)
+            results.append(str(rel))
 
         if not results:
             return ToolResult(output="No files matched")

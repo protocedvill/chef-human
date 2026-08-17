@@ -108,6 +108,24 @@ class TestRefactorTool:
         result = await tool.run(old_name="Circle", new_name="")
         assert not result.success
 
+    async def test_warns_when_new_name_already_exists(self, tool: RefactorTool, caplog):
+        import logging
+
+        # "Square" is already a real symbol in the fixture index -- renaming
+        # Circle to it should warn about the naming conflict.
+        with caplog.at_level(logging.WARNING, logger="chef_human.tools.refactor"):
+            await tool.run(old_name="Circle", new_name="Square", scope="file", path="shapes.py")
+
+        assert "already exists in index" in caplog.text
+
+    async def test_no_warning_when_new_name_is_unused(self, tool: RefactorTool, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="chef_human.tools.refactor"):
+            await tool.run(old_name="Circle", new_name="Ellipse", scope="file", path="shapes.py")
+
+        assert "already exists in index" not in caplog.text
+
     async def test_diff_store_receives_entries(self, tool: RefactorTool, diff_store: DiffStore, tmp_path: Path):
         result = await tool.run(old_name="Circle", new_name="Ellipse", scope="all")
         assert result.success

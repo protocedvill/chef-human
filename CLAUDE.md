@@ -89,11 +89,15 @@ registry, LLM backend, and planner into a `ReActLoop`.
 ### The agent loop (`chef_human/agent/react_loop.py`)
 
 `ReActLoop.run()` is the core loop: assemble context → call the LLM → parse tool calls
-(`chef_human/agent/parser.py`) → dispatch non-`finish` tool calls concurrently via `asyncio.gather` (each
+(`chef_human/agent/parser.py`) → dispatch non-`finish` tool calls one at a time, in model order (each
 wrapped in `asyncio.wait_for(..., timeout=config.tool_timeout)`) → run `finish` serially/terminally →
 feed results back into context → let `RetryManager` (`chef_human/agent/retry.py`) decide whether to
-retry the step, replan (`Planner`, `chef_human/agent/planner.py`), or escalate/complete. Concurrent tool
-calls dispatched together share no per-file locking, so parallel writes to the same file can race.
+retry the step, replan (`Planner`, `chef_human/agent/planner.py`), or escalate/complete. Dispatch within
+one response batch is deliberately serialized (not `asyncio.gather`) specifically so two mutating calls
+in the same turn can't race on the same path — see the comment above the dispatch loop. The tool classes
+themselves still have no per-file locking of their own, though, so that safety only holds as long as
+every caller goes through this loop; a caller that invoked tools directly and concurrently (nothing in
+`agent/*.py` does today) would not be protected.
 
 Post-write, if `lint_after_write` is set, `run_lint` (`chef_human/agent/linter.py`) lints the touched file;
 lint errors trigger a rollback of that write (`_rollback_file`) using content captured before dispatch
@@ -140,13 +144,17 @@ another narrow evidence-acceptance patch.
 Each tool is a plain class with `name`, `description`, `parameters` (JSON schema) and an async `run()`,
 registered into a `ToolRegistry` (`registry.py`) by `create_tool_registry()` (`tools/__init__.py`).
 File-mutating tools (`write`, `edit`, `patch`, `refactor`, `lint_fix`) share a single `DiffStore`
-(`diff.py`) instance so `undo`/`redo` can reverse the most recent recorded diff. Note: `EditTool` does not
-currently pass `old_content`/`new_content` into `diff_store.record()` the way `WriteTool` does, so `undo`
-after an `edit()` treats the file as newly-created rather than restoring prior content — check this before
-relying on undo/edit interaction.
+(`diff.py`) instance so `undo`/`redo` can reverse the most recent recorded diff. `EditTool` does pass
+`old_content`/`new_content` into `diff_store.record()`, same as `WriteTool` — this was previously broken
+(fixed in `c858b14`) but the two paths still duplicate similar entry-building logic rather than sharing
+one; `DiffStore.record()` now delegates to `record_transaction()` internally for that reason, though the
+two public methods keep distinct "should I record at all" conditions (`record` trusts its caller-supplied
+`diff` string; `record_transaction` compares `old_content`/`new_content` itself, since it has no
+separately-supplied diff to trust instead).
 
-`refactor_symbol` renames across multiple files but records one `DiffStore` entry per file, so a single
-`undo` call only reverts the last file touched, not the whole rename.
+`refactor_symbol` renames across multiple files but records them as a single `DiffStore` transaction (one
+`record_transaction()` call with every changed file's `FileChange`), so a single `undo` call reverts the
+whole rename atomically, not just the last file touched.
 
 `EditTool`'s wording for its result matters more than it looks like it should: the step verifier LLM
 reads tool output text as evidence, so ambiguous phrasing directly causes false step-completion

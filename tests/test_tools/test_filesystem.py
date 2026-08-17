@@ -152,6 +152,15 @@ class TestWriteTool:
         assert result.success
         assert "```diff" not in result.output
 
+    async def test_mkdir_failure_returns_error_not_exception(self, write_tool, tmp_path):
+        # A file where a parent directory needs to be creates makes mkdir()
+        # raise FileExistsError/NotADirectoryError -- must come back as a
+        # ToolResult, not propagate out of run().
+        create_file(tmp_path, "not_a_dir", "im a file")
+        result = await write_tool.run(path="not_a_dir/child.txt", content="x")
+        assert not result.success
+        assert "Cannot write" in result.error
+
 
 # ---------------------------------------------------------------------------
 # EditTool
@@ -185,6 +194,14 @@ class TestEditTool:
         result = await edit_tool.run(path="new.txt", old_string="", new_string="hello")
         assert result.success
         assert (tmp_path / "new.txt").read_text() == "hello"
+
+    async def test_missing_file_create_mkdir_failure_returns_error(self, edit_tool, tmp_path):
+        create_file(tmp_path, "not_a_dir", "im a file")
+        result = await edit_tool.run(
+            path="not_a_dir/child.txt", old_string="", new_string="x"
+        )
+        assert not result.success
+        assert "Cannot write" in result.error
 
     async def test_existing_file_empty_old_string_replaces_whole_content(self, edit_tool, tmp_path):
         # str.replace("", x) inserts x between every character instead of
@@ -393,12 +410,79 @@ class TestGrepTool:
         assert not result.success
         assert "not found" in result.error
 
+    async def test_does_not_follow_symlink_outside_workspace(self, grep_tool, tmp_path, tmp_path_factory):
+        outside = tmp_path_factory.mktemp("outside")
+        secret = outside / "secret.txt"
+        secret.write_text("top secret token")
+        (tmp_path / "escape").symlink_to(outside, target_is_directory=True)
+
+        result = await grep_tool.run(pattern="secret")
+        assert result.success
+        assert "top secret" not in result.output
+        assert "secret.txt" not in result.output
+
+    async def test_search_timeout_is_surfaced(self, grep_tool, monkeypatch):
+        # Exercises the wait_for/timeout wiring via a mocked slow _search --
+        # deliberately not a real catastrophic-backtracking pattern, since a
+        # genuinely stuck worker thread cannot be killed and would hang the
+        # test process at teardown (confirmed by hand: this is not
+        # theoretical -- it hung a real pytest run during development).
+        import time
+
+        monkeypatch.setattr(type(grep_tool), "SEARCH_TIMEOUT", 0.05)
+        monkeypatch.setattr(
+            grep_tool, "_search", lambda base, compiled, include: (time.sleep(1), ([], False))[1]
+        )
+
+        result = await grep_tool.run(pattern="anything")
+
+        assert not result.success
+        assert "timed out" in result.error
+
+    async def test_oversized_line_is_skipped_not_searched(self, grep_tool, tmp_path):
+        # MAX_LINE_LENGTH is the real bound on catastrophic-backtracking
+        # cost -- verify it actually skips long lines rather than being
+        # decorative.
+        grep_tool.MAX_LINE_LENGTH = 20
+        create_file(tmp_path, "a.py", "findme " + "x" * 100 + "\nshort findme line\n")
+
+        result = await grep_tool.run(pattern="findme")
+
+        assert result.success
+        assert "short findme line" in result.output
+        assert "x" * 100 not in result.output
+
+    async def test_permission_denied_surfaced_not_silent(self, grep_tool, tmp_path):
+        create_file(tmp_path, "visible.py", "def findme(): pass")
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        (locked / "hidden.py").write_text("def findme(): pass")
+        locked.chmod(0o000)
+        try:
+            result = await grep_tool.run(pattern="findme")
+        finally:
+            locked.chmod(0o755)  # so pytest can clean up tmp_path afterward
+
+        # Matches found before hitting the inaccessible directory are kept,
+        # but the permission gap must not be silently invisible.
+        assert "visible.py" in result.output
+        assert "permission denied" in result.output.lower()
+
 
 # ---------------------------------------------------------------------------
 # GlobTool
 # ---------------------------------------------------------------------------
 
 class TestGlobTool:
+    async def test_does_not_follow_symlink_outside_workspace(self, glob_tool, tmp_path, tmp_path_factory):
+        outside = tmp_path_factory.mktemp("outside")
+        (outside / "secret.py").write_text("")
+        (tmp_path / "escape").symlink_to(outside, target_is_directory=True)
+
+        result = await glob_tool.run(pattern="**/*.py")
+        assert result.success
+        assert "secret.py" not in result.output
+
     async def test_matches_pattern(self, glob_tool, tmp_path):
         create_file(tmp_path, "a.py", "")
         create_file(tmp_path, "b.py", "")

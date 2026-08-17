@@ -142,9 +142,14 @@ class DiffStore:
         old_content: str | None = None,
         new_content: str | None = None,
     ) -> None:
+        """Record a single-file change. Whether to record at all is decided
+        by `diff` being non-empty -- old_content/new_content are optional
+        metadata here, not the record/skip signal (unlike record_transaction,
+        where comparing old/new content *is* the signal, since it has no
+        separately-supplied diff string to trust instead)."""
         if not diff:
             return
-        self._entries.append(
+        self._append_entry(
             DiffEntry(
                 path=path,
                 diff=diff,
@@ -154,7 +159,6 @@ class DiffStore:
                 tool_name=tool_name,
             )
         )
-        self._redo_stack.clear()
 
     def record_transaction(
         self,
@@ -163,7 +167,15 @@ class DiffStore:
         *,
         label: str | None = None,
     ) -> None:
-        effective = [change for change in changes if change.old_content != change.new_content]
+        # Copy rather than reuse the caller's FileChange instances -- they're
+        # a mutable dataclass, and storing the caller's own objects by
+        # reference would let a later mutation on the caller's side silently
+        # corrupt already-recorded history.
+        effective = [
+            FileChange(change.path, change.old_content, change.new_content)
+            for change in changes
+            if change.old_content != change.new_content
+        ]
         if not effective:
             return
         diffs = [
@@ -179,7 +191,7 @@ class DiffStore:
             if len(effective) == 1
             else f"transaction:{tool_name}:{len(effective)}-files"
         )
-        self._entries.append(
+        self._append_entry(
             DiffEntry(
                 path=path,
                 diff="\n".join(diff for diff in diffs if diff),
@@ -190,6 +202,9 @@ class DiffStore:
                 changes=tuple(effective),
             )
         )
+
+    def _append_entry(self, entry: DiffEntry) -> None:
+        self._entries.append(entry)
         self._redo_stack.clear()
 
     def get_all(self, path: str | None = None) -> list[DiffEntry]:

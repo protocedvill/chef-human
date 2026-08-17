@@ -1670,11 +1670,26 @@ class ReActLoop:
                 # All named files were read and this turn produced real tool
                 # evidence: validate via the verifier instead of auto-completing.
                 investigative_needs_verifier = True
-            elif has_tool_evidence:
+            elif has_tool_evidence or (
+                _looks_like_execution_step(step.description)
+                and successful_commands_this_turn
+            ):
                 # Generic read/identify/check-style step (no specific files
                 # named) has no artifact beyond "the tool ran and returned
                 # real output" -- that's sufficient evidence; skip the extra
-                # (failure-prone) LLM judgment call.
+                # (failure-prone) LLM judgment call. A description like "run
+                # the tests to identify which one is failing" matches both
+                # this branch (via "identify") and _looks_like_execution_step
+                # (via "run"/"test"), but bash isn't in
+                # _INVESTIGATIVE_TOOL_NAMES -- without the added clause, a
+                # step phrased that way rejects every turn that actually
+                # reruns the tests, no matter how many times it passes, until
+                # the retry budget escalates (seen reproducibly on the
+                # scroll_grid_navigation_repair benchmark case). Only widens
+                # this already-unconditional "no named files" fallback, and
+                # only for steps whose wording independently reads as
+                # execution too -- a purely investigative step gets no new
+                # leniency, and the named-files branch above is untouched.
                 logger.debug(
                     "Step %r auto-completed (investigative, has tool evidence)",
                     step.description,

@@ -105,7 +105,7 @@ Recent tool and command history:
 Finish request summary:
 {finish_summary}
 
-The "Current file contents" section (when present) is the verbatim current state of the relevant files, read directly from disk -- quote from it when judging. If the step is not COMPLETE, your REASON must be specific and actionable: quote the exact offending lines (with their line numbers) so the agent knows precisely what to change. Never give vague feedback like "duplicate code" or "still needs work" without quoting the lines you mean.
+The "Current file contents" section (when present) is the verbatim current state of the relevant files, read directly from disk -- quote from it when judging. It is the ground truth for whether the step's goal is achieved, not whether this turn's specific tool call produced a visible change: a "no changes made" or no-op edit result does not mean the step failed, it can mean the file was already correct from an earlier turn. Judge the current file contents on their own merits. If the step is not COMPLETE, your REASON must be specific and actionable: quote the exact offending lines (with their line numbers) so the agent knows precisely what to change. Never give vague feedback like "duplicate code" or "still needs work" without quoting the lines you mean.
 
 Respond with exactly two lines and nothing else:
 VERDICT: COMPLETE, PARTIAL, or NOT_COMPLETE

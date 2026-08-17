@@ -267,12 +267,33 @@ class EditTool:
         if self._file_context is not None:
             self._file_context.remember(path, new_content)
 
+        diff = compute_diff(old_content, new_content, path=path)
+
         output_parts: list[str] = []
-        output_parts.append(f"Applied edit to {path} ({count} occurrence{'s' if count != 1 else ''})")
+        if diff:
+            output_parts.append(
+                f"Applied edit to {path} ({count} occurrence{'s' if count != 1 else ''})"
+            )
+        else:
+            # old_string and new_string were identical, so nothing changed --
+            # say so explicitly rather than the generic "Applied edit"
+            # phrasing, which reads as ambiguous-but-successful to the step
+            # verifier. Without this, a step verifier judging a later,
+            # redundant "fix X" step (e.g. after a replan re-describes work
+            # already done and already verified under a different step's
+            # evidence key) sees a no-op edit with no visible diff and
+            # concludes the fix was never applied -- even though the
+            # "Current file contents" evidence shown alongside it already
+            # has the correct code from an earlier turn.
+            output_parts.append(
+                f"No changes made to {path}: the requested content was already present "
+                "(old_string and new_string are identical, or the file already matches "
+                "new_string). This is not an error -- it means the file is already in the "
+                "desired state."
+            )
         if fuzzy_note:
             output_parts.append(fuzzy_note.rstrip())
 
-        diff = compute_diff(old_content, new_content, path=path)
         if diff:
             output_parts.append(diff)
             if self._diff_store:

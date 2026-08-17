@@ -235,6 +235,15 @@ class TestEditTool:
         assert "-hello world" in result.output
         assert "+hello there" in result.output
 
+    async def test_noop_edit_says_no_changes_made(self, edit_tool, tmp_path):
+        create_file(tmp_path, "f.txt", "hello world")
+        result = await edit_tool.run(path="f.txt", old_string="world", new_string="world")
+        assert result.success
+        assert (tmp_path / "f.txt").read_text() == "hello world"
+        assert "No changes made" in result.output
+        assert "Applied edit" not in result.output
+        assert "```diff" not in result.output
+
     async def test_fuzzy_match_succeeds(self, edit_tool, tmp_path):
         create_file(tmp_path, "f.txt", "def foo():\n    return 42\n")
         result = await edit_tool.run(path="f.txt", old_string="def foo():\n   return 42", new_string="def foo():\n    return 99", fuzzy=True)

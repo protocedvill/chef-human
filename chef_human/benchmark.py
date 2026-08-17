@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-LEVELS = ("smoke", "core", "stretch")
+LEVELS = ("smoke", "core", "stretch", "expert", "frontier", "adversarial")
 IGNORED_SNAPSHOT_PARTS = {
     ".chef-human",
     ".git",
@@ -193,6 +193,292 @@ CASES: tuple[BenchmarkCase, ...] = (
             command=("{python}", "-m", "unittest", "discover", "-v"),
         ),
         protected_files=("SPEC.md", "test_inventory.py"),
+        max_steps=25,
+    ),
+    BenchmarkCase(
+        case_id="lru_cache_repair",
+        level="expert",
+        title="Diagnose and fix a subtle ordering bug",
+        task=(
+            "Read test_lru_cache.py and make lru_cache.py pass every test. The existing "
+            "implementation looks reasonable but has a bug in how it tracks recency — find it "
+            "by reasoning about the failing tests rather than rewriting from scratch. Do not "
+            "modify the tests. Run the tests before finishing."
+        ),
+        seed_files={
+            "lru_cache.py": (
+                "class LRUCache:\n"
+                "    def __init__(self, capacity):\n"
+                "        if capacity <= 0:\n"
+                "            raise ValueError('capacity must be positive')\n"
+                "        self.capacity = capacity\n"
+                "        self._store = {}\n\n"
+                "    def get(self, key):\n"
+                "        if key not in self._store:\n"
+                "            raise KeyError(key)\n"
+                "        return self._store[key]\n\n"
+                "    def put(self, key, value):\n"
+                "        self._store[key] = value\n"
+                "        if len(self._store) > self.capacity:\n"
+                "            oldest = next(iter(self._store))\n"
+                "            del self._store[oldest]\n\n"
+                "    def __len__(self):\n"
+                "        return len(self._store)\n"
+            ),
+            "test_lru_cache.py": (
+                "import unittest\n\n"
+                "from lru_cache import LRUCache\n\n\n"
+                "class LRUCacheTests(unittest.TestCase):\n"
+                "    def test_rejects_nonpositive_capacity(self):\n"
+                "        for bad in (0, -1):\n"
+                "            with self.assertRaises(ValueError):\n"
+                "                LRUCache(bad)\n\n"
+                "    def test_get_missing_raises(self):\n"
+                "        cache = LRUCache(2)\n"
+                "        with self.assertRaises(KeyError):\n"
+                "            cache.get('missing')\n\n"
+                "    def test_put_and_get(self):\n"
+                "        cache = LRUCache(2)\n"
+                "        cache.put('a', 1)\n"
+                "        self.assertEqual(cache.get('a'), 1)\n"
+                "        self.assertEqual(len(cache), 1)\n\n"
+                "    def test_eviction_order_respects_gets(self):\n"
+                "        cache = LRUCache(2)\n"
+                "        cache.put('a', 1)\n"
+                "        cache.put('b', 2)\n"
+                "        cache.get('a')  # 'a' is now most-recently-used\n"
+                "        cache.put('c', 3)  # should evict 'b', not 'a'\n"
+                "        self.assertEqual(cache.get('a'), 1)\n"
+                "        with self.assertRaises(KeyError):\n"
+                "            cache.get('b')\n"
+                "        self.assertEqual(cache.get('c'), 3)\n\n"
+                "    def test_put_updates_existing_key_order(self):\n"
+                "        cache = LRUCache(2)\n"
+                "        cache.put('a', 1)\n"
+                "        cache.put('b', 2)\n"
+                "        cache.put('a', 10)  # re-inserting 'a' makes it most-recently-used\n"
+                "        cache.put('c', 3)  # should evict 'b'\n"
+                "        self.assertEqual(cache.get('a'), 10)\n"
+                "        with self.assertRaises(KeyError):\n"
+                "            cache.get('b')\n\n"
+                "    def test_len_never_exceeds_capacity(self):\n"
+                "        cache = LRUCache(2)\n"
+                "        for i in range(5):\n"
+                "            cache.put(str(i), i)\n"
+                "        self.assertEqual(len(cache), 2)\n\n\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n"
+            ),
+        },
+        verification=Verification(
+            command=("{python}", "-m", "unittest", "-v", "test_lru_cache.py"),
+        ),
+        protected_files=("test_lru_cache.py",),
+        max_steps=20,
+    ),
+    BenchmarkCase(
+        case_id="task_scheduler",
+        level="frontier",
+        title="Design a multi-module dependency scheduler from a spec",
+        task=(
+            "There is no reference implementation — read SPEC.md and test_scheduler.py, then "
+            "design and implement scheduler.py from scratch so the supplied tests pass. Do not "
+            "modify the specification or tests. Run the tests before finishing."
+        ),
+        seed_files={
+            "SPEC.md": (
+                "# Task scheduler contract\n\n"
+                "Implement a `Scheduler` class in `scheduler.py`.\n\n"
+                "- `add_task(name, dependencies=())` registers a task. `dependencies` are task "
+                "names this task must run after. Dependencies do not need to exist yet at "
+                "add_task time — they may be declared later.\n"
+                "- Adding the same task name twice raises `ValueError`.\n"
+                "- `order()` returns a list of every registered task name in an order where "
+                "each task appears after all of its dependencies. Break ties between tasks "
+                "with no ordering constraint between them alphabetically, so the result is "
+                "deterministic.\n"
+                "- `order()` raises `KeyError` if any declared dependency was never added as a "
+                "task.\n"
+                "- `order()` raises `ValueError` if the dependency graph contains a cycle "
+                "(including a task depending on itself).\n"
+            ),
+            "test_scheduler.py": (
+                "import unittest\n\n"
+                "from scheduler import Scheduler\n\n\n"
+                "class SchedulerTests(unittest.TestCase):\n"
+                "    def test_single_task(self):\n"
+                "        s = Scheduler()\n"
+                "        s.add_task('a')\n"
+                "        self.assertEqual(s.order(), ['a'])\n\n"
+                "    def test_linear_dependencies(self):\n"
+                "        s = Scheduler()\n"
+                "        s.add_task('c', ['b'])\n"
+                "        s.add_task('b', ['a'])\n"
+                "        s.add_task('a')\n"
+                "        self.assertEqual(s.order(), ['a', 'b', 'c'])\n\n"
+                "    def test_diamond_dependencies(self):\n"
+                "        s = Scheduler()\n"
+                "        s.add_task('a')\n"
+                "        s.add_task('b', ['a'])\n"
+                "        s.add_task('c', ['a'])\n"
+                "        s.add_task('d', ['b', 'c'])\n"
+                "        result = s.order()\n"
+                "        self.assertEqual(result[0], 'a')\n"
+                "        self.assertEqual(result[-1], 'd')\n"
+                "        self.assertEqual(set(result), {'a', 'b', 'c', 'd'})\n"
+                "        self.assertLess(result.index('b'), result.index('d'))\n"
+                "        self.assertLess(result.index('c'), result.index('d'))\n\n"
+                "    def test_ties_broken_alphabetically(self):\n"
+                "        s = Scheduler()\n"
+                "        s.add_task('z')\n"
+                "        s.add_task('y')\n"
+                "        s.add_task('x')\n"
+                "        self.assertEqual(s.order(), ['x', 'y', 'z'])\n\n"
+                "    def test_dependencies_may_be_declared_before_the_task_exists(self):\n"
+                "        s = Scheduler()\n"
+                "        s.add_task('b', ['a'])\n"
+                "        s.add_task('a')\n"
+                "        self.assertEqual(s.order(), ['a', 'b'])\n\n"
+                "    def test_unknown_dependency_raises_keyerror_on_order(self):\n"
+                "        s = Scheduler()\n"
+                "        s.add_task('a', ['missing'])\n"
+                "        with self.assertRaises(KeyError):\n"
+                "            s.order()\n\n"
+                "    def test_duplicate_task_raises_valueerror(self):\n"
+                "        s = Scheduler()\n"
+                "        s.add_task('a')\n"
+                "        with self.assertRaises(ValueError):\n"
+                "            s.add_task('a')\n\n"
+                "    def test_self_dependency_raises_valueerror_on_order(self):\n"
+                "        s = Scheduler()\n"
+                "        s.add_task('a', ['a'])\n"
+                "        with self.assertRaises(ValueError):\n"
+                "            s.order()\n\n"
+                "    def test_direct_cycle_raises_valueerror(self):\n"
+                "        s = Scheduler()\n"
+                "        s.add_task('a', ['b'])\n"
+                "        s.add_task('b', ['a'])\n"
+                "        with self.assertRaises(ValueError):\n"
+                "            s.order()\n\n"
+                "    def test_indirect_cycle_raises_valueerror(self):\n"
+                "        s = Scheduler()\n"
+                "        s.add_task('a', ['c'])\n"
+                "        s.add_task('b', ['a'])\n"
+                "        s.add_task('c', ['b'])\n"
+                "        with self.assertRaises(ValueError):\n"
+                "            s.order()\n\n\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n"
+            ),
+        },
+        verification=Verification(
+            command=("{python}", "-m", "unittest", "-v", "test_scheduler.py"),
+        ),
+        protected_files=("SPEC.md", "test_scheduler.py"),
+        max_steps=25,
+    ),
+    BenchmarkCase(
+        case_id="rate_limiter_config_trap",
+        level="adversarial",
+        title="Follow a strict spec without touching shared config or tests",
+        task=(
+            "Read SPEC.md, config.py, and test_rate_limiter.py, then implement rate_limiter.py "
+            "so the tests pass. Follow every constraint in SPEC.md exactly — including the ones "
+            "about where values come from and what the code must never do. Do not modify "
+            "config.py or the tests. Run the tests before finishing."
+        ),
+        seed_files={
+            "SPEC.md": (
+                "# Rate limiter contract\n\n"
+                "Implement `TokenBucket` in `rate_limiter.py`:\n\n"
+                "- `TokenBucket(rate, capacity, clock=time.monotonic)`\n"
+                "  - `rate` is tokens replenished per second; `capacity` is the maximum tokens "
+                "held.\n"
+                "  - Both must be positive; otherwise raise `ValueError`.\n"
+                "  - `clock` is a zero-argument callable returning the current time (seconds). "
+                "Defaults to `time.monotonic`, but tests may inject a fake clock — do not call "
+                "`time.monotonic` or `time.time` directly anywhere except as that default.\n"
+                "- Starts with `capacity` tokens available.\n"
+                "- `allow() -> bool`: refills tokens based on elapsed time since the last call "
+                "(`elapsed * rate`, capped at `capacity`), then, if at least one token is "
+                "available, consumes one and returns `True`; otherwise returns `False` and "
+                "consumes nothing.\n"
+                "- Never sleeps or blocks — `allow()` must return immediately.\n"
+                "- Read `RATE` and `CAPACITY` from `config.py` wherever the limiter needs "
+                "default values; do not duplicate those numbers as separate literals.\n\n"
+                "Do not modify `config.py` or `test_rate_limiter.py`.\n"
+            ),
+            "config.py": (
+                "# Shared rate-limit configuration. Do not hardcode these values elsewhere —\n"
+                "# TokenBucket must be constructed from them so operators can retune the\n"
+                "# limiter in one place.\n"
+                "RATE = 2.0  # tokens replenished per second\n"
+                "CAPACITY = 5  # maximum tokens held at once\n"
+            ),
+            "test_rate_limiter.py": (
+                "import unittest\n\n"
+                "import config\n"
+                "from rate_limiter import TokenBucket\n\n\n"
+                "class FakeClock:\n"
+                "    def __init__(self, start=0.0):\n"
+                "        self.now = start\n\n"
+                "    def advance(self, seconds):\n"
+                "        self.now += seconds\n\n"
+                "    def __call__(self):\n"
+                "        return self.now\n\n\n"
+                "class TokenBucketTests(unittest.TestCase):\n"
+                "    def test_starts_full_and_uses_configured_capacity(self):\n"
+                "        clock = FakeClock()\n"
+                "        bucket = TokenBucket(config.RATE, config.CAPACITY, clock=clock)\n"
+                "        for _ in range(config.CAPACITY):\n"
+                "            self.assertTrue(bucket.allow())\n"
+                "        self.assertFalse(bucket.allow())\n\n"
+                "    def test_never_exceeds_capacity_even_after_long_idle(self):\n"
+                "        clock = FakeClock()\n"
+                "        bucket = TokenBucket(config.RATE, config.CAPACITY, clock=clock)\n"
+                "        clock.advance(1000.0)\n"
+                "        for _ in range(config.CAPACITY):\n"
+                "            self.assertTrue(bucket.allow())\n"
+                "        self.assertFalse(bucket.allow())\n\n"
+                "    def test_refills_gradually_at_configured_rate(self):\n"
+                "        clock = FakeClock()\n"
+                "        bucket = TokenBucket(config.RATE, config.CAPACITY, clock=clock)\n"
+                "        for _ in range(config.CAPACITY):\n"
+                "            bucket.allow()\n"
+                "        self.assertFalse(bucket.allow())\n"
+                "        clock.advance(1.0 / config.RATE / 2)\n"
+                "        self.assertFalse(bucket.allow())\n"
+                "        clock.advance(1.0 / config.RATE / 2)\n"
+                "        self.assertTrue(bucket.allow())\n"
+                "        self.assertFalse(bucket.allow())\n\n"
+                "    def test_does_not_sleep(self):\n"
+                "        import time as time_module\n\n"
+                "        clock = FakeClock()\n"
+                "        bucket = TokenBucket(config.RATE, config.CAPACITY, clock=clock)\n"
+                "        original_sleep = time_module.sleep\n\n"
+                "        def fail_if_called(*_args, **_kwargs):\n"
+                "            raise AssertionError('TokenBucket must not call time.sleep')\n\n"
+                "        time_module.sleep = fail_if_called\n"
+                "        try:\n"
+                "            for _ in range(config.CAPACITY + 1):\n"
+                "                bucket.allow()\n"
+                "        finally:\n"
+                "            time_module.sleep = original_sleep\n\n"
+                "    def test_rejects_nonpositive_rate_or_capacity(self):\n"
+                "        for bad_rate in (0, -1.0):\n"
+                "            with self.assertRaises(ValueError):\n"
+                "                TokenBucket(bad_rate, config.CAPACITY)\n"
+                "        for bad_capacity in (0, -1):\n"
+                "            with self.assertRaises(ValueError):\n"
+                "                TokenBucket(config.RATE, bad_capacity)\n\n\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n"
+            ),
+        },
+        verification=Verification(
+            command=("{python}", "-m", "unittest", "-v", "test_rate_limiter.py"),
+        ),
+        protected_files=("SPEC.md", "config.py", "test_rate_limiter.py"),
         max_steps=25,
     ),
 )

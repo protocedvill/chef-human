@@ -498,7 +498,7 @@ async def _run_task_in_tui(
     app: ChefHumanTUI
     result_holder: list[AgentResult] = []
 
-    async def handle_task(text: str) -> None:
+    async def handle_task(text: str) -> AgentResult:
         config = ReActConfig(
             max_steps=max_steps,
             tool_timeout=settings.tool_timeout,
@@ -516,6 +516,7 @@ async def _run_task_in_tui(
         result = await loop.run(text)
         result_holder.append(result)
         app.tui_ui.display_result(result)
+        return result
 
     app = ChefHumanTUI(
         workspace_root=context.workspace.root,

@@ -365,7 +365,7 @@ class ChefHumanTUI(App):
     def __init__(
         self,
         workspace_root: Path,
-        on_submit: Callable[[str], Awaitable[None]],
+        on_submit: Callable[[str], Awaitable[AgentResult | None]],
         initial_task: str | None = None,
         auto_exit_after_initial_task: bool = False,
     ) -> None:
@@ -408,8 +408,13 @@ class ChefHumanTUI(App):
             self.copy_to_clipboard(text)
 
     async def _run_initial_task(self) -> None:
-        await self._on_submit(self._initial_task)
-        if self._auto_exit_after_initial_task:
+        result = await self._on_submit(self._initial_task)
+        # Only auto-exit on success. On a persistent failure (escalated
+        # retries, max steps exceeded, ...) leave the panel open so there's
+        # actually time to read the failure message, warnings, and replan
+        # count in the stats panel before it disappears -- the user has to
+        # explicitly quit (Ctrl+Q) once they're done reviewing.
+        if self._auto_exit_after_initial_task and (result is None or result.success):
             self.exit()
 
     def _app_log(self, text: str) -> None:

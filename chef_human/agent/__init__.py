@@ -24,6 +24,7 @@ def _build_rag_context_assembler(
     file_ctx: FileContextManager,
     repo_map: RepoMap,
     conversation: ContextManager,
+    index_on_init: bool,
 ) -> ContextAssembler:
     from chef_human.agent.rag.chunker import CodeChunker
     from chef_human.agent.rag.retriever import RAGRetriever
@@ -37,10 +38,14 @@ def _build_rag_context_assembler(
         target_tokens=settings.rag_chunk_tokens,
         overlap_tokens=settings.rag_chunk_overlap,
     )
-    store = VectorStore(
-        dimension=embedder.dimension,
-        index_dir=workspace.root / settings.rag_index_dir,
-    )
+    index_dir = workspace.root / settings.rag_index_dir
+
+    store = None
+    if settings.persist_index:
+        store = VectorStore.load(index_dir, dimension=embedder.dimension)
+    if store is None:
+        store = VectorStore(dimension=embedder.dimension, index_dir=index_dir)
+
     symbol_index = SymbolIndex(workspace=workspace, extractor=CompositeExtractor())
     rag_retriever = RAGRetriever(
         chunker=chunker,
@@ -51,6 +56,34 @@ def _build_rag_context_assembler(
         symbol_index=symbol_index,
     )
 
+    if index_on_init and not rag_retriever.is_built:
+        # Without this, retrieve() always returns [] for the entire
+        # session -- RAGRetriever starts with an empty, never-populated
+        # store otherwise, since nothing else builds or loads one for it.
+        files = workspace.list_files(max_depth=10)
+        rag_retriever.build(files)
+        symbol_index.build(files=files)
+        if settings.persist_index:
+            store.save()
+
+    file_watcher = None
+    if settings.watch_files:
+        from chef_human.agent.watcher import FileWatcher
+
+        def _on_files_changed(changed_files: list) -> None:
+            try:
+                rag_retriever.update(changed_files)
+                symbol_index.refresh(files=changed_files)
+            except Exception:
+                logger.exception("RAG/symbol index update failed after file change")
+
+        file_watcher = FileWatcher(
+            workspace=workspace,
+            on_change=_on_files_changed,
+            interval=settings.watch_interval,
+        )
+        file_watcher.start()
+
     return ContextAssembler(
         conversation=conversation,
         workspace=workspace,
@@ -58,6 +91,7 @@ def _build_rag_context_assembler(
         repo_map=repo_map,
         rag_retriever=rag_retriever,
         symbol_index=symbol_index,
+        file_watcher=file_watcher,
     )
 
 
@@ -117,6 +151,29 @@ def _build_symbol_context_assembler(
                 if settings.persist_index:
                     dep_graph.save(deps_path, workspace_root=workspace.root)
 
+    file_watcher = None
+    if settings.watch_files:
+        from chef_human.agent.watcher import FileWatcher
+
+        def _on_files_changed(changed_files: list) -> None:
+            # Keeps the symbol index from going stale as files change during
+            # the session (externally, or via the agent's own writes).
+            # dep_graph is intentionally NOT rebuilt here -- DependencyGraph
+            # only supports a full build(), not an incremental update, so
+            # doing that on every change would be expensive; it stays as a
+            # known follow-up rather than being silently wrong.
+            try:
+                symbol_index.refresh(files=changed_files)
+            except Exception:
+                logger.exception("Symbol index refresh failed after file change")
+
+        file_watcher = FileWatcher(
+            workspace=workspace,
+            on_change=_on_files_changed,
+            interval=settings.watch_interval,
+        )
+        file_watcher.start()
+
     return ContextAssembler(
         conversation=conversation,
         workspace=workspace,
@@ -125,6 +182,7 @@ def _build_symbol_context_assembler(
         symbol_index=symbol_index,
         dep_graph=dep_graph,
         symbol_retriever=symbol_retriever,
+        file_watcher=file_watcher,
     )
 
 
@@ -154,6 +212,7 @@ def create_context_assembler(
             file_ctx=file_ctx,
             repo_map=repo_map,
             conversation=conversation,
+            index_on_init=index_on_init,
         )
     return _build_symbol_context_assembler(
         workspace=workspace,

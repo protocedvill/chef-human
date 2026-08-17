@@ -8,7 +8,6 @@ from chef_human.agent.prompts import (
     build_agent_prompt,
     build_planner_prompt,
 )
-from chef_human.llm.backend import ToolDefinition
 
 
 class TestPromptConstants:
@@ -18,8 +17,17 @@ class TestPromptConstants:
 
     def test_agent_prompt_has_guidelines(self):
         assert "chef-human" in AGENT_SYSTEM_PROMPT
-        assert "tool_call" in AGENT_SYSTEM_PROMPT
         assert "finish" in AGENT_SYSTEM_PROMPT
+
+    def test_agent_prompt_delegates_tool_calling_to_native_support(self):
+        """Tool-call format/listing is intentionally NOT embedded in this
+        prompt -- it's provided by the model interface's own native
+        tool-calling support (see CompletionRequest.tools /
+        OllamaBackend.complete), so there's exactly one instruction for it
+        instead of two overlapping ones. This prompt should still tell the
+        model not to substitute prose for an actual call."""
+        assert "tool-calling support" in AGENT_SYSTEM_PROMPT
+        assert "accomplishes nothing" in AGENT_SYSTEM_PROMPT
 
     def test_finish_prompt_has_summary_instructions(self):
         assert "Summarize" in AGENT_FINISH_PROMPT
@@ -47,62 +55,42 @@ class TestBuildPlannerPrompt:
 
 
 class TestBuildAgentPrompt:
-    def test_includes_tool_definitions(self):
-        plan = Plan(goal="Test", steps=[])
-        tool_defs = [
-            ToolDefinition(name="read", description="Read", parameters={"type": "object"})
-        ]
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
-        assert "read" in prompt
-
     def test_includes_plan(self):
         plan = Plan(goal="Test", steps=[PlanStep(index=1, description="Do something")])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        prompt = build_agent_prompt(plan=plan)
         assert "Step 1" in prompt
         assert "Do something" in prompt
 
-    def test_with_both(self):
-        plan = Plan(goal="Test", steps=[PlanStep(index=1, description="Do something")])
-        tool_defs = [
-            ToolDefinition(name="read", description="Read", parameters={"type": "object"})
-        ]
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
-        assert "read" in prompt
-        assert "Step 1" in prompt
+    def test_does_not_embed_a_tool_list(self):
+        """Regression test: this prompt used to duplicate the tool list and
+        <tool_call> format instructions that the model interface's native
+        tool-calling support already provides -- two overlapping
+        instructions competing for the model's attention likely made
+        things less reliable, not more."""
+        plan = Plan(goal="Test", steps=[])
+        prompt = build_agent_prompt(plan=plan)
+        assert "## Available Tools" not in prompt
 
     def test_repo_map_empty_uses_fallback(self):
         plan = Plan(goal="Test", steps=[])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        prompt = build_agent_prompt(plan=plan)
         assert "no project context loaded" in prompt
 
     def test_repo_map_included_when_provided(self):
         plan = Plan(goal="Test", steps=[])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs, repo_map="src/\n  main.py")
+        prompt = build_agent_prompt(plan=plan, repo_map="src/\n  main.py")
         assert "src/" in prompt
         assert "no project context loaded" not in prompt
 
-    def test_tool_call_format_example_present(self):
-        plan = Plan(goal="Test", steps=[])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
-        assert "tool_name" in prompt
-
     def test_scratchpad_empty_uses_fallback(self):
         plan = Plan(goal="Test", steps=[])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        prompt = build_agent_prompt(plan=plan)
         assert "Scratchpad" in prompt
         assert "add notes" in prompt
 
     def test_scratchpad_included_when_provided(self):
         plan = Plan(goal="Test", steps=[])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(
-            plan=plan, tool_defs=tool_defs, scratchpad="I found the bug"
-        )
+        prompt = build_agent_prompt(plan=plan, scratchpad="I found the bug")
         assert "I found the bug" in prompt
         assert "add notes" not in prompt
 
@@ -120,8 +108,7 @@ class TestBuildAgentPrompt:
             PlanStep(index=2, description="Work on this now", status=StepStatus.pending),
             PlanStep(index=3, description="Later step", status=StepStatus.pending),
         ])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        prompt = build_agent_prompt(plan=plan)
 
         current_section = prompt.split("## Current Step")[1].split("## Project Structure")[0]
         assert "Work on this now" in current_section
@@ -131,12 +118,10 @@ class TestBuildAgentPrompt:
         plan = Plan(goal="Test", steps=[
             PlanStep(index=1, description="Done", status=StepStatus.completed),
         ])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        prompt = build_agent_prompt(plan=plan)
         assert "All steps are complete" in prompt
 
     def test_current_step_empty_plan(self):
         plan = Plan(goal="Test", steps=[])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        prompt = build_agent_prompt(plan=plan)
         assert "All steps are complete" in prompt

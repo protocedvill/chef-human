@@ -374,6 +374,13 @@ class TestParseVerdict:
         assert verdict == StepVerdict.complete
         assert reason == "file was created"
 
+    def test_complete_verdict_ignores_partial_word_in_reason(self):
+        verdict, reason = Planner._parse_verdict(
+            "VERDICT: COMPLETE\nREASON: previously partial, now done"
+        )
+        assert verdict == StepVerdict.complete
+        assert reason == "previously partial, now done"
+
     def test_partial(self):
         verdict, reason = Planner._parse_verdict("VERDICT: PARTIAL\nREASON: only half done")
         assert verdict == StepVerdict.partial

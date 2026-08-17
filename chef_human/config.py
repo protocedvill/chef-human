@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import dataclasses
+import logging
 import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -60,8 +64,14 @@ def _load_toml(path: str = "config.toml") -> dict[str, object]:
     p = Path(path)
     if not p.exists():
         return {}
-    with p.open("rb") as f:
-        data = tomllib.load(f)
+    try:
+        with p.open("rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(
+            f"chef-human config file {p} is not valid TOML: {exc}. "
+            "Fix the syntax error or remove the file to fall back to defaults."
+        ) from exc
     result: dict[str, object] = data.get("chef_human", {})
     return result
 
@@ -94,6 +104,22 @@ def load_settings(
     if project_cfg is not None:
         merged.update(_load_toml(str(project_cfg)))
     merged.update(_load_env())
+
+    # An unrecognized key here (a typo in config.toml, or an unrelated
+    # CHEF_-prefixed env var from something else on the machine) would
+    # otherwise raise TypeError out of Settings(**merged) and crash the
+    # whole process, since `settings = load_settings()` below runs at
+    # import time. Drop and warn instead.
+    valid_fields = {f.name for f in dataclasses.fields(Settings)}
+    unknown_keys = sorted(set(merged) - valid_fields)
+    if unknown_keys:
+        logger.warning(
+            "Ignoring unknown chef-human config key(s): %s",
+            ", ".join(unknown_keys),
+        )
+        for key in unknown_keys:
+            merged.pop(key)
+
     return Settings(**merged)
 
 

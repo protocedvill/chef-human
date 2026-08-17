@@ -72,6 +72,39 @@ class TestVectorStoreSearch:
         assert len(results) == 1
 
 
+class TestVectorStoreRemoveByFile:
+    def test_removes_only_matching_file(self, store: VectorStore):
+        store.add(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+            [
+                {"chunk_id": "c1", "file_path": "a.py"},
+                {"chunk_id": "c2", "file_path": "a.py"},
+                {"chunk_id": "c3", "file_path": "b.py"},
+            ],
+        )
+        removed = store.remove_by_file("a.py")
+        assert removed == 2
+        assert len(store) == 1
+        results = store.search([0.0, 0.0, 1.0, 0.0], top_k=5)
+        assert [r.chunk_id for r in results] == ["c3"]
+
+    def test_removing_nonexistent_file_is_a_noop(self, store: VectorStore):
+        store.add([[1.0, 0.0, 0.0, 0.0]], [{"chunk_id": "c1", "file_path": "a.py"}])
+        removed = store.remove_by_file("nope.py")
+        assert removed == 0
+        assert len(store) == 1
+
+    def test_remove_then_readd_same_file(self, store: VectorStore):
+        """A file re-indexed after an edit shouldn't leave stale duplicate
+        chunks around, and the fresh chunk must still be searchable."""
+        store.add([[1.0, 0.0, 0.0, 0.0]], [{"chunk_id": "old", "file_path": "a.py"}])
+        store.remove_by_file("a.py")
+        store.add([[0.0, 1.0, 0.0, 0.0]], [{"chunk_id": "new", "file_path": "a.py"}])
+        assert len(store) == 1
+        results = store.search([0.0, 1.0, 0.0, 0.0], top_k=5)
+        assert [r.chunk_id for r in results] == ["new"]
+
+
 class TestVectorStoreClear:
     def test_clear_empties_store(self, store: VectorStore):
         store.add([[0.1, 0.2, 0.3, 0.4]], [{"chunk_id": "c1"}])
@@ -116,3 +149,43 @@ class TestVectorStorePersistence:
         assert loaded is not None
         results = loaded.search([0.0, 1.0, 0.0, 0.0], top_k=1)
         assert results[0].chunk_id == "c2"
+
+    def test_roundtrip_survives_remove_by_file(self, store: VectorStore, tmp_path):
+        """save/load must preserve ids, not just insertion order, since ids
+        are what remove_by_file keys off of after a reload."""
+        store.add(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            [{"chunk_id": "c1", "file_path": "a.py"}, {"chunk_id": "c2", "file_path": "b.py"}],
+        )
+        store._index_dir = tmp_path
+        store.save()
+
+        loaded = VectorStore.load(tmp_path, dimension=4)
+        assert loaded is not None
+        removed = loaded.remove_by_file("a.py")
+        assert removed == 1
+        assert len(loaded) == 1
+        results = loaded.search([0.0, 1.0, 0.0, 0.0], top_k=5)
+        assert [r.chunk_id for r in results] == ["c2"]
+
+    def test_loads_pre_incremental_update_format(self, store: VectorStore, tmp_path):
+        """Older on-disk metadata was a plain JSON list (no explicit ids) --
+        loading it must still work."""
+        import json
+
+        import faiss
+
+        store.add(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            [{"chunk_id": "c1"}, {"chunk_id": "c2"}],
+        )
+        store._index_dir = tmp_path
+        faiss.write_index(store._index, str(tmp_path / "rag.index"))
+        with open(tmp_path / "rag.meta.json", "w") as f:
+            json.dump([{"chunk_id": "c1"}, {"chunk_id": "c2"}], f)
+
+        loaded = VectorStore.load(tmp_path, dimension=4)
+        assert loaded is not None
+        assert len(loaded) == 2
+        results = loaded.search([1.0, 0.0, 0.0, 0.0], top_k=1)
+        assert results[0].chunk_id == "c1"

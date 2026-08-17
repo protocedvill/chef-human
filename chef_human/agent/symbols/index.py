@@ -83,6 +83,16 @@ class SymbolIndex:
         logger.info("Indexed %d symbols from %d files", count, len(files))
         return count
 
+    def _remove_file(self, f: Path) -> None:
+        for entry in self._by_file.pop(f, []):
+            name_list = self._entries.get(entry.symbol.name, [])
+            self._entries[entry.symbol.name] = [
+                e for e in name_list if e.file_path != str(f)
+            ]
+            if not self._entries[entry.symbol.name]:
+                del self._entries[entry.symbol.name]
+        self._content_hashes.pop(f, None)
+
     def refresh(self, files: list[Path] | None = None) -> int:
         if not self._initial_built:
             return self.build(files=files)
@@ -92,6 +102,12 @@ class SymbolIndex:
 
         count = 0
         for f in files:
+            if not f.exists():
+                # A file that was tracked and has since been deleted --
+                # drop its symbols instead of leaving them stale forever.
+                self._remove_file(f)
+                continue
+
             try:
                 content = f.read_text(encoding="utf-8", errors="replace")
             except Exception:
@@ -100,13 +116,7 @@ class SymbolIndex:
             if self._content_hashes.get(f) == new_hash:
                 continue
 
-            for entry in self._by_file.pop(f, []):
-                name_list = self._entries.get(entry.symbol.name, [])
-                self._entries[entry.symbol.name] = [
-                    e for e in name_list if e.file_path != str(f)
-                ]
-                if not self._entries[entry.symbol.name]:
-                    del self._entries[entry.symbol.name]
+            self._remove_file(f)
 
             symbols = self._extractor.extract(str(f), content)
             for s in symbols:

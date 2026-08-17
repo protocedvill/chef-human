@@ -4,11 +4,16 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Final, Protocol
-
-from tree_sitter import Language, Parser, Query, QueryCursor
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from chef_human.agent.symbols.grammars import GrammarLoader
+
+if TYPE_CHECKING:
+    # tree-sitter is an optional dependency (the `indexing` extra) -- these
+    # names are only used in type annotations, which `from __future__ import
+    # annotations` turns into strings, so no runtime import is needed here.
+    # TreeSitterExtractor.__init__ does the real (guarded) import below.
+    from tree_sitter import Language, Query
 
 logger = logging.getLogger(__name__)
 
@@ -170,12 +175,15 @@ class TreeSitterExtractor:
 
     def __init__(self, grammar_loader: GrammarLoader | None = None) -> None:
         try:
-            import tree_sitter  # noqa: F401
+            from tree_sitter import Parser, Query, QueryCursor
         except ImportError:
             raise ImportError(
                 "tree-sitter is required for TreeSitterExtractor. "
                 "Install: pip install tree-sitter"
             )
+        self._Parser = Parser
+        self._Query = Query
+        self._QueryCursor = QueryCursor
         self._loader = grammar_loader or GrammarLoader()
         self._compiled: dict[str, dict[str, Query]] = {}
 
@@ -189,7 +197,7 @@ class TreeSitterExtractor:
         if language is None:
             return []
 
-        parser = Parser(language)
+        parser = self._Parser(language)
         tree = parser.parse(content.encode("utf-8"))
         if tree is None:
             return []
@@ -200,7 +208,7 @@ class TreeSitterExtractor:
         queries = self._get_queries(lang_name, language)
 
         for kind, query in queries.items():
-            cursor = QueryCursor(query)
+            cursor = self._QueryCursor(query)
             for _pi, captures in cursor.matches(root):
                 name_nodes = captures.get("name")
                 def_nodes = captures.get("def")
@@ -221,7 +229,7 @@ class TreeSitterExtractor:
     def _get_queries(self, lang_name: str, language: Language) -> dict[str, Query]:
         if lang_name not in self._compiled:
             self._compiled[lang_name] = {
-                kind: Query(language, qs)
+                kind: self._Query(language, qs)
                 for kind, qs in _TS_QUERIES.get(lang_name, {}).items()
             }
         return self._compiled[lang_name]

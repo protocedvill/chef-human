@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from chef_human.agent.symbols.dependencies import DependencyGraph
     from chef_human.agent.symbols.index import SymbolIndex
     from chef_human.agent.symbols.retriever import SymbolRetriever
+    from chef_human.agent.watcher import FileWatcher
     from chef_human.agent.workspace import WorkspaceManager
 
 
@@ -103,6 +104,7 @@ class ContextAssembler:
         dep_graph: DependencyGraph | None = None,
         symbol_retriever: SymbolRetriever | None = None,
         rag_retriever: RAGRetriever | None = None,
+        file_watcher: FileWatcher | None = None,
     ) -> None:
         self._conversation = conversation
         self._workspace = workspace
@@ -112,6 +114,11 @@ class ContextAssembler:
         self._dep_graph = dep_graph
         self._symbol_retriever = symbol_retriever
         self._rag_retriever = rag_retriever
+        # Holds a reference to the background FileWatcher thread (if one was
+        # started -- see agent/__init__.py's _build_symbol_context_assembler
+        # / _build_rag_context_assembler) purely so it isn't only reachable
+        # via the on_change closure; also lets callers stop() it explicitly.
+        self.file_watcher = file_watcher
 
     @property
     def conversation(self) -> ContextManager:

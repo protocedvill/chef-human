@@ -109,6 +109,21 @@ class TestIsIgnored:
         wm = WorkspaceManager(root=tmp_path)
         assert wm.is_ignored(str(tmp_path / ".venv"))
 
+    def test_chef_human_dir_is_ignored(self, tmp_path: Path):
+        (tmp_path / ".chef-human").mkdir(exist_ok=True)
+        wm = WorkspaceManager(root=tmp_path)
+        assert wm.is_ignored(str(tmp_path / ".chef-human"))
+
+    def test_session_files_under_chef_human_are_ignored(self, tmp_path: Path):
+        sessions_dir = tmp_path / ".chef-human" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        (sessions_dir / "session_abc123.json").write_text("{}")
+        wm = WorkspaceManager(root=tmp_path)
+        assert wm.is_ignored(str(sessions_dir / "session_abc123.json"))
+        assert not any(
+            "session" in str(f) for f in wm.list_files()
+        )
+
     def test_ignored_in_subdirectory(self, tmp_path: Path):
         (tmp_path / "src/__pycache__").mkdir(parents=True)
         wm = WorkspaceManager(root=tmp_path)

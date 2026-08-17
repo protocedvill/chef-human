@@ -76,6 +76,70 @@ class TestRetrieverBuild:
         assert count == 0
 
 
+class TestRetrieverUpdate:
+    def test_update_before_build_falls_back_to_build(self, retriever: RAGRetriever, tmp_path: Path):
+        f = tmp_path / "a.py"
+        f.write_text("def foo():\n    pass\n" * 20)
+        count = retriever.update([f])
+        assert count > 0
+        assert retriever.is_built
+
+    def test_update_reindexes_changed_file_without_duplicating_or_touching_others(
+        self, retriever: RAGRetriever, tmp_path: Path
+    ):
+        a = tmp_path / "a.py"
+        a.write_text("def foo():\n    pass\n" * 20)
+        b = tmp_path / "b.py"
+        b.write_text("class Bar:\n    pass\n" * 20)
+        retriever.build([a, b])
+        b_chunks_before = sum(
+            1 for r in retriever.retrieve("Bar class", top_k=50) if r.file_path == str(b)
+        )
+
+        a.write_text("def foo():\n    return 1\n" * 20)
+        retriever.update([a])
+
+        results = retriever.retrieve("foo function bar class", top_k=50)
+        a_chunks = [r for r in results if r.file_path == str(a)]
+        b_chunks = [r for r in results if r.file_path == str(b)]
+
+        # b.py untouched by the incremental update to a.py.
+        assert len(b_chunks) == b_chunks_before
+        # a.py's old ("pass") content shouldn't linger as stale duplicates
+        # alongside the new ("return 1") content.
+        assert all("return 1" in c.content for c in a_chunks)
+        assert not any("pass" in c.content for c in a_chunks)
+
+    def test_update_removes_chunks_for_deleted_file(self, retriever: RAGRetriever, tmp_path: Path):
+        a = tmp_path / "a.py"
+        a.write_text("def only_here():\n    pass\n" * 20)
+        retriever.build([a])
+        assert retriever.total_chunks > 0
+
+        a.unlink()
+        count = retriever.update([a])
+
+        assert count == 0
+        assert retriever.total_chunks == 0
+
+    def test_update_does_not_clear_unrelated_files(self, retriever: RAGRetriever, tmp_path: Path):
+        """The whole point of update() over build(): untouched files must
+        survive, unlike build()'s full store.clear()."""
+        a = tmp_path / "a.py"
+        a.write_text("def foo():\n    pass\n" * 20)
+        b = tmp_path / "b.py"
+        b.write_text("def bar():\n    pass\n" * 20)
+        retriever.build([a, b])
+
+        c = tmp_path / "c.py"
+        c.write_text("def baz():\n    pass\n" * 20)
+        retriever.update([c])
+
+        results = retriever.retrieve("foo function", top_k=20)
+        assert any(r.file_path == str(a) for r in results)
+        assert any(r.file_path == str(b) for r in results)
+
+
 class TestRetrieverSearch:
     def test_retrieve_returns_chunks(self, retriever: RAGRetriever, tmp_path: Path):
         f = tmp_path / "test.py"

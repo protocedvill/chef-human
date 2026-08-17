@@ -17,6 +17,10 @@ IGNORE_PATTERNS: set[str] = {
     "*.pyc",
     "*.pyo",
     ".DS_Store",
+    # chef-human's own internal state (symbol index, RAG cache, saved
+    # sessions) -- not part of the user's project, and noisy/irrelevant in
+    # any file listing shown to the model (repo map, ls, glob).
+    ".chef-human",
 }
 
 

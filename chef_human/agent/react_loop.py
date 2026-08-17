@@ -55,6 +55,24 @@ _VAGUE_ASK_USER_PATTERNS = (
     "what next",
 )
 
+# Phrases that, in isolation, look like a completion announcement -- but a
+# plain substring match on these is fooled by negated phrasing (see
+# _NEGATION_CUES below and _detect_finish).
+_FINISH_TRIGGERS = (
+    "task is complete",
+    "i have finished",
+    "all done",
+    "finished the task",
+)
+
+# Words/contractions that, if found in the text immediately preceding a
+# finish trigger, mean the model is actually saying it *hasn't* finished
+# (e.g. "I haven't finished the task yet", "I don't think the task is
+# complete"). "n't" alone covers isn't/wasn't/haven't/don't/doesn't/won't/
+# etc; this is a best-effort heuristic over a short window, not a parser.
+_NEGATION_CUES = ("not", "n't", "never", "no ", "cannot")
+_NEGATION_WINDOW_CHARS = 40
+
 
 def _rollback_file(path: str, content: str) -> None:
     """Restore a file to its pre-write content."""
@@ -149,6 +167,7 @@ class ReActLoop:
         )
         scratchpad = Scratchpad()
         last_call_signature: str | None = None
+        last_reasoning_text: str | None = None
         files_read: set[str] = set()
         retry_mgr = RetryManager(
             max_retries_per_step=self._config.max_retries_per_step,
@@ -169,7 +188,6 @@ class ReActLoop:
                 )
                 system_prompt = build_agent_prompt(
                     plan=plan,
-                    tool_defs=self._tools.get_definitions(),
                     scratchpad=scratchpad.render(),
                 )
                 messages = self._context.assemble(
@@ -252,20 +270,6 @@ class ReActLoop:
                         logger.debug("No tool calls this turn (plain reasoning only)")
 
                     steps_taken += 1
-                    if parse_error:
-                        action = retry_mgr.record_iteration(1, 1, [parse_error])
-                    else:
-                        action = retry_mgr.record_iteration(0, 0, [])
-
-                    if action == RetryAction.STEP_COMPLETED:
-                        verify_feedback = await self._verify_and_mark_step(
-                            plan, non_tool_reasoning
-                        )
-                        if verify_feedback:
-                            self._ui.on_tool_result("plan-check", verify_feedback)
-                            self._context.conversation.add_message(
-                                Message(role=Role.tool, content=verify_feedback)
-                            )
 
                     if self._detect_finish(non_tool_reasoning) and not parse_error:
                         logger.info("Task finished via finish-phrase detection after %d step(s)", steps_taken)
@@ -274,6 +278,62 @@ class ReActLoop:
                             steps_taken=steps_taken,
                             message=non_tool_reasoning,
                         )
+
+                    failure_context = ""
+                    if parse_error:
+                        action = retry_mgr.record_iteration(1, 1, [parse_error])
+                        failure_context = parse_error
+                    else:
+                        # A model that just narrates an intended action
+                        # ("Let's call the X tool...") instead of actually
+                        # emitting a <tool_call>, turn after turn, must not
+                        # look "fine" just because nothing errored -- ask
+                        # the verifier whether this reasoning-only turn
+                        # actually satisfies the active step *before*
+                        # deciding the retry outcome, so a rejection here
+                        # counts as a real failure the same way a failing
+                        # tool call would.
+                        reasoning_text = non_tool_reasoning.strip()
+                        is_repeat_reasoning = (
+                            bool(reasoning_text) and reasoning_text == last_reasoning_text
+                        )
+                        last_reasoning_text = reasoning_text
+
+                        verify_feedback = await self._verify_and_mark_step(
+                            plan, non_tool_reasoning
+                        )
+                        if verify_feedback is None:
+                            # Nothing to verify (no active step), or the
+                            # step genuinely verified complete from
+                            # reasoning alone -- a real "fine" turn.
+                            action = retry_mgr.record_iteration(0, 0, [])
+                        else:
+                            self._ui.on_tool_result("plan-check", verify_feedback)
+                            self._context.conversation.add_message(
+                                Message(role=Role.tool, content=verify_feedback)
+                            )
+                            if is_repeat_reasoning:
+                                nudge = (
+                                    "You've said this exact same thing, without "
+                                    "taking any action, on the previous turn too "
+                                    "-- describing a tool call isn't the same as "
+                                    "making one. Actually emit a <tool_call> now, "
+                                    "or call `finish` if the task is genuinely "
+                                    "already done."
+                                )
+                                self._ui.on_tool_result("repeat-guard", nudge)
+                                self._context.conversation.add_message(
+                                    Message(role=Role.tool, content=nudge)
+                                )
+                                verify_feedback = f"{verify_feedback}\n{nudge}"
+                            failure_context = verify_feedback
+                            action = retry_mgr.record_iteration(1, 1, [verify_feedback])
+
+                    plan, escalate_result = await self._handle_replan_or_escalate(
+                        action, plan, retry_mgr, failure_context, steps_taken
+                    )
+                    if escalate_result is not None:
+                        return escalate_result
                     continue
 
                 call_signature = json.dumps(
@@ -289,6 +349,14 @@ class ReActLoop:
                 tool_results: list[str] = []
                 finish_call: tuple[ParsedToolCall, object] | None = None
                 parallel_candidates: list[tuple[ParsedToolCall, object]] = []
+                # Paths already claimed by a write/edit/patch call earlier in
+                # this same batch. Two calls targeting the same file would
+                # otherwise both capture the same pre-write snapshot below
+                # and dispatch concurrently with no ordering guarantee --
+                # if the second one's lint fails, its rollback would restore
+                # that shared stale snapshot and silently discard the first
+                # write too.
+                claimed_write_paths: dict[str, str] = {}
 
                 for tc in tool_calls:
                     logger.debug("Tool call: %s(%s)", tc.name, tc.arguments)
@@ -402,6 +470,28 @@ class ReActLoop:
                             tool_results.append(result)
                             failed_calls += 1
                             continue
+
+                    if tc.name in ("write", "edit", "patch"):
+                        raw_path = tc.arguments.get("path", "")
+                        try:
+                            write_key = str(self._context.workspace.resolve(raw_path))
+                        except Exception:
+                            write_key = raw_path
+                        if write_key:
+                            prior_tool = claimed_write_paths.get(write_key)
+                            if prior_tool is not None:
+                                result = self._make_tool_error(
+                                    f"'{raw_path}' is already targeted by a "
+                                    f"{prior_tool} call earlier in this same turn -- "
+                                    "two calls can't safely write the same file "
+                                    "concurrently. Make this change in a separate "
+                                    "step instead."
+                                )
+                                self._ui.on_tool_result(tc.name, result)
+                                tool_results.append(result)
+                                failed_calls += 1
+                                continue
+                            claimed_write_paths[write_key] = tc.name
 
                     parallel_candidates.append((tc, tool))
 
@@ -551,28 +641,12 @@ class ReActLoop:
                         self._context.conversation.add_message(
                             Message(role=Role.tool, content=verify_feedback)
                         )
-                elif action == RetryAction.REPLAN:
-                    logger.info("Replanning after repeated failures (step %d)", steps_taken)
-                    self._ui.on_replan()
-                    # Note: the scratchpad is deliberately NOT reset here --
-                    # it's the agent's accumulated working memory (decisions,
-                    # files touched, assumptions, open questions) and is
-                    # exactly what the next attempt needs, not something to
-                    # discard just because this attempt failed.
-                    plan = await self._planner.update_plan(
-                        plan,
-                        failure_context="\n".join(tool_results),
+                else:
+                    plan, escalate_result = await self._handle_replan_or_escalate(
+                        action, plan, retry_mgr, "\n".join(tool_results), steps_taken
                     )
-                    retry_mgr.on_replan()
-                elif action == RetryAction.ESCALATE:
-                    logger.warning("Escalating: persistent failures despite re-planning (step %d)", steps_taken)
-                    return self._make_result(
-                        plan=plan,
-                        steps_taken=steps_taken,
-                        message="The task could not be completed despite re-planning. "
-                                "The agent encountered persistent failures.",
-                        success=False,
-                    )
+                    if escalate_result is not None:
+                        return escalate_result
 
             logger.warning("Max steps (%d) exceeded", self._config.max_steps)
             return self._make_result(
@@ -632,14 +706,63 @@ class ReActLoop:
             "Keep working on this step before moving on."
         )
 
+    async def _handle_replan_or_escalate(
+        self,
+        action: RetryAction,
+        plan: Plan,
+        retry_mgr: RetryManager,
+        failure_context: str,
+        steps_taken: int,
+    ) -> tuple[Plan, AgentResult | None]:
+        """Shared REPLAN/ESCALATE handling for both the tool-call turn path
+        and the reasoning-only (no tool call) turn path. Previously only
+        the tool-call path acted on these -- a persistently malformed
+        response, or a model that just narrates an action instead of
+        taking one, could never trigger a replan or an honest early
+        failure there; it just looped silently until max_steps regardless
+        of how many times the step verifier rejected it.
+
+        Returns the (possibly replanned) plan, and a non-None AgentResult
+        if the run should end now (ESCALATE)."""
+        if action == RetryAction.REPLAN:
+            logger.info("Replanning after repeated failures (step %d)", steps_taken)
+            self._ui.on_replan()
+            failed_step = plan.current_step()
+            if failed_step is not None:
+                failed_step.status = StepStatus.failed
+            # Note: the scratchpad is deliberately NOT reset here -- it's
+            # the agent's accumulated working memory (decisions, files
+            # touched, assumptions, open questions) and is exactly what the
+            # next attempt needs, not something to discard just because
+            # this attempt failed.
+            plan = await self._planner.update_plan(plan, failure_context=failure_context)
+            retry_mgr.on_replan()
+            return plan, None
+
+        if action == RetryAction.ESCALATE:
+            logger.warning("Escalating: persistent failures despite re-planning (step %d)", steps_taken)
+            return plan, self._make_result(
+                plan=plan,
+                steps_taken=steps_taken,
+                message="The task could not be completed despite re-planning. "
+                        "The agent encountered persistent failures.",
+                success=False,
+            )
+
+        return plan, None
+
     def _detect_finish(self, content: str) -> bool:
-        triggers = [
-            "task is complete",
-            "i have finished",
-            "all done",
-            "finished the task",
-        ]
-        return any(t in content.lower() for t in triggers)
+        lowered = content.lower()
+        for trigger in _FINISH_TRIGGERS:
+            idx = lowered.find(trigger)
+            if idx == -1:
+                continue
+            window_start = max(0, idx - _NEGATION_WINDOW_CHARS)
+            preceding = lowered[window_start:idx]
+            if any(cue in preceding for cue in _NEGATION_CUES):
+                continue
+            return True
+        return False
 
     def _unread_existing_file(self, path: str, files_read: set[str]) -> str | None:
         """Returns the canonical path if `path` refers to an existing file
@@ -661,12 +784,8 @@ class ReActLoop:
         return key
 
     def _is_destructive_command(self, command: str) -> bool:
-        from chef_human.tools.shell import DESTRUCTIVE_PREFIXES
-        stripped = command.strip()
-        for prefix in DESTRUCTIVE_PREFIXES:
-            if stripped.startswith(prefix):
-                return True
-        return False
+        from chef_human.tools.shell import BashTool
+        return BashTool._is_destructive(command)
 
     async def _request_approval(self, tool_call: ParsedToolCall) -> bool:
         result = await self._ui.on_approval_request(tool_call)

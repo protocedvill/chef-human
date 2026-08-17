@@ -73,3 +73,44 @@ class TestBashTool:
 
     async def test_timeout_capped(self, bash_tool):
         assert bash_tool.TIMEOUT_MAX == 300
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git add foo.py",
+            "npm add lodash",
+            "yarn add react",
+            "echo added",
+            "mkdir addons",
+            "git commit --amend",
+        ],
+    )
+    async def test_blacklist_does_not_false_positive_on_add(self, bash_tool, command):
+        """Regression test: the blacklist's "dd" entry (for the `dd`
+        command) must not substring-match the "dd" inside "add"."""
+        result = await bash_tool.run(command=command)
+        assert result.success or "blocked" not in (result.error or "")
+
+    def test_blacklist_matches_dd_as_a_command_not_a_substring(self):
+        assert BashTool._is_blacklisted("dd if=/dev/zero of=/dev/sda")
+        assert not BashTool._is_blacklisted("git add foo.py")
+        assert not BashTool._is_blacklisted("npm add lodash")
+
+    def test_blacklist_catches_chained_and_wrapped_destructive_commands(self):
+        assert BashTool._is_blacklisted("echo hi; dd if=x of=y")
+        assert BashTool._is_blacklisted("bash -c 'dd if=x of=y'")
+        assert BashTool._is_blacklisted("sudo reboot")
+
+    def test_destructive_detects_chained_commands(self):
+        """A leading benign command must not hide a later destructive one."""
+        assert BashTool._is_destructive("echo hi && rm important_file.txt")
+        assert BashTool._is_destructive("echo hi; rmdir project")
+
+    def test_destructive_detects_wrapped_commands(self):
+        assert BashTool._is_destructive('bash -c "rm -rf ./build"')
+        assert BashTool._is_destructive("sudo rm -rf /tmp/x")
+        assert BashTool._is_destructive("sudo -u root rm file")
+
+    def test_destructive_does_not_flag_ordinary_redirects(self):
+        assert not BashTool._is_destructive("pytest > out.log")
+        assert not BashTool._is_destructive("echo hi")

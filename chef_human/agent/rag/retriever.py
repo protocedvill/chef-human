@@ -51,9 +51,51 @@ class RAGRetriever:
             self._initial_built = True
             return 0
 
-        texts = [c.content for c in chunks]
-        embeddings = self._embedder.embed(texts)
-        metadata = [
+        embeddings = self._embedder.embed([c.content for c in chunks])
+        self._store.add(embeddings, self._chunk_metadata(chunks))
+        self._initial_built = True
+        logger.info("RAG built: %d chunks from %d files", len(chunks), len(files))
+        return len(chunks)
+
+    def update(self, files: list[Path]) -> int:
+        """Incrementally re-index just `files` (added, changed, or deleted)
+        instead of build()'s full clear-and-rebuild -- each file's old
+        chunks are removed first, then re-added from its current content
+        (or just left removed, if the file no longer exists)."""
+        if not self._initial_built:
+            return self.build(files=files)
+
+        total_chunks = 0
+        for f in files:
+            removed = self._store.remove_by_file(str(f))
+            if removed:
+                logger.debug("Removed %d stale chunk(s) for %s", removed, f)
+
+            if not f.exists():
+                continue
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            file_chunks = self._chunker.chunk_file(str(f), content)
+            if not file_chunks:
+                continue
+
+            embeddings = self._embedder.embed([c.content for c in file_chunks])
+            self._store.add(embeddings, self._chunk_metadata(file_chunks))
+            total_chunks += len(file_chunks)
+
+        if total_chunks:
+            logger.info(
+                "RAG updated: %d chunk(s) from %d changed file(s)",
+                total_chunks, len(files),
+            )
+        return total_chunks
+
+    @staticmethod
+    def _chunk_metadata(chunks: list[Chunk]) -> list[dict]:
+        return [
             {
                 "chunk_id": c.chunk_id,
                 "file_path": c.file_path,
@@ -63,10 +105,6 @@ class RAGRetriever:
             }
             for c in chunks
         ]
-        self._store.add(embeddings, metadata)
-        self._initial_built = True
-        logger.info("RAG built: %d chunks from %d files", len(chunks), len(files))
-        return len(chunks)
 
     def retrieve(self, query: str, top_k: int = 5) -> list[Chunk]:
         if not self._initial_built or len(self._store) == 0:

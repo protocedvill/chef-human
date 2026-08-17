@@ -121,12 +121,17 @@ class Planner:
         text = content.strip()
         reason_match = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE)
         reason = reason_match.group(1).strip() if reason_match else ""
-        upper = text.upper()
-        if "NOT_COMPLETE" in upper or "NOT COMPLETE" in upper:
+        verdict_match = re.search(
+            r"^\s*VERDICT:\s*(NOT_COMPLETE|NOT COMPLETE|PARTIAL|COMPLETE)\s*$",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        verdict_text = verdict_match.group(1).upper() if verdict_match else ""
+        if verdict_text in {"NOT_COMPLETE", "NOT COMPLETE"}:
             return StepVerdict.not_complete, reason
-        if "PARTIAL" in upper:
+        if verdict_text == "PARTIAL":
             return StepVerdict.partial, reason
-        if "COMPLETE" in upper:
+        if verdict_text == "COMPLETE":
             return StepVerdict.complete, reason
         return StepVerdict.not_complete, reason or "Could not parse verifier response"
 

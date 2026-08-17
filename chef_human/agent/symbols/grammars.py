@@ -4,8 +4,6 @@ import importlib
 import logging
 from typing import Any
 
-from tree_sitter import Language
-
 logger = logging.getLogger(__name__)
 
 _LANGUAGE_PACKAGES: dict[str, tuple[str, str]] = {
@@ -61,6 +59,8 @@ class GrammarLoader:
 
         pkg_name, func_name = entry
         try:
+            from tree_sitter import Language
+
             mod = importlib.import_module(pkg_name)
             raw = getattr(mod, func_name)()
             lang = Language(raw) if not isinstance(raw, Language) else raw

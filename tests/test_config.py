@@ -80,6 +80,25 @@ class TestLoadSettings:
             s = load_settings()
             assert s.workspace == "/home/user/project"
 
+    def test_unknown_env_key_is_ignored_not_fatal(self):
+        """A stray CHEF_-prefixed env var that isn't a real Settings field
+        (typo, or unrelated to chef-human) must not crash load_settings()."""
+        env_data = {"totally_unknown_setting": "x", "temperature": 0.3}
+        with patch("chef_human.config._load_toml", return_value={}), patch(
+            "chef_human.config._load_env", return_value=env_data
+        ):
+            s = load_settings()
+            assert s.temperature == 0.3
+            assert not hasattr(s, "totally_unknown_setting")
+
+    def test_unknown_toml_key_is_ignored_not_fatal(self):
+        toml_data = {"totally_unknown_setting": "x", "llm_backend": "llamacpp"}
+        with patch("chef_human.config._load_toml", return_value=toml_data), patch(
+            "chef_human.config._load_env", return_value={}
+        ):
+            s = load_settings()
+            assert s.llm_backend == "llamacpp"
+
 
 class TestLoadToml:
     def test_returns_empty_when_file_missing(self):
@@ -115,6 +134,16 @@ class TestLoadToml:
 
         data = _load_toml(str(toml_file))
         assert data == {}
+
+    def test_malformed_toml_raises_clear_error(self, tmp_path: Path):
+        """A syntax error in config.toml must not crash with a raw
+        tomllib.TOMLDecodeError traceback -- raise something actionable."""
+        toml_file = tmp_path / "config.toml"
+        toml_file.write_text("[chef_human]\nthis is not valid toml =====\n")
+        from chef_human.config import _load_toml
+
+        with pytest.raises(ValueError, match="not valid TOML"):
+            _load_toml(str(toml_file))
 
 
 class TestLoadEnv:

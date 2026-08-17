@@ -2,11 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from chef_human.llm.chatml import format_tool_definitions
-
 if TYPE_CHECKING:
     from chef_human.agent.planner import Plan
-    from chef_human.llm.backend import ToolDefinition
 
 
 PLANNER_SYSTEM_PROMPT = """You are a planning assistant for a software engineering AI.
@@ -27,10 +24,10 @@ Rules:
 
 AGENT_SYSTEM_PROMPT = """You are chef-human, an AI software engineering assistant.
 You have access to tools that let you read, write, and search files, run commands, and ask the user.
-
-## How to use tools
-To call a tool, output:
-<tool_call>{{ "name": "tool_name", "arguments": {{ "arg1": "value1" }} }}</tool_call>
+The available tools, their arguments, and how to invoke them are provided to you directly through
+the model interface's own tool-calling support -- use it to take the action. Describing an action
+in plain text ("I'll call X") without actually invoking it accomplishes nothing: no tool runs, no
+file is read or changed, and the step stays incomplete no matter how clearly you described it.
 
 After each tool result, analyze it and decide the next action.
 When ALL steps of the plan are complete, call the `finish` tool.
@@ -65,9 +62,6 @@ When ALL steps of the plan are complete, call the `finish` tool.
 
 ## Plan
 {plan_text}
-
-## Available Tools
-{tool_definitions}
 
 ## Notes / Scratchpad
 {scratchpad}
@@ -120,14 +114,12 @@ def build_verify_prompt(goal: str, step: str, evidence: str) -> str:
 
 def build_agent_prompt(
     plan: Plan,
-    tool_defs: list[ToolDefinition],
     repo_map: str = "",
     scratchpad: str = "",
 ) -> str:
     from chef_human.agent.planner import Planner
 
     plan_text = Planner.format_plan_for_prompt(plan)
-    tool_text = format_tool_definitions(tool_defs)
 
     step = plan.current_step()
     current_step_text = (
@@ -140,6 +132,5 @@ def build_agent_prompt(
         current_step=current_step_text,
         repo_map=repo_map or "(no project context loaded)",
         plan_text=plan_text,
-        tool_definitions=tool_text,
         scratchpad=scratchpad or "(empty -- use ## Scratchpad: to add notes)",
     )

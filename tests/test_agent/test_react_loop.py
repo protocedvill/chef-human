@@ -151,44 +151,23 @@ def _make_tool_run(result_str: str = "ok", success: bool = True):
 class TestBuildAgentPrompt:
     def test_base_prompt(self):
         plan = Plan(goal="Test", steps=[])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        prompt = build_agent_prompt(plan=plan)
         assert "chef-human" in prompt
-
-    def test_includes_tool_definitions(self):
-        plan = Plan(goal="Test", steps=[])
-        tool_defs = [
-            ToolDefinition(name="read", description="Read", parameters={"type": "object"})
-        ]
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
-        assert "read" in prompt
 
     def test_includes_plan(self):
         plan = Plan(goal="Test", steps=[PlanStep(index=1, description="Do something")])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        prompt = build_agent_prompt(plan=plan)
         assert "Step 1" in prompt
         assert "Do something" in prompt
 
-    def test_with_both(self):
-        plan = Plan(goal="Test", steps=[PlanStep(index=1, description="Do something")])
-        tool_defs = [
-            ToolDefinition(name="read", description="Read", parameters={"type": "object"})
-        ]
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
-        assert "read" in prompt
-        assert "Step 1" in prompt
-
     def test_repo_map_empty_uses_fallback(self):
         plan = Plan(goal="Test", steps=[])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
+        prompt = build_agent_prompt(plan=plan)
         assert "no project context loaded" in prompt
 
     def test_repo_map_included_when_provided(self):
         plan = Plan(goal="Test", steps=[])
-        tool_defs: list[ToolDefinition] = []
-        prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs, repo_map="src/\n  main.py")
+        prompt = build_agent_prompt(plan=plan, repo_map="src/\n  main.py")
         assert "src/" in prompt
         assert "no project context loaded" not in prompt
 
@@ -534,6 +513,57 @@ class TestReActLoopRun:
         await loop.run("do something")
         # After 2 consecutive failures (max_retries_per_step=2), should trigger re-plan
         planner.update_plan.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_replan_marks_current_step_failed_before_replanning(self):
+        """StepStatus.failed previously had no producer anywhere -- a step
+        that triggered a replan just silently stayed 'pending'. It should
+        be marked failed at the moment replanning is triggered."""
+        backend = _make_mock_backend()
+
+        async def side_effect(*args, **kwargs):
+            return CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content='<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>',
+                )
+            )
+        backend.complete.side_effect = side_effect
+
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        observed_statuses = []
+
+        async def capture_status_on_replan(plan, failure_context):
+            # By this point the failed step is no longer "current" (that
+            # only matches pending) -- check the step itself.
+            observed_statuses.append(plan.steps[0].status)
+            return Plan(goal="Retry plan", steps=[])
+
+        planner.update_plan.side_effect = capture_status_on_replan
+
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = _make_tool_run("fail", success=False)
+        registry.get.return_value = read_tool
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=10, max_retries_per_step=2),
+        )
+        await loop.run("do something")
+
+        assert observed_statuses == [StepStatus.failed]
 
     @pytest.mark.asyncio
     async def test_reasoning_stored_as_assistant_message(self):
@@ -1255,6 +1285,155 @@ class TestReActLoopRun:
         assert "use SQLite" not in scratchpad_args[0]
         # Every prompt built after the note (including post-replan) still has it.
         assert all("use SQLite" in s for s in scratchpad_args[1:])
+
+
+class TestReasoningOnlyFailureHandling:
+    """Regression tests for a real production failure: a small local model
+    got stuck repeating the exact same plain-reasoning sentence ("Let's
+    call the ls tool...") for 25 straight turns without ever emitting an
+    actual <tool_call>. Because record_iteration(0, 0, []) always returned
+    STEP_COMPLETED and reset consecutive_failures regardless of what the
+    step verifier concluded, and because the no-tool-calls branch never
+    acted on REPLAN/ESCALATE at all, this failure mode was invisible to
+    every safety mechanism in the loop and just burned all of max_steps."""
+
+    @pytest.mark.asyncio
+    async def test_repeated_reasoning_rejection_triggers_replan(self):
+        backend = _make_mock_backend()
+
+        async def side_effect(*args, **kwargs):
+            return CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="Let's call the ls tool with the path to the directory:",
+                )
+            )
+        backend.complete.side_effect = side_effect
+
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        planner.verify_step.return_value = (StepVerdict.not_complete, "no tool evidence")
+        planner.update_plan.return_value = Plan(goal="Retry plan", steps=[])
+
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=10, max_retries_per_step=2, max_replans=1),
+        )
+        await loop.run("do something")
+
+        planner.update_plan.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repeated_reasoning_rejection_escalates_before_max_steps(self):
+        """The bug's actual symptom: the run used to always hit max_steps
+        with "Max steps exceeded" -- it should now escalate honestly and
+        much sooner once replanning also fails to help."""
+        backend = _make_mock_backend()
+
+        async def side_effect(*args, **kwargs):
+            return CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="Let's call the ls tool with the path to the directory:",
+                )
+            )
+        backend.complete.side_effect = side_effect
+
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        planner.verify_step.return_value = (StepVerdict.not_complete, "no tool evidence")
+        planner.update_plan.return_value = Plan(
+            goal="Retry plan",
+            steps=[PlanStep(index=1, description="Step one", status=StepStatus.pending)],
+        )
+
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=25, max_retries_per_step=2, max_replans=1),
+        )
+        result = await loop.run("do something")
+
+        assert result.success is False
+        assert "persistent failures" in result.message.lower()
+        # The whole point: it must not have silently run all the way to
+        # max_steps to discover this.
+        assert result.steps_taken < 25
+
+    @pytest.mark.asyncio
+    async def test_identical_reasoning_triggers_repeat_nudge(self):
+        backend = _make_mock_backend()
+
+        async def side_effect(*args, **kwargs):
+            return CompletionResponse(
+                message=Message(
+                    role=Role.assistant,
+                    content="Let's call the ls tool with the path to the directory:",
+                )
+            )
+        backend.complete.side_effect = side_effect
+
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        planner.verify_step.return_value = (StepVerdict.not_complete, "no tool evidence")
+
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=3, max_retries_per_step=5),
+        )
+        await loop.run("do something")
+
+        messages = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if getattr(c.args[0], "role", None) == Role.tool
+        ]
+        assert any("same thing" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_reasoning_verified_complete_does_not_count_as_failure(self):
+        """A reasoning-only turn the verifier accepts must not be punished
+        -- only a rejection should count against the retry budget."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(role=Role.assistant, content="Everything here is already done.")
+        )
+
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        planner.verify_step.return_value = (StepVerdict.complete, "looks done")
+
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=5, max_retries_per_step=1),
+        )
+        result = await loop.run("do something")
+
+        planner.update_plan.assert_not_awaited()
+        assert result.success is False  # ran out of turns, but not via replan/escalate
 
 
 class TestStepVerification:
@@ -2267,6 +2446,28 @@ class TestLooksInvestigative:
         assert _looks_investigative("Test the implementation by running it") is False
 
 
+class TestDetectFinish:
+    def test_positive_completion_phrases(self):
+        loop = _make_loop_with_mocks()
+        assert loop._detect_finish("The task is complete.")
+        assert loop._detect_finish("I have finished setting everything up.")
+        assert loop._detect_finish("All done, everything works.")
+        assert loop._detect_finish("I finished the task successfully.")
+
+    def test_negated_phrases_are_not_detected_as_finished(self):
+        """Regression test: a plain substring match on "finished the task"
+        falsely fires on "I haven't finished the task yet"."""
+        loop = _make_loop_with_mocks()
+        assert not loop._detect_finish("I haven't finished the task yet, more work is needed.")
+        assert not loop._detect_finish("I don't think the task is complete.")
+        assert not loop._detect_finish("This is not all done -- there's more to do.")
+
+    def test_unrelated_text_not_detected(self):
+        loop = _make_loop_with_mocks()
+        assert not loop._detect_finish("Let me read the file first.")
+        assert not loop._detect_finish("")
+
+
 class TestIsVagueNextStepQuestion:
     def test_exact_phrase_from_bug_report(self):
         from chef_human.agent.react_loop import _is_vague_next_step_question
@@ -2315,6 +2516,16 @@ class TestIsDestructiveCommand:
     def test_strips_whitespace(self):
         loop = _make_loop_with_mocks()
         assert loop._is_destructive_command("  rm file.txt  ")
+
+    def test_catches_chained_and_wrapped_commands(self):
+        """The approval gate must not be bypassable by chaining a
+        destructive command after a benign one, or wrapping it in `bash -c`
+        / `sudo` -- it now delegates to BashTool._is_destructive, which
+        handles both."""
+        loop = _make_loop_with_mocks()
+        assert loop._is_destructive_command("echo hi && rm important_file.txt")
+        assert loop._is_destructive_command('bash -c "rm -rf ./build"')
+        assert loop._is_destructive_command("sudo rm -rf /tmp/x")
         assert not loop._is_destructive_command("  ls -la  ")
 
 
@@ -2519,6 +2730,56 @@ class TestParallelToolExecution:
         )
         result = await loop.run("do something")
         assert result.success is False  # error → retry → max_steps
+
+    @pytest.mark.asyncio
+    async def test_duplicate_write_path_in_same_turn_is_rejected(self):
+        """Two write/edit/patch calls targeting the same file in one turn
+        must not both dispatch -- see the same-file-race regression test in
+        the plan: both would otherwise capture the same pre-write snapshot
+        and race concurrently."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content="Writing twice.\n"
+                '<tool_call>{"name": "write", "arguments": {"path": "conflict.py", "content": "a"}}</tool_call>\n'
+                '<tool_call>{"name": "write", "arguments": {"path": "conflict.py", "content": "b"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        }
+        write_tool.run = AsyncMock(return_value=MagicMock(output="wrote", success=True, error=None))
+
+        registry.get.side_effect = lambda name: {"write": write_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, lint_after_write=False),
+        )
+        await loop.run("do something")
+
+        write_tool.run.assert_awaited_once()
+
+        rejection_messages = [
+            call.args[0].content
+            for call in context.conversation.add_message.call_args_list
+            if "already targeted" in getattr(call.args[0], "content", "")
+        ]
+        assert len(rejection_messages) == 1
+        assert "conflict.py" in rejection_messages[0]
 
     @pytest.mark.asyncio
     async def test_single_tool_call_still_works(self):

@@ -269,6 +269,48 @@ class TestInitialTaskAutoSubmit:
             await pilot.pause()
             assert app._exit is False
 
+    async def test_stays_open_after_persistent_failure_even_with_auto_exit(self, tmp_path):
+        """Regression test: auto-exit used to fire unconditionally once the
+        initial task finished, closing the panel before there was any
+        chance to read why a persistent failure happened. It should only
+        auto-exit on success."""
+        async def on_submit(text: str) -> AgentResult:
+            return AgentResult(
+                plan=Plan(goal="do the thing", steps=[]),
+                steps_taken=5,
+                message="The task could not be completed despite re-planning.",
+                success=False,
+            )
+
+        app = ChefHumanTUI(
+            workspace_root=tmp_path,
+            on_submit=on_submit,
+            initial_task="fix the bug",
+            auto_exit_after_initial_task=True,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._exit is False
+
+    async def test_still_auto_exits_on_success(self, tmp_path):
+        async def on_submit(text: str) -> AgentResult:
+            return AgentResult(
+                plan=Plan(goal="do the thing", steps=[]),
+                steps_taken=3,
+                message="All done.",
+                success=True,
+            )
+
+        app = ChefHumanTUI(
+            workspace_root=tmp_path,
+            on_submit=on_submit,
+            initial_task="fix the bug",
+            auto_exit_after_initial_task=True,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._exit is True
+
     async def test_user_can_still_type_after_initial_task(self, tmp_path):
         calls: list[str] = []
 

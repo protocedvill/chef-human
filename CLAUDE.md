@@ -45,6 +45,15 @@ pyright
 Ollama must be running locally (`ollama serve`) with the configured model pulled
 (default `qwen2.5-coder:7b`) for anything that actually calls the LLM.
 
+### Environment on this machine
+
+The working Python venv is `/home/louis/chef-human/.env` (note: `.env`, not `.venv`) — already has
+the project installed editable. It may be missing the `indexing`/`rag`/`embeddings` extras depending
+on when it was last touched; if symbol/RAG tests fail with `ModuleNotFoundError` or grammar-loader
+`None` results, run `.env/bin/pip install -e ".[indexing,rag,embeddings]"` before assuming a real
+regression. Ollama runs as a systemd service already listening on `http://localhost:11434` — it does
+not need to be started manually. See `AGENTS.md` for the same info in agent-facing form.
+
 ## Configuration
 
 `Settings` (`chef_human/config.py`) is a frozen dataclass loaded once at import time into the module-level
@@ -53,6 +62,11 @@ Ollama must be running locally (`ollama serve`) with the configured model pulled
 like `--model`/`--temperature`/`--config` are applied by monkeypatching `chef_human.config.settings` for
 the duration of agent construction (see `_execute_task`/`_run_repl` in `main.py`) — don't assume
 `settings` is stable across the process lifetime.
+
+`ollama_think` (`bool`, default `False`) controls Ollama's native `think` chat parameter — needed for
+reasoning/thinking-style models like Qwen3.x. Set via `config.toml` or `CHEF_OLLAMA_THINK=true`; there
+is no CLI flag for it yet. Qwen3.6 (`qwen3.6:27b`, `qwen3.6:35b-a3b` locally) both work well as
+`ollama_model` values as of this writing — validated against the full benchmark suite (see below).
 
 ## Architecture
 
@@ -85,6 +99,42 @@ Post-write, if `lint_after_write` is set, `run_lint` (`chef_human/agent/linter.p
 lint errors trigger a rollback of that write (`_rollback_file`) using content captured before dispatch
 (`_capture_file_content`).
 
+**Step verification (`_verify_and_mark_step`) is where most of the interesting bugs live.** It decides,
+per turn, whether the plan's current step is done — via deterministic guards first (file-creation/
+mutation/execution-step checks against real disk state and tool exit codes) and an LLM verifier
+(`Planner.verify_step`) as the fallback for anything not objectively checkable. `_verify_and_mark_step`
+now has `logger.debug("VERIFIER_DEBUG ...")` lines logging the exact evidence/history/finish_summary
+sent to the verifier on every call — turn on debug logging (`--log-file` + appropriate level) before
+trying to diagnose a false escalation rather than re-instrumenting from scratch.
+
+Two related false-escalation bugs were found and fixed by running the larger benchmark cases (marathon,
+expert) against Qwen3.6 repeatedly — both looked like "the agent failed" but were actually the harness
+rejecting already-correct work until `RetryManager`'s 5-consecutive-failure cap escalated:
+- A step description matching both `_looks_investigative` (e.g. "identify") and `_looks_like_execution_step`
+  (e.g. "run"/"test") — a very natural phrasing like "run the tests to identify which one is failing" —
+  used to route through the investigative branch first, whose no-named-files evidence fallback only
+  accepted `read`/`ls`/`grep`/`glob`, not `bash`. A step phrased that way rejected every turn that
+  actually ran the tests, no matter how many times they passed. Fixed by widening that fallback to also
+  accept a successful `bash` command when the step's wording independently reads as an execution step.
+- `EditTool` reported a no-op edit (`old_string == new_string`, or content already matched) identically
+  to a real edit: `"Applied edit to X (N occurrences)"` with no diff. When a replan generates a new step
+  demanding a fix that was already applied and verified under an *earlier* step's evidence (evidence is
+  keyed by exact step-description text via `_step_evidence_key`, so a replan's reworded step starts with
+  an empty bucket even though the underlying work is done), the model's redundant re-edit came back
+  as this ambiguous "success" message, and the LLM verifier read "no visible diff" as "not fixed" even
+  though the file's actual current content (also in its prompt) was already correct. Fixed by making
+  `EditTool`'s no-op message explicit ("No changes made: ... already in the desired state") and adding a
+  sentence to `STEP_VERIFY_PROMPT` establishing current file contents as ground truth over whether *this*
+  turn's tool call produced a visible change.
+
+**Known, not-yet-fixed follow-up**: the root cause underlying both of the above is broader than either
+individual fix — `_step_evidence_key` keys accumulated per-step evidence (files written, successful
+commands) by the exact step-description string, so *any* replan that rewords a step orphans all
+evidence accumulated under the old wording, even when the step's real-world goal was already achieved.
+This can still surface as a false escalation on long tasks with multiple replans; if it recurs, the fix
+likely needs evidence to survive across a replan for steps whose underlying goal is unchanged, not
+another narrow evidence-acceptance patch.
+
 ### Tools (`chef_human/tools/`)
 
 Each tool is a plain class with `name`, `description`, `parameters` (JSON schema) and an async `run()`,
@@ -97,6 +147,12 @@ relying on undo/edit interaction.
 
 `refactor_symbol` renames across multiple files but records one `DiffStore` entry per file, so a single
 `undo` call only reverts the last file touched, not the whole rename.
+
+`EditTool`'s wording for its result matters more than it looks like it should: the step verifier LLM
+reads tool output text as evidence, so ambiguous phrasing directly causes false step-completion
+judgments. A no-op edit (`old_string == new_string`) says `"No changes made: ... already in the desired
+state"`, not a generic `"Applied edit"` with no diff (see the step-verification note above) — follow this
+pattern (explicit, unambiguous success/no-op wording) for any new tool output text, not just edits.
 
 `BashTool`'s destructive-command guard (`shell.py` `BLACKLIST`/`DESTRUCTIVE_PREFIXES`) and the duplicated
 approval gate in `react_loop.py` (`_is_destructive_command`) both match on literal command prefixes/
@@ -129,11 +185,18 @@ store — there's no incremental update path analogous to `SymbolIndex.refresh()
 
 `create_backend()` (`llm/__init__.py`) picks `OllamaBackend` or `LlamaCppBackend` based on
 `settings.llm_backend`. Both implement a shared `LLMBackend` protocol (`backend.py`): `complete()`,
-`complete_stream()`, `embed()`, `count_tokens()`. Tool calls are communicated to the model via
-ChatML-style `<tool_call>{...}</tool_call>` tags (`chatml.py` formats the system prompt/tool
-definitions; each backend's `parse_tool_calls` extracts them from raw completion text) rather than a
-native function-calling API — this is deliberate, for compatibility with small local models that don't
-reliably support structured tool-calling.
+`complete_stream()`, `embed()`, `count_tokens()`.
+
+`OllamaBackend` supports two tool-call paths: it first checks `response.message.tool_calls` (Ollama's
+native structured tool-calling field, populated for models whose template supports it, e.g. Qwen3.x's
+`qwen3.5` renderer/parser) via `parser.parse_native_tool_calls`, and falls back to scraping
+ChatML-style `<tool_call>{...}</tool_call>` tags out of raw content (`parser.parse_tool_calls`) only
+when the native field is empty — for models/templates with no native tool-calling support at all.
+`LlamaCppBackend` has no native path and always expects `<tool_call>` tags. `react_loop.py` calls
+whichever path fires via `response.message.tool_calls` truthiness (`react_loop.py` ~line 717) — a
+`Message` mock in a test must set `tool_calls=None` explicitly, since a bare `MagicMock(content=...)`
+auto-fabricates a truthy `.tool_calls` attribute and silently takes the wrong path (bit us once, see
+`tests/test_agent/test_persistence.py`).
 
 ### Context assembly (`chef_human/agent/context.py`, `file_context.py`, `repo_map.py`)
 
@@ -148,6 +211,31 @@ Sessions (conversation history + task) are saved/loaded as JSON via `chef_human/
 (default dir `DEFAULT_SAVE_DIR`), surfaced through `chef-human session list/show/delete/export` and
 `--resume`/`--continue`. UI is pluggable via the `ReActUI` protocol (`chef_human/ui/protocol.py`):
 `DebugTUI`, `StreamingUI`, `ReplUI`, or `NoopUI` for headless runs.
+
+## Benchmark suite (`chef_human/benchmark.py`)
+
+`python -m chef_human.benchmark` runs the agent (as a real subprocess, `chef-human run --headless`)
+against a fixed set of `BenchmarkCase`s in disposable workspaces, verifying each with an independent
+external command (never the agent's own say-so) plus a protected-files integrity check. `--list` shows
+cases, `--case <id>` runs one, `--through <level>` runs every case up to that difficulty, `--model` and
+`CHEF_OLLAMA_THINK=true` (env, no CLI flag) override the model/backend config for the run. Seven cases
+across seven levels, increasing in scope/difficulty: `smoke` (hello_world) → `core` (slugify_contract,
+TDD against a supplied spec+tests) → `stretch` (inventory_refactor, multi-file repair+extend) →
+`expert` ×2 (lru_cache_repair, scroll_grid_navigation_repair — diagnose a subtle bug in an otherwise-
+plausible implementation; the latter is a real niri bug, PR #686) → `frontier` (task_scheduler, build
+a topological-sort scheduler from a spec alone, no starter code) → `adversarial`
+(rate_limiter_config_trap, spec includes real traps: a protected shared config to read not hardcode, a
+banned `time.sleep` call) → `marathon` (library_system, ~24-test multi-module system built from a large
+spec, no starter code — the largest-scope case, and the one that originally surfaced the false-
+escalation bugs described above since it needs the most turns).
+
+Every case was validated against a hand-written reference solution (and, for bug-hunt cases, the exact
+buggy seed) before being wired in — confirm any new case fails/passes exactly as intended in isolation
+(`python -c "from chef_human.benchmark import CASES; ..."` + `subprocess.run` the verification command
+directly against seed files) before trusting a live model run's pass/fail as ground truth for the case
+itself. As of this writing, `qwen3.6:27b` and `qwen3.6:35b-a3b` both pass all 7 cases cleanly (100%);
+`qwen3.6:35b-a3b` is consistently ~2x the completion-token throughput of `qwen3.6:27b` (MoE, ~3B active
+params) and noticeably faster wall-clock on the harder cases despite being the larger model on disk.
 
 ## Testing conventions
 

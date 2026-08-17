@@ -12,6 +12,7 @@ class Settings:
     llm_backend: Literal["ollama", "llamacpp"] = "ollama"
     ollama_model: str = "qwen2.5-coder:7b"
     ollama_host: str = "http://localhost:11434"
+    ollama_think: bool = False
     llamacpp_model_path: str | None = None
     llamacpp_n_gpu_layers: int = 0
     llamacpp_n_threads: int | None = None

@@ -240,7 +240,11 @@ def _prepare_agent_path(workspace: Path) -> dict[str, str]:
     )
     python_shim.chmod(0o755)
     env = dict(os.environ)
-    env["PATH"] = f"{shim_dir}:{env.get('PATH', '')}"
+    # Prepend the venv bin (parent of sys.executable) too: ruff lives there
+    # (not on the host PATH), and the agent's lint-after-write rollback
+    # silently no-ops when `ruff` isn't findable.
+    venv_bin = str(Path(sys.executable).parent)
+    env["PATH"] = f"{shim_dir}:{venv_bin}:{env.get('PATH', '')}"
     return env
 
 

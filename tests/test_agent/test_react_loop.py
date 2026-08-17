@@ -11,7 +11,10 @@ from chef_human.agent.react_loop import (
     AgentResult,
     ReActConfig,
     ReActLoop,
+    _step_file_contents,
+    _step_python_syntax_errors,
 )
+from chef_human.agent.workspace import WorkspaceManager
 from chef_human.llm.backend import (
     CompletionResponse,
     LLMBackend,
@@ -200,7 +203,7 @@ class TestReActConfig:
     def test_defaults(self):
         config = ReActConfig()
         assert config.max_steps == 25
-        assert config.max_retries_per_step == 3
+        assert config.max_retries_per_step == 5
         assert config.temperature == 0.0
         assert config.max_tokens_per_response == 4096
         assert config.lint_after_write is True
@@ -1927,13 +1930,211 @@ class TestObjectiveFileVerification:
         assert "hello_world.py: exists=True, lines=2, created_during_step=True" in evidence_arg
 
 
+class TestVerifierSeesFileContents:
+    @pytest.mark.asyncio
+    async def test_verifier_evidence_includes_current_file_contents(self, tmp_path):
+        """The step verifier must see the verbatim current content of the
+        step's files (read from disk at verification time), not just the
+        turn's tool-result diffs -- the vague "duplicate code" feedback that
+        sent the agent chasing a phantom problem came from the verifier
+        having to guess at the file's actual state."""
+        (tmp_path / "report.py").write_text(
+            "def inventory_report(inventory):\n"
+            "    if not inventory.items:\n"
+            "        return '(empty)'\n"
+            "    return inventory.items\n"
+            "    return inventory.items\n"
+        )
+        workspace = WorkspaceManager(root=str(tmp_path))
+
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "read", "arguments": {"path": "report.py"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Fix the duplicated return line in report.py", status=StepStatus.pending),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        context.workspace = workspace
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = AsyncMock(
+            return_value=MagicMock(output="(contents)", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"read": read_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        planner.verify_step.assert_awaited_once()
+        _, _, evidence_arg = planner.verify_step.await_args.args
+        assert "Current file contents (read directly from disk for verification):" in evidence_arg
+        assert "--- report.py ---" in evidence_arg
+        assert "return inventory.items" in evidence_arg
+
+
+class TestVerifierSyntaxGuard:
+    @pytest.mark.asyncio
+    async def test_broken_file_cannot_complete_even_if_verifier_says_complete(self, tmp_path):
+        """A step whose .py file does not even parse must not be marked
+        complete, even when the LLM verifier (which previously returned a
+        false "complete" verdict for a column-0 IndentationError, observed in
+        the inventory benchmark run 4) says it is -- the deterministic syntax
+        check overrides the verdict."""
+        (tmp_path / "inventory.py").write_text(
+            "class Inventory:\n"
+            "    def remove(self, name, quantity):\n"
+            "        if name not in self.stock:\n"
+            " raise KeyError()\n"
+        )
+        workspace = WorkspaceManager(root=str(tmp_path))
+
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "edit", "arguments": {"path": "inventory.py", "old_string": "raise KeyError()", "new_string": "        raise KeyError()"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        # Default verify_step mock returns complete -- the regression this
+        # guards against.
+        plan = Plan(goal="g", steps=[
+            PlanStep(index=1, description="Implement the remove method in inventory.py", status=StepStatus.pending),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        context.workspace = workspace
+        registry = _make_mock_tool_registry()
+        edit_tool = MagicMock()
+        edit_tool.name = "edit"
+        edit_tool.parameters = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+            },
+            "required": ["path", "old_string", "new_string"],
+        }
+        edit_tool.run = AsyncMock(
+            return_value=MagicMock(output="edited inventory.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"edit": edit_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(
+                max_steps=1,
+                require_read_before_edit=False,
+                lint_after_write=False,
+            ),
+        )
+        await loop.run("do something")
+
+        assert plan.steps[0].status == StepStatus.pending
+        planner.verify_step.assert_awaited_once()
+        added = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if hasattr(c.args[0], "content")
+        ]
+        assert any("syntax error" in text for text in added if isinstance(text, str))
+        assert any("E999 SyntaxError" in text for text in added if isinstance(text, str))
+
+
+class TestRolledBackContentVerification:
+    def test_step_file_contents_shows_attempted_content(self, tmp_path):
+        """After a lint-rollback the on-disk file is the clean pre-write
+        state; the verifier evidence must instead show the *attempted*
+        content the model produced, so it can cite the exact offending lines."""
+        path = tmp_path / "inventory.py"
+        path.write_text("class Inventory:\n    def remove(self, name, quantity):\n        pass\n")
+        workspace = WorkspaceManager(root=str(tmp_path))
+        attempted = (
+            "class Inventory:\n"
+            "    def remove(self, name, quantity):\n"
+            "        if name not in self.stock:\n"
+            " raise KeyError()\n"
+        )
+        content = _step_file_contents(
+            workspace,
+            written_paths=[str(path.resolve())],
+            named_files=[],
+            rolled_back_content={str(path.resolve()): attempted},
+        )
+        assert "attempted write that was rolled back after lint errors" in content
+        assert "raise KeyError()" in content
+        assert "pass" not in content
+
+    def test_step_python_syntax_errors_checks_attempted_content(self, tmp_path):
+        """The deterministic syntax check must look at the attempted content
+        even though the disk file was rolled back to a valid state -- a
+        rolled-back broken write would otherwise hide from the guard."""
+        path = tmp_path / "inventory.py"
+        path.write_text("class Inventory:\n    def remove(self, name, quantity):\n        pass\n")
+        workspace = WorkspaceManager(root=str(tmp_path))
+        attempted = (
+            "class Inventory:\n"
+            "    def remove(self, name, quantity):\n"
+            "        if name not in self.stock:\n"
+            " raise KeyError()\n"
+        )
+        errors = _step_python_syntax_errors(
+            workspace,
+            written_paths=[str(path.resolve())],
+            named_files=[],
+            rolled_back_content={str(path.resolve()): attempted},
+        )
+        assert len(errors) == 1
+        assert "E999 SyntaxError" in errors[0]
+
+    def test_step_python_syntax_errors_clean_attempted_content(self, tmp_path):
+        path = tmp_path / "inventory.py"
+        path.write_text("class Inventory:\n    def remove(self, name, quantity):\n        pass\n")
+        workspace = WorkspaceManager(root=str(tmp_path))
+        attempted = (
+            "class Inventory:\n"
+            "    def remove(self, name, quantity):\n"
+            "        if name not in self.stock:\n"
+            "            raise KeyError()\n"
+        )
+        errors = _step_python_syntax_errors(
+            workspace,
+            written_paths=[str(path.resolve())],
+            named_files=[],
+            rolled_back_content={str(path.resolve()): attempted},
+        )
+        assert errors == []
+
+
 class TestInvestigativeStepBypassesVerification:
     @pytest.mark.asyncio
-    async def test_read_step_auto_completes_without_llm_verification(self):
-        """A 'read the file' step should be marked complete purely because
-        the read tool succeeded and returned real output -- no LLM
-        verify_step call needed (that's the failure mode that caused the
-        agent to re-read the same file over and over)."""
+    async def test_named_file_read_step_runs_through_verifier(self):
+        """A 'read the file' step that names a specific file must be
+        validated through the LLM verifier (with objective read facts in the
+        evidence) rather than auto-completed on any tool evidence -- a turn
+        that read a *different* file used to mark "read plan.md" done."""
         backend = _make_mock_backend()
         backend.complete.return_value = CompletionResponse(
             message=Message(
@@ -1970,7 +2171,73 @@ class TestInvestigativeStepBypassesVerification:
         await loop.run("do something")
 
         assert plan.steps[0].status == StepStatus.completed
+        planner.verify_step.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_wrong_file_read_does_not_complete_named_explore_step(self):
+        """Regression: an explore step that names specific files must not be
+        auto-completed by a turn that only read a *different* file -- the
+        benchmark showed 'Explore ... inventory.py and test_inventory.py'
+        being marked done because the model read SPEC.md instead."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "read", "arguments": {"path": "SPEC.md"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(
+                index=1,
+                description=(
+                    "Explore the existing codebase to understand the current "
+                    "implementation of inventory.py and test_inventory.py"
+                ),
+                status=StepStatus.pending,
+            ),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(
+            side_effect=lambda p: _FakeResolvedPath(p, exists=str(p) in {"inventory.py", "test_inventory.py"})
+        )
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = AsyncMock(
+            return_value=MagicMock(output="# SPEC\ncontract text", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"read": read_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        # The step must NOT be auto-completed by reading a different file,
+        # and it must not be silently handed to the LLM verifier either --
+        # the objective check should reject it outright with guidance to
+        # read the named files.
+        assert plan.steps[0].status == StepStatus.pending
         planner.verify_step.assert_not_awaited()
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("`inventory.py`" in m for m in tool_msgs)
+        assert any("`test_inventory.py`" in m for m in tool_msgs)
+        assert any("not been read yet this session" in m for m in tool_msgs)
 
     @pytest.mark.asyncio
     async def test_non_investigative_step_still_verified(self):
@@ -2028,6 +2295,9 @@ class TestInvestigativeStepBypassesVerification:
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
+        context.workspace.resolve = MagicMock(
+            side_effect=lambda p: _FakeResolvedPath(p, exists=str(p) == "plan.md")
+        )
         registry = _make_mock_tool_registry()
 
         loop = ReActLoop(
@@ -2120,7 +2390,7 @@ class TestInvestigativeStepBypassesVerification:
         await loop.run("do something")
 
         read_tool.run.assert_awaited_once_with(path="test_slugify.py")
-        planner.verify_step.assert_not_awaited()
+        planner.verify_step.assert_awaited_once()
         assert plan.steps[0].status == StepStatus.completed
 
     @pytest.mark.asyncio
@@ -2196,6 +2466,47 @@ class TestInvestigativeStepBypassesVerification:
         assert any("still needs real file-change evidence" in m for m in tool_msgs)
         assert any("`write`/`edit`" in m for m in tool_msgs)
         assert any("`slugify.py`" in m for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_repeated_reasoning_only_mutation_step_gets_stronger_guard(self):
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(side_effect=[
+            CompletionResponse(
+                message=Message(role=Role.assistant, content="I should create the file."),
+            ),
+            CompletionResponse(
+                message=Message(role=Role.assistant, content="I'll create it next."),
+            ),
+        ])
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanStep(
+                index=1,
+                description="Create a new file named slugify.py",
+                status=StepStatus.pending,
+            ),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=2),
+        )
+        await loop.run("do something")
+
+        planner.verify_step.assert_not_awaited()
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("Respond by calling `write`/`edit` on `slugify.py` now." in m for m in tool_msgs)
+        assert any("must contain a single `write`/`edit` tool call" in m for m in tool_msgs)
 
     @pytest.mark.asyncio
     async def test_unrelated_successful_tool_call_does_not_auto_complete(self):

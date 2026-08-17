@@ -31,10 +31,12 @@ class OllamaBackend(LLMBackend):
         model: str = DEFAULT_MODEL,
         host: str = "http://localhost:11434",
         context_length: int = DEFAULT_CONTEXT_LENGTH,
+        think: bool = False,
     ) -> None:
         self._model = model
         self._host = host.rstrip("/")
         self._context_length = context_length
+        self._think = think
         self._client = ollama.Client(host=self._host)
         self._async_client = ollama.AsyncClient(host=self._host)
 
@@ -66,6 +68,7 @@ class OllamaBackend(LLMBackend):
             model=self._model,
             messages=ollama_messages,
             tools=ollama_tools or None,
+            think=self._think,
             options={
                 "temperature": request.temperature,
                 "num_predict": request.max_tokens,
@@ -105,6 +108,7 @@ class OllamaBackend(LLMBackend):
             model=self._model,
             messages=ollama_messages,
             tools=ollama_tools or None,
+            think=self._think,
             options={
                 "temperature": request.temperature,
                 "num_predict": request.max_tokens,

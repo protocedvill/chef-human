@@ -79,11 +79,41 @@ def _detect_linter(file_path: str) -> str | None:
     return None
 
 
+def syntax_error(source: str, file_path: str) -> str:
+    """ruff-style `path:line:col: E999 ...` line if `source` (treated as the
+    content of `file_path`) does not compile, else ''."""
+    try:
+        compile(source, file_path, "exec")
+    except (SyntaxError, ValueError) as exc:
+        if isinstance(exc, SyntaxError):
+            line = exc.lineno or 0
+            col = exc.offset or 0
+            msg = exc.msg or "syntax error"
+        else:
+            line, col, msg = 0, 0, str(exc)
+        return f"{file_path}:{line}:{col}: E999 SyntaxError: {msg}"
+    return ""
+
+
+def check_python_syntax(file_path: str) -> str:
+    """Deterministic syntax-only check for a Python file, independent of any
+    external linter binary being installed/on PATH. Returns ruff-style
+    `path:line:col: E999 ...` output when the file does not compile, else ''."""
+    try:
+        source = Path(file_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return syntax_error(source, file_path)
+
+
 def run_lint(file_path: str) -> str:
     linter = _detect_linter(file_path)
     if linter is None:
         return ""
     if linter == "ruff":
+        syntax_errors = check_python_syntax(file_path)
+        if syntax_errors:
+            return syntax_errors
         return _run_ruff(file_path)
     return ""
 

@@ -166,9 +166,10 @@ class TestCreateBackend:
                 mock_settings.llm_backend = "ollama"
                 mock_settings.ollama_model = "test-model"
                 mock_settings.ollama_host = "http://localhost:11434"
+                mock_settings.ollama_think = False
                 _ = create_backend()
                 MockOllamaBackend.assert_called_once_with(
-                    model="test-model", host="http://localhost:11434"
+                    model="test-model", host="http://localhost:11434", think=False
                 )
 
     def test_raises_for_unknown_backend(self):
@@ -210,9 +211,10 @@ class TestCreateBackend:
                 mock_settings.llm_backend = "ollama"
                 mock_settings.ollama_model = "big-model"
                 mock_settings.ollama_host = "http://localhost:11434"
+                mock_settings.ollama_think = False
                 _ = create_backend(model_override="small-model")
                 MockOllamaBackend.assert_called_once_with(
-                    model="small-model", host="http://localhost:11434"
+                    model="small-model", host="http://localhost:11434", think=False
                 )
 
     def test_model_override_wins_over_llamacpp_model_path(self):
@@ -249,11 +251,14 @@ class TestCreatePlannerBackend:
                 mock_settings.planner_ollama_model = "small-model"
                 mock_settings.ollama_model = "big-model"
                 mock_settings.ollama_host = "http://localhost:11434"
+                mock_settings.ollama_think = False
                 main_backend = object()
                 result = create_planner_backend(main_backend)
                 assert result is not main_backend
                 MockOllamaBackend.assert_called_once_with(
-                    model="small-model", host="http://localhost:11434"
+                    model="small-model",
+                    host="http://localhost:11434",
+                    think=False,
                 )
 
     def test_configured_llamacpp_builds_dedicated_backend(self):

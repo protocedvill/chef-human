@@ -70,6 +70,57 @@ def parse_tool_calls(content: str) -> list[ParsedToolCall]:
     return calls
 
 
+def _coerce_arguments(args: Any) -> dict[str, Any]:
+    if isinstance(args, str):
+        try:
+            return json.loads(args)
+        except json.JSONDecodeError:
+            return {"raw": args}
+    if isinstance(args, dict):
+        return args
+    return {}
+
+
+def parse_native_tool_calls(
+    tool_calls: list[Any] | None,
+) -> list[ParsedToolCall]:
+    """Convert native structured tool calls (ollama ToolCall objects or the
+    equivalent dict form) into ParsedToolCall. The ReAct loop's primary path
+    scrapes <tool_call> tags out of raw content; models like qwen3.x emit
+    native tool_calls with empty content instead, so this converts those."""
+    calls: list[ParsedToolCall] = []
+    if not tool_calls:
+        return calls
+
+    for call in tool_calls:
+        if call is None:
+            continue
+        if isinstance(call, dict):
+            if isinstance(call.get("function"), dict):
+                name = call["function"].get("name", "")
+                args = _coerce_arguments(call["function"].get("arguments", {}))
+            else:
+                name = call.get("name", "")
+                args = _coerce_arguments(call.get("arguments", {}))
+        else:
+            fn = getattr(call, "function", None)
+            if fn is None:
+                continue
+            name = getattr(fn, "name", "") or ""
+            args = _coerce_arguments(getattr(fn, "arguments", {}))
+
+        if name and not any(
+            c.name == name and c.arguments == args for c in calls
+        ):
+            try:
+                raw = json.dumps(call, default=str)
+            except (TypeError, ValueError):
+                raw = ""
+            calls.append(ParsedToolCall(name=name, arguments=args, raw=raw))
+
+    return calls
+
+
 def _is_tool_call_object(data: dict[str, Any]) -> bool:
     return "name" in data and "arguments" in data
 

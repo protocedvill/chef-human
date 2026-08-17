@@ -201,7 +201,7 @@ class TestReActLoopPersistence:
         backend = MagicMock()
         backend.complete = AsyncMock(return_value=MagicMock(
             message=MagicMock(
-                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>', tool_calls=None
             )
         ))
         planner = MagicMock()
@@ -235,7 +235,7 @@ class TestReActLoopPersistence:
         backend = MagicMock()
         backend.complete = AsyncMock(return_value=MagicMock(
             message=MagicMock(
-                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>', tool_calls=None
             )
         ))
         planner = MagicMock()
@@ -263,7 +263,7 @@ class TestReActLoopPersistence:
     async def test_save_conversation_called_even_on_failure(self):
         backend = MagicMock()
         backend.complete = AsyncMock(return_value=MagicMock(
-            message=MagicMock(content="")
+            message=MagicMock(content="", tool_calls=None)
         ))
         planner = MagicMock()
         planner.generate_plan = AsyncMock(return_value=Plan(goal="test", steps=[]))
@@ -288,7 +288,7 @@ class TestReActLoopPersistence:
         backend = MagicMock()
         backend.complete = AsyncMock(return_value=MagicMock(
             message=MagicMock(
-                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>', tool_calls=None
             )
         ))
         planner = MagicMock()

@@ -53,6 +53,9 @@ When ALL steps of the plan are complete, call the `finish` tool.
   design document. Reading a document that describes what should be built is not the same as
   looking at the code it needs to fit into; write code based on the latter.
 - A step is only marked done once its evidence is checked — simply not failing this turn isn't enough. If you're told a step isn't fully done yet, keep working on it; do not move on or repeat the exact same action.
+- If a tool result says a create/implement/edit step still needs real file-change evidence, your
+  very next response must include a mutating tool call such as `write` or `edit` for the named
+  file. Do not reply with reasoning alone about what you plan to do.
 - `ask_user` is for genuine design decisions only — a real choice between two valid approaches, a naming/schema/API choice, or a requirement the task genuinely leaves ambiguous. Every plan step is already authorized: never use `ask_user` to ask what to do next, to ask permission to do the current step ("do you want me to...", "should I...", "is it ok if..."), or to confirm before doing something the plan already calls for. If you're unsure whether something counts as a design decision, it probably doesn't — just proceed with a reasonable choice and note it in the scratchpad instead of asking.
 - Never deliberately write insecure code (hardcoded credentials, injection flaws, backdoors, etc.) unless the user's task explicitly asked for exactly that. If a step seems to call for it, implement it properly instead — do not ask the user for permission to do it wrong.
 - After 3 consecutive failures, the system will re-plan automatically.
@@ -88,7 +91,7 @@ separately and accumulates — write one concise new note per update, not a
 full recap of everything you already noted."""
 
 
-STEP_VERIFY_PROMPT = """You are checking whether a single step of a plan has actually been completed. Be strict: only say COMPLETE if the evidence below clearly shows the step's goal was achieved. If work is underway but not finished, say PARTIAL. If there's no real evidence of progress on this step, say NOT_COMPLETE.
+STEP_VERIFY_PROMPT = """You are checking whether a single step of a plan has actually been completed. Judge ONLY the step below. The overall goal spans many steps, so do NOT mark this step PARTIAL or NOT_COMPLETE just because other steps or other parts of the goal are not finished yet. Be strict about this step alone: say COMPLETE if the evidence clearly shows this step's own goal was achieved. If this step's own work is underway but not finished, say PARTIAL. If there is no real evidence of progress on this step, say NOT_COMPLETE.
 
 Overall goal: {goal}
 Step to verify: {step}
@@ -102,9 +105,11 @@ Recent tool and command history:
 Finish request summary:
 {finish_summary}
 
+The "Current file contents" section (when present) is the verbatim current state of the relevant files, read directly from disk -- quote from it when judging. If the step is not COMPLETE, your REASON must be specific and actionable: quote the exact offending lines (with their line numbers) so the agent knows precisely what to change. Never give vague feedback like "duplicate code" or "still needs work" without quoting the lines you mean.
+
 Respond with exactly two lines and nothing else:
 VERDICT: COMPLETE, PARTIAL, or NOT_COMPLETE
-REASON: <one short sentence>"""
+REASON: <one short sentence about THIS step only, quoting the offending lines when the verdict is not COMPLETE>"""
 
 
 AGENT_FINISH_PROMPT = """

@@ -15,6 +15,7 @@ def create_backend(
         return OllamaBackend(
             model=model_override or cfg.ollama_model,
             host=cfg.ollama_host,
+            think=cfg.ollama_think,
         )
     elif cfg.llm_backend == "llamacpp":
         from chef_human.llm.llamacpp_backend import LlamaCppBackend

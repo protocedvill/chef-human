@@ -11,21 +11,28 @@ from collections import deque
 
 
 from chef_human.agent.context import ContextAssembler
-from chef_human.agent.linter import annotate_diff_with_lint, format_lint_result, run_lint
+from chef_human.agent.linter import (
+    annotate_diff_with_lint,
+    format_lint_result,
+    run_lint,
+    syntax_error,
+)
 from chef_human.agent.parser import (
     ParsedToolCall,
     extract_scratchpad_entries,
     format_parse_error,
     looks_like_tool_call,
+    parse_native_tool_calls,
     parse_tool_calls,
     strip_scratchpad,
     strip_tool_calls,
     validate_arguments,
 )
-from chef_human.agent.planner import Plan, Planner, StepStatus, StepVerdict
+from chef_human.agent.planner import Plan, PlanStep, Planner, StepStatus, StepVerdict
 from chef_human.agent.prompts import build_agent_prompt
 from chef_human.agent.retry import RetryAction, RetryManager
 from chef_human.agent.scratchpad import Scratchpad
+from chef_human.agent.workspace import WorkspaceManager
 from chef_human.llm.backend import (
     CompletionRequest,
     CompletionResponse,
@@ -80,6 +87,7 @@ _FILE_MUTATION_VERBS = (
     *_FILE_CREATION_VERBS,
     "implement", "edit", "update", "modify", "change", "refactor",
 )
+_DOC_LIKE_SUFFIXES = (".md", ".markdown", ".txt", ".rst", ".adoc", ".org")
 _EXECUTION_STEP_KEYWORDS = ("run", "test", "verify", "execute", "check")
 _DIRECT_READ_PREFIX_RE = re.compile(r"^\s*read\b", re.IGNORECASE)
 
@@ -112,6 +120,22 @@ def _named_step_files(description: str) -> list[str]:
     return list(seen)
 
 
+def _read_file_names(files_read: set[str]) -> set[str]:
+    """Basenames of the files read (or written/edited) so far this session,
+    from the loop's set of resolved workspace paths. Basenames are used
+    because step descriptions name files by their short path; if two files
+    in different directories share a basename this errs toward treating the
+    step as satisfied, which is the safe direction for an investigative
+    step (better a loose read than a false-negative re-read loop)."""
+    names: set[str] = set()
+    for path_str in files_read:
+        try:
+            names.add(Path(path_str).name)
+        except Exception:
+            continue
+    return names
+
+
 def _file_facts(
     files_written: dict[str, bool],
     *,
@@ -133,6 +157,122 @@ def _file_facts(
             f"{created_label}={exists and not existed_before}"
         )
     return "\n".join(lines)
+
+
+# How many lines of a file's current content get injected into the step
+# verifier's evidence so it can give *specific* feedback (quote the actual
+# offending lines) instead of vague language like "duplicate code". Read
+# fresh from disk on every verification so the verifier sees the real
+# state -- without this it only sees the turn's tool-result diffs and had
+# to guess at the current file, which produced generic reasons that sent
+# the agent chasing phantom problems (observed: verifier saying "duplicate
+# lines need to be removed" about an already-deduplicated file).
+_VERIFY_FILE_MAX_LINES = 300
+
+
+def _step_candidate_files(
+    workspace: WorkspaceManager,
+    written_paths: list[str],
+    named_files: list[str],
+) -> list[str]:
+    """Resolve the files a step is about to existing paths on disk.
+    `written_paths` are already-resolved workspace paths; `named_files` are
+    short names from the step description that are resolved against the
+    workspace (and dropped if they don't exist -- the filename regex
+    over-matches on method references like `Inventory.remove`)."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for path_str in written_paths:
+        try:
+            p = Path(path_str)
+            if p.exists():
+                key = str(p.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(str(p))
+        except Exception:
+            continue
+    for name in named_files:
+        try:
+            resolved = workspace.resolve(name)
+            if resolved.exists():
+                key = str(resolved.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(str(resolved))
+        except Exception:
+            continue
+    return candidates
+
+
+def _step_file_contents(
+    workspace: WorkspaceManager,
+    written_paths: list[str],
+    named_files: list[str],
+    rolled_back_content: dict[str, str] | None = None,
+) -> str:
+    """Current content of the files a step is about, read from disk right
+    now, for the verifier's evidence. `rolled_back_content` maps resolved
+    paths to content that was written this turn and then restored by the
+    lint-after-write rollback -- for those files the *attempted* content is
+    shown instead of the restored pre-write state, so the verifier can cite
+    the exact offending lines (the model has to fix what it actually wrote,
+    not what the file looked like before). Returns "" when nothing readable
+    is found."""
+    rolled_back_content = rolled_back_content or {}
+    sections: list[str] = []
+    for path_str in _step_candidate_files(workspace, written_paths, named_files):
+        key = str(Path(path_str).resolve())
+        if key in rolled_back_content:
+            content = rolled_back_content[key]
+            label = " (attempted write that was rolled back after lint errors)"
+        else:
+            try:
+                content = Path(path_str).read_text(errors="replace")
+            except Exception:
+                continue
+            label = ""
+        content_lines = content.splitlines()
+        truncated = len(content_lines) > _VERIFY_FILE_MAX_LINES
+        if truncated:
+            content_lines = content_lines[:_VERIFY_FILE_MAX_LINES]
+        body = "\n".join(content_lines)
+        if truncated:
+            body += f"\n... (file truncated at {_VERIFY_FILE_MAX_LINES} lines)"
+        sections.append(f"--- {Path(path_str).name}{label} ---\n{body}")
+    return "\n\n".join(sections)
+
+
+def _step_python_syntax_errors(
+    workspace: WorkspaceManager,
+    written_paths: list[str],
+    named_files: list[str],
+    rolled_back_content: dict[str, str] | None = None,
+) -> list[str]:
+    """Deterministic syntax check (compile-based, no external linter needed)
+    over the Python files a step is about. Returns ruff-style error lines for
+    any file that does not compile. The LLM verifier has proven unreliable at
+    noticing broken indentation even when shown the file contents -- a file
+    that does not even parse can never be a complete step. For files that
+    were rolled back after lint errors, the *attempted* content is checked
+    (the on-disk state has been restored and would hide the problem)."""
+    rolled_back_content = rolled_back_content or {}
+    errors: list[str] = []
+    for path_str in _step_candidate_files(workspace, written_paths, named_files):
+        if Path(path_str).suffix != ".py":
+            continue
+        key = str(Path(path_str).resolve())
+        if key in rolled_back_content:
+            source = rolled_back_content[key]
+        else:
+            try:
+                source = Path(path_str).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+        result = syntax_error(source, path_str)
+        if result:
+            errors.append(result)
+    return errors
 
 
 def _looks_like_execution_step(description: str) -> bool:
@@ -170,6 +310,47 @@ def _file_mutation_step_feedback(step: PlanStep, target_names: set[str]) -> str:
         f"Step {step.index} ('{step.description}') still needs real file-change evidence. "
         "Reasoning alone does not count for a create/implement/edit step; use a mutating "
         f"tool like `write`/`edit` on {targets} in this turn."
+    )
+
+
+def _primary_mutation_target(step: PlanStep, target_names: set[str]) -> str:
+    ordered = [name for name in _named_step_files(step.description) if name in target_names]
+    for name in ordered:
+        if not name.lower().endswith(_DOC_LIKE_SUFFIXES):
+            return name
+    if ordered:
+        return ordered[0]
+    return sorted(target_names)[0]
+
+
+def _file_mutation_no_tool_feedback(
+    step: PlanStep,
+    target_names: set[str],
+    *,
+    consecutive_stalls: int,
+) -> str:
+    target = _primary_mutation_target(step, target_names)
+    example = (
+        '<tool_call>{ "name": "write", "arguments": '
+        f'{{ "path": "{target}", "content": "..." }}'
+        "}</tool_call>"
+    )
+    prefix = (
+        f"Step {step.index} ('{step.description}') still needs real file-change evidence. "
+    )
+    if consecutive_stalls >= 2:
+        return (
+            prefix
+            + 
+            "You already tried reasoning without a tool on this same step. "
+            "Do not explain the plan again. Your next response must contain a single "
+            f"`write`/`edit` tool call for `{target}`. Example for `{target}`:\n{example}"
+        )
+    return (
+        prefix
+        +
+        "Reasoning alone does not count for a create/implement/edit step. "
+        f"Respond by calling `write`/`edit` on `{target}` now. Example for `{target}`:\n{example}"
     )
 
 
@@ -320,7 +501,15 @@ class StepEvidence:
 @dataclass
 class ReActConfig:
     max_steps: int = 25
-    max_retries_per_step: int = 3
+    # Consecutive failing turns tolerated before the loop gives up on the
+    # current attempt and either replans or escalates. Deliberately larger
+    # than the old 3: a small local model mid-failure frequently recovers
+    # given a couple more turns (each turn's feedback is cheap), and a
+    # premature replan burns the single replan budget -- observed spiraling
+    # from "blocked write" straight into replan-then-escalate without ever
+    # retrying. Tune down for faster, noisier runs; tune up to give the
+    # model more room before re-planning.
+    max_retries_per_step: int = 5
     max_replans: int = 1
     temperature: float = 0.0
     max_tokens_per_response: int = 4096
@@ -366,6 +555,7 @@ class ReActLoop:
         self._recent_verification_events: deque[str] = deque(maxlen=8)
         self._planning_facts: dict[str, bool] = {}
         self._step_evidence: dict[str, StepEvidence] = {}
+        self._mutation_no_tool_stalls: dict[str, int] = {}
 
     def _record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
         self._total_prompt_tokens += prompt_tokens
@@ -401,6 +591,15 @@ class ReActLoop:
             evidence = StepEvidence()
             self._step_evidence[key] = evidence
         return evidence
+
+    def _note_mutation_no_tool_stall(self, step: PlanStep) -> int:
+        key = self._step_evidence_key(step)
+        next_count = self._mutation_no_tool_stalls.get(key, 0) + 1
+        self._mutation_no_tool_stalls[key] = next_count
+        return next_count
+
+    def _clear_mutation_no_tool_stall(self, step: PlanStep) -> None:
+        self._mutation_no_tool_stalls.pop(self._step_evidence_key(step), None)
 
     async def run(self, task: str) -> AgentResult:
         logger.info("Task started: %s", task[:200])
@@ -515,7 +714,11 @@ class ReActLoop:
                     scratchpad.add_lines(new_entries)
                     logger.debug("Scratchpad gained %d new entr%s", len(new_entries), "y" if len(new_entries) == 1 else "ies")
 
-                tool_calls = parse_tool_calls(response.message.content)
+                tool_calls = (
+                    parse_native_tool_calls(response.message.tool_calls)
+                    if response.message.tool_calls
+                    else parse_tool_calls(response.message.content)
+                )
                 non_tool_reasoning = strip_scratchpad(response.message.content)
                 non_tool_reasoning = strip_tool_calls(non_tool_reasoning)
 
@@ -545,6 +748,19 @@ class ReActLoop:
                     else:
                         logger.debug("No tool calls this turn (plain reasoning only)")
                         current = plan.current_step()
+                        # Investigative steps are excluded from the
+                        # reasoning-only mutation stall guard: a step like
+                        # "explore ... the current implementation of
+                        # inventory.py" contains the substring "implement"
+                        # (via "implementation") and would otherwise be
+                        # misrouted into "call write/edit on inventory.py"
+                        # feedback -- it's a read step, not a write step.
+                        mutation_targets = (
+                            _looks_like_file_mutation_step(current.description)
+                            if current is not None
+                            and not _looks_investigative(current.description)
+                            else set()
+                        )
                         direct_read_targets = (
                             _direct_read_targets(current.description)
                             if current is not None
@@ -584,6 +800,40 @@ class ReActLoop:
                                         Message(role=Role.tool, content=read_output)
                                     )
 
+                        if current is not None and mutation_targets:
+                            stall_count = self._note_mutation_no_tool_stall(current)
+                            mutation_feedback = _file_mutation_no_tool_feedback(
+                                current,
+                                mutation_targets,
+                                consecutive_stalls=stall_count,
+                            )
+                            self._ui.on_tool_result("mutation-guard", mutation_feedback)
+                            self._context.conversation.add_message(
+                                Message(role=Role.tool, content=mutation_feedback)
+                            )
+                            verify_failure_history.append(mutation_feedback)
+                            action = retry_mgr.record_iteration(1, 1, [mutation_feedback])
+                            steps_taken += 1
+                            if action == RetryAction.REPLAN:
+                                self._ui.on_replan()
+                                plan = await self._planner.update_plan(
+                                    plan,
+                                    failure_context="\n".join(verify_failure_history),
+                                )
+                                retry_mgr.on_replan()
+                                verify_failure_history.clear()
+                            elif action == RetryAction.ESCALATE:
+                                return self._make_result(
+                                    plan=plan,
+                                    steps_taken=steps_taken,
+                                    message=(
+                                        "The task could not be completed because step "
+                                        "verification repeatedly failed."
+                                    ),
+                                    success=False,
+                                )
+                            continue
+
                     steps_taken += 1
                     if parse_error:
                         action = retry_mgr.record_iteration(1, 1, [parse_error])
@@ -592,6 +842,7 @@ class ReActLoop:
                             plan,
                             "\n".join(auto_tool_results) if auto_tool_results else non_tool_reasoning,
                             has_tool_evidence=auto_read_success,
+                            files_read=files_read,
                         )
                         if verify_feedback:
                             self._ui.on_tool_result("plan-check", verify_feedback)
@@ -666,10 +917,18 @@ class ReActLoop:
                 # edit/patch call ran. Used to objectively verify file-creation
                 # steps instead of relying on a tool's success-message wording.
                 files_written_this_turn: dict[str, bool] = {}
+                # resolved path -> content the model wrote this turn that the
+                # lint-after-write rollback restored. Threaded into step
+                # verification so the verifier still sees the attempted
+                # (broken) content and the syntax check catches it.
+                rolled_back_content: dict[str, str] = {}
                 successful_commands_this_turn: list[str] = []
                 finish_call: tuple[ParsedToolCall, Tool] | None = None
                 deferred_finish_call: tuple[ParsedToolCall, Tool] | None = None
                 parallel_candidates: list[tuple[ParsedToolCall, Tool]] = []
+                current = plan.current_step()
+                if current is not None and _looks_like_file_mutation_step(current.description):
+                    self._clear_mutation_no_tool_stall(current)
 
                 for tc in tool_calls:
                     logger.debug("Tool call: %s(%s)", tc.name, tc.arguments)
@@ -918,6 +1177,15 @@ class ReActLoop:
                                 original = pre_write_content.get(file_path)
                                 resolved_file = self._context.workspace.resolve(file_path)
                                 if original is not None:
+                                    # Capture what the model actually wrote so
+                                    # the verifier can still cite the exact
+                                    # offending lines after the restore.
+                                    try:
+                                        broken_content = Path(resolved_file).read_text(errors="replace")
+                                    except Exception:
+                                        broken_content = None
+                                    if broken_content is not None:
+                                        rolled_back_content[str(resolved_file)] = broken_content
                                     _rollback_file(resolved_file, original)
                                     rollback_msg = (
                                         f"\n[rollback] Lint errors detected — "
@@ -936,10 +1204,16 @@ class ReActLoop:
                                     )
                                     if annotated:
                                         tool_results[last_idx] = annotated
-                                # Append lint output with rollback note
+                                # Append lint output with rollback note. This is
+                                # *not* counted as a failed_calls: verification
+                                # below still runs so the model gets the specific
+                                # syntax feedback and the step cannot slip through
+                                # as completed. (failed_calls > 0 skips that
+                                # whole path, which is what turned a rolled-back
+                                # write into a silent repeat loop in the
+                                # inventory benchmark.)
                                 lint_result = format_lint_result(lint_output) + rollback_msg
                                 tool_results.append(lint_result)
-                                failed_calls += 1
 
                     logger.debug(
                         "Dispatched %d ordered tool call(s) in %.1fs: %s",
@@ -962,6 +1236,8 @@ class ReActLoop:
                             finish_summary=finish_summary,
                             files_written_this_turn=files_written_this_turn,
                             successful_commands_this_turn=successful_commands_this_turn,
+                            files_read=files_read,
+                            rolled_back_content=rolled_back_content,
                         )
                         if finish_feedback is not None:
                             self._ui.on_tool_result("finish", finish_feedback)
@@ -1072,6 +1348,8 @@ class ReActLoop:
                         has_tool_evidence=has_real_investigative_evidence,
                         files_written_this_turn=files_written_this_turn,
                         successful_commands_this_turn=successful_commands_this_turn,
+                        files_read=files_read,
+                        rolled_back_content=rolled_back_content,
                     )
                     if verify_feedback:
                         self._ui.on_tool_result("plan-check", verify_feedback)
@@ -1290,6 +1568,8 @@ class ReActLoop:
         successful_commands_this_turn: list[str] | None = None,
         finish_summary: str = "",
         step_override: PlanStep | None = None,
+        files_read: set[str] | None = None,
+        rolled_back_content: dict[str, str] | None = None,
     ) -> str | None:
         """Ask the planner to verify the current pending step is actually
         done before advancing it, instead of assuming any non-failing turn
@@ -1302,37 +1582,115 @@ class ReActLoop:
         step.status = StepStatus.in_progress
         files_written_this_turn = files_written_this_turn or {}
         successful_commands_this_turn = successful_commands_this_turn or []
+        files_read = files_read or set()
         step_evidence = self._step_evidence_for(step)
         step_evidence.merge_turn(files_written_this_turn, successful_commands_this_turn)
         accumulated_files_written = step_evidence.files_written
         accumulated_commands = step_evidence.successful_commands
 
-        if has_tool_evidence and _looks_investigative(step.description):
-            # Read/identify/check-style steps have no artifact beyond "the
-            # tool ran and returned real output" -- that's sufficient
-            # evidence; skip the extra (failure-prone) LLM judgment call.
-            logger.debug("Step %r auto-completed (investigative, has tool evidence)", step.description)
-            step.status = StepStatus.completed
-            return None
+        # Deterministic guard: a step whose involved .py file does not even
+        # parse can never be complete. The LLM verifier has been observed
+        # marking a syntactically-broken file "complete" (run 4 of the
+        # inventory benchmark: an IndentationError at column 0 got a complete
+        # verdict), so the verifier's verdict is overridden below when this
+        # check fails. The attempted (rolled-back) content is still shown to
+        # the verifier so it can produce a specific fix directive.
+        syntax_errors = _step_python_syntax_errors(
+            self._context.workspace,
+            written_paths=list(accumulated_files_written),
+            named_files=_named_step_files(step.description),
+            rolled_back_content=rolled_back_content,
+        )
 
-        if _looks_investigative(step.description) and not has_tool_evidence:
-            step.status = StepStatus.pending
-            named_files = _named_step_files(step.description)
-            if named_files:
-                targets = ", ".join(f"`{name}`" for name in named_files)
-                return (
-                    f"Step {step.index} ('{step.description}') still needs real tool evidence. "
-                    f"Reasoning alone does not count for an investigative step; use a read-only "
-                    f"tool like `read`/`grep`/`ls` on {targets} in this turn."
+        # When a step names specific files (e.g. "Explore inventory.py and
+        # test_inventory.py"), auto-completing on *any* read-only tool evidence
+        # is too loose -- the model can read a different file and the step
+        # gets marked done without ever looking at the ones it named. For
+        # such steps, check against the files actually read this session and
+        # route through the LLM verifier (with objective read facts) instead
+        # of auto-completing. Steps that name no specific file still
+        # auto-complete on any real read-only evidence -- there's nothing
+        # specific to validate, and the extra LLM judgment is what caused the
+        # re-read loop (see _INVESTIGATIVE_KEYWORDS).
+        investigative_named_files: list[str] = []
+        investigative_read_names: set[str] = set()
+        investigative_needs_verifier = False
+
+        if _looks_investigative(step.description):
+            investigative_named_files = _named_step_files(step.description)
+            if investigative_named_files:
+                investigative_read_names = _read_file_names(files_read)
+                # The filename regex over-matches on method/attribute
+                # references in step descriptions (e.g. "Inventory.add" in
+                # "Identify the missing methods `Inventory.add` and
+                # `Inventory.remove` in inventory.py"). Only enforce reads
+                # for names that correspond to real files on disk (or files
+                # already read this session); requiring a read of a
+                # non-existent "file" is an impossible loop.
+                existing_named_files = []
+                for name in investigative_named_files:
+                    if name in investigative_read_names:
+                        existing_named_files.append(name)
+                        continue
+                    try:
+                        if self._context.workspace.resolve(name).exists():
+                            existing_named_files.append(name)
+                    except Exception:
+                        continue
+                investigative_named_files = existing_named_files
+            if investigative_named_files:
+                unread = [
+                    name
+                    for name in investigative_named_files
+                    if name not in investigative_read_names
+                ]
+                if unread:
+                    step.status = StepStatus.pending
+                    targets = ", ".join(f"`{name}`" for name in unread)
+                    return (
+                        f"Step {step.index} ('{step.description}') named {targets}, but "
+                        f"{'that file has' if len(unread) == 1 else 'those files have'} "
+                        "not been read yet this session; the step still needs real tool "
+                        "evidence. Use the `read` tool on "
+                        f"{targets} in this turn -- reading other files does not "
+                        "satisfy this step."
+                    )
+                if not has_tool_evidence:
+                    # The named files were read at some earlier point this
+                    # session, but this turn produced no read-only tool call --
+                    # reasoning alone still isn't fresh evidence.
+                    step.status = StepStatus.pending
+                    targets = ", ".join(f"`{name}`" for name in investigative_named_files)
+                    return (
+                        f"Step {step.index} ('{step.description}') still needs real tool "
+                        "evidence. Reasoning alone does not count for an investigative "
+                        f"step; use a read-only tool like `read`/`grep`/`ls` on {targets} "
+                        "in this turn."
+                    )
+                # All named files were read and this turn produced real tool
+                # evidence: validate via the verifier instead of auto-completing.
+                investigative_needs_verifier = True
+            elif has_tool_evidence:
+                # Generic read/identify/check-style step (no specific files
+                # named) has no artifact beyond "the tool ran and returned
+                # real output" -- that's sufficient evidence; skip the extra
+                # (failure-prone) LLM judgment call.
+                logger.debug(
+                    "Step %r auto-completed (investigative, has tool evidence)",
+                    step.description,
                 )
-            return (
-                f"Step {step.index} ('{step.description}') still needs real tool evidence. "
-                "Reasoning alone does not count for an investigative step; use a relevant "
-                "read-only tool in this turn."
-            )
+                step.status = StepStatus.completed
+                return None
+            else:
+                step.status = StepStatus.pending
+                return (
+                    f"Step {step.index} ('{step.description}') still needs real tool "
+                    "evidence. Reasoning alone does not count for an investigative "
+                    "step; use a relevant read-only tool in this turn."
+                )
 
         target_names = _looks_like_file_creation_step(step.description)
-        if target_names:
+        if target_names and not investigative_needs_verifier:
             for target_name in target_names:
                 initially_existed = self._planning_facts.get(target_name)
                 if initially_existed is not False:
@@ -1365,11 +1723,19 @@ class ReActLoop:
                     return None
 
         mutation_targets = _looks_like_file_mutation_step(step.description)
-        if mutation_targets and not accumulated_files_written:
+        if (
+            mutation_targets
+            and not accumulated_files_written
+            and not investigative_needs_verifier
+        ):
             step.status = StepStatus.pending
             return _file_mutation_step_feedback(step, mutation_targets)
 
-        if _looks_like_execution_step(step.description) and successful_commands_this_turn:
+        if (
+            _looks_like_execution_step(step.description)
+            and successful_commands_this_turn
+            and not investigative_needs_verifier
+        ):
             logger.debug(
                 "Step %r auto-completed (objective: successful command(s) %s)",
                 step.description,
@@ -1378,11 +1744,20 @@ class ReActLoop:
             step.status = StepStatus.completed
             return None
 
-        if _looks_like_execution_step(step.description) and not has_tool_evidence:
+        if (
+            _looks_like_execution_step(step.description)
+            and not has_tool_evidence
+            and not investigative_needs_verifier
+        ):
             step.status = StepStatus.pending
             return _execution_step_feedback(step)
 
         evidence_sections: list[str] = []
+        if investigative_needs_verifier:
+            evidence_sections.append(
+                "Files read so far this session (checked directly by the system):\n"
+                + "\n".join(f"- {name}" for name in sorted(investigative_read_names))
+            )
         accumulated_facts = _file_facts(
             accumulated_files_written,
             created_label="created_during_step",
@@ -1397,6 +1772,24 @@ class ReActLoop:
             evidence_sections.append(
                 "Successful commands accumulated for this step:\n"
                 f"{commands_text}"
+            )
+        step_contents = _step_file_contents(
+            self._context.workspace,
+            written_paths=list(accumulated_files_written),
+            named_files=_named_step_files(step.description),
+            rolled_back_content=rolled_back_content,
+        )
+        if step_contents:
+            evidence_sections.append(
+                "Current file contents (read directly from disk for verification):\n"
+                + step_contents
+            )
+        if syntax_errors:
+            evidence_sections.append(
+                "Deterministic syntax check (the system compiled these files "
+                "directly; a file listed here does not parse, so the step cannot "
+                "be verified complete regardless of the model's judgment):\n"
+                + "\n".join(syntax_errors)
             )
         if evidence_sections:
             evidence = "\n\n".join(
@@ -1432,6 +1825,17 @@ class ReActLoop:
                 "re-checked next turn."
             )
         logger.debug("Step %r verification verdict: %s (%s)", step.description, verdict.value, reason)
+        if verdict == StepVerdict.complete and syntax_errors:
+            # Deterministic override: the verifier (and the model) may judge a
+            # broken file "complete"; a file that does not even parse cannot be.
+            step.status = StepStatus.pending
+            details = "; ".join(syntax_errors)
+            return (
+                f"Step {step.index} ('{step.description}') is not fully done yet: a "
+                f"Python file this step involves does not parse (checked directly, "
+                f"not inferred): {details}. Fix the syntax error before this step "
+                "can be considered done."
+            )
         if verdict == StepVerdict.complete:
             step.status = StepStatus.completed
             return None
@@ -1451,6 +1855,8 @@ class ReActLoop:
         finish_summary: str,
         files_written_this_turn: dict[str, bool],
         successful_commands_this_turn: list[str],
+        files_read: set[str] | None = None,
+        rolled_back_content: dict[str, str] | None = None,
     ) -> str | None:
         unresolved = plan.unresolved_steps()
         if not unresolved:
@@ -1477,6 +1883,8 @@ class ReActLoop:
                     successful_commands_this_turn=successful_commands_this_turn,
                     finish_summary=finish_summary,
                     step_override=step,
+                    files_read=files_read,
+                    rolled_back_content=rolled_back_content,
                 )
                 if feedback is not None:
                     return (

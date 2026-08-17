@@ -1800,6 +1800,11 @@ class ReActLoop:
             )
 
         try:
+            logger.debug("VERIFIER_DEBUG evidence sent:\n%s", evidence)
+            logger.debug(
+                "VERIFIER_DEBUG recent_history:\n%s", self._recent_verification_history()
+            )
+            logger.debug("VERIFIER_DEBUG finish_summary:\n%s", finish_summary)
             verdict, reason = await self._planner.verify_step(
                 plan,
                 step,

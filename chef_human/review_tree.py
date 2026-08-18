@@ -214,6 +214,10 @@ class ReviewNode:
     # included in its prompt. Empty for non-leaf nodes.
     header_context: CodeChunk | None = None
     connected: tuple[ConnectedRef, ...] = ()
+    # Synthesis-only: the cross_axis text this node's synthesis call needs
+    # once its children are all resolved. None for leaves (nothing to
+    # synthesize) and for the root, which builds its own inline.
+    cross_axis: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -319,9 +323,23 @@ class ReviewConfig:
     max_completion_tokens: int = 30000
     # Called with a short label right before each LLM call dispatches, and
     # again with the result summary right after it returns. Traversal is
-    # strictly sequential (one call at a time), so this is the only signal
-    # available that a long run is still alive rather than hung.
+    # strictly sequential (one call at a time) by default, so this is often
+    # the only signal available that a long run is still alive rather than
+    # hung -- with leaf_concurrency > 1, several "dispatching"/"done" pairs
+    # can interleave, which is expected.
     on_progress: Callable[[str], None] | None = None
+    # Leaves within one method subtree are read-only over the same
+    # immutable `config.units`/context tables and share no mutable state
+    # with each other, unlike chef_human.agent.react_loop's tool dispatch
+    # (which serializes deliberately because tool calls *do* mutate shared
+    # files) -- so, unlike that loop, it's safe to fan them out concurrently.
+    # A semaphore (not gather-everything) bounds how many requests hit the
+    # backend at once, since an Ollama server backed by one GPU still only
+    # actually executes one completion at a time; concurrency here mostly
+    # buys overlap on request/response overhead and any queuing the backend
+    # itself does, not true parallel inference. 1 preserves the old
+    # strictly-sequential behavior exactly.
+    leaf_semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -840,53 +858,62 @@ def _split_oversized_unit(
     return _wrap_as_units(unit, _split_chunk_by_lines(unit.chunk, tokenizer, budget))
 
 
-async def _execute_leaf(
+@dataclass
+class _PendingLeaf:
+    """A leaf node whose skeleton (node_id/goal/scope) is built but whose
+    LLM call hasn't run yet -- collected across the whole tree so every
+    leaf call can execute before any synthesis call does. This is the
+    model-swap fix: the old traversal interleaved a handful of leaf calls
+    with one synthesis call per method, which meant Ollama had to page the
+    leaf model out and the (usually different, larger) synthesis model in
+    on every single method boundary. Grouping all leaf calls together, then
+    all synthesis calls together, means at most one swap for the whole run
+    instead of one per method."""
+
+    node: ReviewNode
+    method: ReviewMethod
+    unit: CodeUnit
+    header: CodeChunk | None
+
+
+def _build_unit_skeleton(
     node_id: str,
     method: ReviewMethod,
     unit: CodeUnit,
     header: CodeChunk | None,
     depth: int,
     config: ReviewConfig,
+    pending: list[_PendingLeaf],
 ) -> ReviewNode:
-    node = ReviewNode(
-        node_id=node_id,
-        goal=f"[{method.id}] review {unit.name} ({unit.path})",
-        method=method.id,
-        depth=depth,
-        scope=(unit.chunk,),
-        header_context=header,
-    )
-    remaining = config.leaf_token_budget - config.tokenizer.count(unit.chunk.text)
-    if header is not None:
-        remaining -= config.tokenizer.count(header.text)
-    connected, included, omitted = _assemble_connected_context(
-        unit, config.definition_map, config.caller_index, config.tokenizer, max(remaining, 0)
-    )
-    node.connected = tuple(connected)
-    node.result = await _complete_result(
-        config, config.backend, LEAF_SYSTEM_PROMPT, _leaf_prompt(method, unit, header, connected), node_id
-    )
-    node.result.connected_included = included
-    node.result.connected_omitted = omitted
-    return node
-
-
-async def _build_unit_subtree(
-    node_id: str,
-    method: ReviewMethod,
-    unit: CodeUnit,
-    header: CodeChunk | None,
-    depth: int,
-    config: ReviewConfig,
-) -> ReviewNode:
+    """Structural pass only -- decides atom vs. oversized-split using the
+    tokenizer (no LLM call involved), builds the node shape, and queues any
+    leaf directly onto `pending` instead of executing it. Mirrors the old
+    _build_unit_subtree's structure/node_id/goal exactly so output shape is
+    unchanged; only when the LLM call happens has moved."""
     if config.is_atom(unit, header, config.tokenizer, config.leaf_token_budget):
-        return await _execute_leaf(node_id, method, unit, header, depth, config)
+        node = ReviewNode(
+            node_id=node_id,
+            goal=f"[{method.id}] review {unit.name} ({unit.path})",
+            method=method.id,
+            depth=depth,
+            scope=(unit.chunk,),
+            header_context=header,
+        )
+        pending.append(_PendingLeaf(node, method, unit, header))
+        return node
 
     pieces = _split_oversized_unit(unit, config.tokenizer, config.leaf_token_budget)
     if len(pieces) <= 1:
-        # Couldn't actually shrink further -- execute directly rather than
-        # recurse on an unchanged unit.
-        return await _execute_leaf(node_id, method, unit, header, depth, config)
+        node = ReviewNode(
+            node_id=node_id,
+            goal=f"[{method.id}] review {unit.name} ({unit.path})",
+            method=method.id,
+            depth=depth,
+            scope=(unit.chunk,),
+            header_context=header,
+        )
+        pending.append(_PendingLeaf(node, method, unit, header))
+        return node
 
     node = ReviewNode(
         node_id=node_id,
@@ -894,24 +921,17 @@ async def _build_unit_subtree(
         method=method.id,
         depth=depth,
         scope=(unit.chunk,),
+        cross_axis=f"pieces of the oversized {unit.kind} '{unit.name}'",
     )
     for index, piece in enumerate(pieces):
-        child = await _build_unit_subtree(f"{node_id}/p{index}", method, piece, header, depth + 1, config)
+        child = _build_unit_skeleton(f"{node_id}/p{index}", method, piece, header, depth + 1, config, pending)
         node.children.append(child)
-    node.result = await _complete_result(
-        config,
-        config.synthesis_backend,
-        SYNTHESIS_SYSTEM_PROMPT,
-        _synthesis_prompt(node.goal, f"pieces of the oversized {unit.kind} '{unit.name}'", node.children),
-        f"{node_id} (synthesis)",
-    )
-    node.result.findings, node.result.recovered_from_children = _merge_child_findings(
-        node.result.findings, node.children
-    )
     return node
 
 
-async def _build_method_subtree(node_id: str, method: ReviewMethod, config: ReviewConfig, depth: int) -> ReviewNode:
+def _build_method_skeleton(
+    node_id: str, method: ReviewMethod, config: ReviewConfig, depth: int, pending: list[_PendingLeaf]
+) -> ReviewNode:
     if len(config.units) == 1:
         # Only one function/class in scope for this whole run -- synthesizing
         # "across 1 sub-review" adds nothing and doubles the LLM calls for
@@ -920,7 +940,7 @@ async def _build_method_subtree(node_id: str, method: ReviewMethod, config: Revi
         # token-budget-atomic scope check used to take.
         unit = config.units[0]
         header = config.header_by_path.get(unit.path)
-        return await _build_unit_subtree(node_id, method, unit, header, depth, config)
+        return _build_unit_skeleton(node_id, method, unit, header, depth, config, pending)
 
     node = ReviewNode(
         node_id=node_id,
@@ -928,24 +948,65 @@ async def _build_method_subtree(node_id: str, method: ReviewMethod, config: Revi
         method=method.id,
         depth=depth,
         scope=tuple(u.chunk for u in config.units),
+        cross_axis=f"functions/classes reviewed under the '{method.id}' lens",
     )
     for unit in config.units:
         header = config.header_by_path.get(unit.path)
         child_id = f"{node_id}/{unit.path.stem}.{unit.name}"
-        child = await _build_unit_subtree(child_id, method, unit, header, depth + 1, config)
+        child = _build_unit_skeleton(child_id, method, unit, header, depth + 1, config, pending)
         node.children.append(child)
+    return node
 
+
+async def _execute_all_leaves(pending: list[_PendingLeaf], config: ReviewConfig) -> None:
+    """Runs every queued leaf call against config.backend (the leaf model),
+    grouped together with no synthesis calls interleaved. Bounded by
+    config.leaf_semaphore -- default 1 (fully sequential, minimizing memory
+    pressure and matching the model-swap-avoidance goal this exists for);
+    raising leaf_concurrency only pipelines request/response overhead, it
+    does not add a second model into memory."""
+
+    async def _run(item: _PendingLeaf) -> None:
+        node, method, unit, header = item.node, item.method, item.unit, item.header
+        remaining = config.leaf_token_budget - config.tokenizer.count(unit.chunk.text)
+        if header is not None:
+            remaining -= config.tokenizer.count(header.text)
+        connected, included, omitted = _assemble_connected_context(
+            unit, config.definition_map, config.caller_index, config.tokenizer, max(remaining, 0)
+        )
+        node.connected = tuple(connected)
+        async with config.leaf_semaphore:
+            node.result = await _complete_result(
+                config,
+                config.backend,
+                LEAF_SYSTEM_PROMPT,
+                _leaf_prompt(method, unit, header, connected),
+                node.node_id,
+            )
+        node.result.connected_included = included
+        node.result.connected_omitted = omitted
+
+    await asyncio.gather(*(_run(item) for item in pending))
+
+
+async def _execute_synthesis_bottom_up(node: ReviewNode, config: ReviewConfig) -> None:
+    """Post-order: children (recursively) before this node's own synthesis
+    call, so a node's synthesis prompt always sees fully-resolved children.
+    No-op for leaves (result already set by _execute_all_leaves)."""
+    if not node.children:
+        return
+    for child in node.children:
+        await _execute_synthesis_bottom_up(child, config)
     node.result = await _complete_result(
         config,
         config.synthesis_backend,
         SYNTHESIS_SYSTEM_PROMPT,
-        _synthesis_prompt(node.goal, f"functions/classes reviewed under the '{method.id}' lens", node.children),
-        f"{node_id} (synthesis)",
+        _synthesis_prompt(node.goal, node.cross_axis or "", node.children),
+        f"{node.node_id} (synthesis)",
     )
     node.result.findings, node.result.recovered_from_children = _merge_child_findings(
         node.result.findings, node.children
     )
-    return node
 
 
 async def run_review(
@@ -963,6 +1024,7 @@ async def run_review(
     think: ThinkLevel = "low",
     synthesis_think: ThinkLevel | None = None,
     on_progress: Callable[[str], None] | None = None,
+    leaf_concurrency: int = 1,
 ) -> ReviewNode:
     backend = backend or _default_backend(model, think)
     # synthesis_backend defaults to the same backend as leaves -- nothing
@@ -990,6 +1052,7 @@ async def run_review(
         max_completion_tokens=max_completion_tokens,
         on_progress=on_progress,
         is_atom=is_atom,
+        leaf_semaphore=asyncio.Semaphore(max(1, leaf_concurrency)),
     )
 
     root = ReviewNode(
@@ -998,16 +1061,31 @@ async def run_review(
         method=None,
         depth=0,
         scope=tuple(u.chunk for u in units),
+        cross_axis="different analysis lenses over the same code",
     )
+    # Phase 1: build the whole tree's structure (no LLM calls -- atom/split
+    # decisions are pure tokenizer checks) and collect every leaf into one
+    # flat queue, across every method/lens.
+    pending: list[_PendingLeaf] = []
     for method in methods:
-        method_node = await _build_method_subtree(f"root/{method.id}", method, config, 1)
+        method_node = _build_method_skeleton(f"root/{method.id}", method, config, 1, pending)
         root.children.append(method_node)
+
+    # Phase 2: run every leaf call (config.backend, the leaf model) before
+    # any synthesis call touches config.synthesis_backend -- see
+    # _execute_all_leaves for why this ordering is the point.
+    await _execute_all_leaves(pending, config)
+
+    # Phase 3: bottom-up synthesis (config.synthesis_backend), one model in
+    # memory for this whole phase instead of swapping per method.
+    for method_node in root.children:
+        await _execute_synthesis_bottom_up(method_node, config)
 
     root.result = await _complete_result(
         config,
         config.synthesis_backend,
         SYNTHESIS_SYSTEM_PROMPT,
-        _synthesis_prompt(root.goal, "different analysis lenses over the same code", root.children),
+        _synthesis_prompt(root.goal, root.cross_axis or "", root.children),
         "root (synthesis)",
     )
     root.result.findings, root.result.recovered_from_children = _merge_child_findings(
@@ -1023,8 +1101,18 @@ def _iter_nodes(node: ReviewNode) -> list[ReviewNode]:
     return nodes
 
 
-def render_markdown(root: ReviewNode) -> str:
+def render_markdown(root: ReviewNode, verified: list[Any] | None = None) -> str:
     lines = ["# Code review", "", root.result.summary if root.result else "", ""]
+    if verified is not None:
+        confirmed = [v for v in verified if v.verdict == "confirmed"]
+        refuted = [v for v in verified if v.verdict == "refuted"]
+        uncertain = [v for v in verified if v.verdict == "uncertain"]
+        lines.append(
+            f"**Verification pass:** {len(confirmed)} confirmed, {len(refuted)} refuted "
+            f"(dropped below), {len(uncertain)} uncertain (kept, flagged) -- of "
+            f"{len(verified)} raw finding(s)."
+        )
+        lines.append("")
     all_nodes = _iter_nodes(root)
     truncated_nodes = [n for n in all_nodes if n.result and n.result.truncated]
     recovered_nodes = [n for n in all_nodes if n.result and n.result.recovered_from_children]
@@ -1056,6 +1144,28 @@ def render_markdown(root: ReviewNode) -> str:
             omitted = node.result.connected_omitted if node.result else 0
             lines.append(f"- `{node.node_id}`: {included} included / {omitted} omitted")
         lines.append("")
+    if verified is not None:
+        kept = [v for v in verified if v.verdict != "refuted"]
+        if not kept:
+            lines.append("No findings survived synthesis + verification.")
+        else:
+            lines.append(f"## Findings ({len(kept)})")
+            lines.append("")
+            for v in kept:
+                finding = v.finding
+                location = f"{finding.file}:{finding.line}" if finding.line else finding.file
+                tag = " (UNVERIFIED)" if v.verdict == "uncertain" else ""
+                lines.append(f"### [{finding.category}] {location}{tag}")
+                lines.append("")
+                lines.append(finding.summary)
+                lines.append("")
+                if finding.failure_scenario:
+                    lines.append(f"**Failure scenario:** {finding.failure_scenario}")
+                    lines.append("")
+                lines.append(f"**Verification:** {v.verdict} -- {v.reasoning}")
+                lines.append("")
+        return "\n".join(lines)
+
     findings = root.result.findings if root.result else []
     if not findings:
         lines.append("No findings survived synthesis.")
@@ -1098,6 +1208,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Ollama reasoning effort for qwen3.x-style thinking models (default: low)",
     )
     parser.add_argument("--quiet", action="store_true", help="Suppress per-node progress output")
+    parser.add_argument(
+        "--leaf-concurrency", type=int, default=1,
+        help="Max concurrent leaf LLM calls within one method subtree (default 1: sequential, "
+        "matches prior behavior)",
+    )
+    parser.add_argument(
+        "--verify", action="store_true",
+        help="Run every surviving finding through execution-backed verification (chef_human."
+        "review_verify) before writing output; refuted findings are dropped, uncertain ones "
+        "are kept but flagged. Uses the synthesis model/backend.",
+    )
     args = parser.parse_args(argv)
 
     target_files = _iter_python_files(args.target_dir)
@@ -1108,6 +1229,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr)
 
     think: ThinkLevel = False if args.think == "none" else args.think
+    synthesis_model = args.synthesis_model or args.model
     root = asyncio.run(
         run_review(
             target_files,
@@ -1117,14 +1239,42 @@ def main(argv: list[str] | None = None) -> int:
             synthesis_model=args.synthesis_model,
             think=think,
             on_progress=None if args.quiet else _report_progress,
+            leaf_concurrency=args.leaf_concurrency,
         )
     )
 
+    verified = None
+    if args.verify:
+        from chef_human.review_verify import verify_findings
+
+        findings = root.result.findings if root.result else []
+        source_by_file: dict[str, str] = {}
+        path_by_file: dict[str, Path] = {}
+        for path in target_files:
+            text = path.read_text(encoding="utf-8")
+            for key in (str(path), path.name):
+                source_by_file[key] = text
+                path_by_file[key] = path
+        verify_backend = _default_backend(synthesis_model, think)
+        if not args.quiet:
+            _report_progress(f"verifying {len(findings)} finding(s)")
+        verified = asyncio.run(verify_findings(verify_backend, findings, source_by_file, path_by_file))
+        if not args.quiet:
+            confirmed = sum(1 for v in verified if v.verdict == "confirmed")
+            refuted = sum(1 for v in verified if v.verdict == "refuted")
+            _report_progress(
+                f"verification done: {confirmed} confirmed, {refuted} refuted, "
+                f"{len(verified) - confirmed - refuted} uncertain"
+            )
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    tree_dict = root.to_dict()
+    if verified is not None:
+        tree_dict["verified_findings"] = [v.to_dict() for v in verified]
     (args.output_dir / "tree.json").write_text(
-        json.dumps(root.to_dict(), indent=2) + "\n", encoding="utf-8"
+        json.dumps(tree_dict, indent=2) + "\n", encoding="utf-8"
     )
-    (args.output_dir / "REVIEW.md").write_text(render_markdown(root) + "\n", encoding="utf-8")
+    (args.output_dir / "REVIEW.md").write_text(render_markdown(root, verified) + "\n", encoding="utf-8")
     print(f"Wrote {args.output_dir / 'tree.json'} and {args.output_dir / 'REVIEW.md'}")
     truncated = root.truncated_node_ids()
     if truncated:

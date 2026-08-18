@@ -1042,7 +1042,7 @@ class TestRenderAndSerialize:
         assert "No findings survived synthesis." in markdown
 
 
-def test_iter_python_files_only_direct_children(tmp_path):
+def test_iter_python_files_recurses_into_subdirectories(tmp_path):
     (tmp_path / "a.py").write_text("x = 1\n")
     (tmp_path / "b.py").write_text("x = 2\n")
     (tmp_path / "not_python.txt").write_text("skip\n")
@@ -1052,4 +1052,16 @@ def test_iter_python_files_only_direct_children(tmp_path):
 
     files = review_tree._iter_python_files(tmp_path)
 
-    assert [f.name for f in files] == ["a.py", "b.py"]
+    assert [f.name for f in files] == ["a.py", "b.py", "c.py"]
+
+
+def test_iter_python_files_skips_noise_directories(tmp_path):
+    (tmp_path / "a.py").write_text("x = 1\n")
+    for skipped in (".git", "__pycache__", "venv", "node_modules", ".hidden"):
+        d = tmp_path / skipped
+        d.mkdir()
+        (d / "should_not_appear.py").write_text("x = 1\n")
+
+    files = review_tree._iter_python_files(tmp_path)
+
+    assert [f.name for f in files] == ["a.py"]

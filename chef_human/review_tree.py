@@ -26,6 +26,7 @@ import argparse
 import ast
 import asyncio
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -1554,13 +1555,39 @@ def render_markdown(root: ReviewNode, verified: list[Any] | None = None) -> str:
     return "\n".join(lines)
 
 
+# Directories skipped during the recursive walk -- not code to review, and
+# for the dependency/venv ones, walking into them could pull in thousands
+# of irrelevant files and wreck clustering (they're not meaningfully
+# "connected" to the target codebase by any call graph review_tree builds).
+_SKIP_DIR_NAMES = frozenset(
+    {
+        ".git", "__pycache__", ".venv", "venv", "env", ".env", "node_modules",
+        ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist",
+    }
+)
+
+
 def _iter_python_files(target_dir: Path) -> list[Path]:
-    return sorted(p for p in target_dir.glob("*.py") if p.is_file())
+    """Recursively finds every .py file under target_dir, skipping
+    _SKIP_DIR_NAMES and any other dot-prefixed directory (e.g. .idea,
+    .claude) -- os.walk (not Path.rglob) so skipped directories are pruned
+    from traversal entirely rather than just filtered after the fact."""
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(target_dir):
+        dirnames[:] = [
+            d for d in dirnames if d not in _SKIP_DIR_NAMES and not d.startswith(".") and not d.endswith(".egg-info")
+        ]
+        found.extend(Path(dirpath) / name for name in filenames if name.endswith(".py"))
+    return sorted(found)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Goal-tree code review prototype.")
-    parser.add_argument("--target-dir", type=Path, required=True)
+    parser.add_argument(
+        "--target-dir", type=Path, required=True,
+        help="Directory to review, walked recursively for .py files (skips .git, __pycache__, "
+        "venvs, node_modules, build/dist, and other dot-prefixed directories).",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("review-runs"))
     parser.add_argument("--model", default=None, help="Model for leaf calls (one function/class + context)")
     parser.add_argument(
@@ -1612,7 +1639,7 @@ def main(argv: list[str] | None = None) -> int:
 
     target_files = _iter_python_files(args.target_dir)
     if not target_files:
-        parser.error(f"No .py files found directly in {args.target_dir}")
+        parser.error(f"No .py files found under {args.target_dir}")
 
     def _report_progress(message: str) -> None:
         print(f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr)

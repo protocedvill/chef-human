@@ -505,14 +505,14 @@ async def _complete_result(
     response = await backend.complete(request)
     data = _parse_json_object(response.message.content)
     usage = response.usage or {}
-    completion_tokens = usage.get("completion_tokens", 0)
+    completion_tokens = usage.get("completion_tokens") or 0
     truncated = completion_tokens >= config.max_completion_tokens
 
     summary = data.get("summary")
     result = NodeResult(
         summary=summary if isinstance(summary, str) else "",
         findings=_parse_findings(data.get("findings")),
-        prompt_tokens=usage.get("prompt_tokens", 0),
+        prompt_tokens=usage.get("prompt_tokens") or 0,
         completion_tokens=completion_tokens,
         truncated=truncated,
         dropped=_parse_dropped(data.get("dropped")),

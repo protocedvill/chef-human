@@ -657,6 +657,100 @@ class TestFindingsMergeRecovery:
         assert root.result.recovered_from_children == 0
 
 
+class TrackingBackend:
+    """Records which prompts it received so tests can verify routing."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.model_name = name
+        self.calls: list[CompletionRequest] = []
+
+    async def complete(self, request: CompletionRequest) -> CompletionResponse:
+        self.calls.append(request)
+        is_leaf = "Review lens" in request.messages[-1].content
+        data = {"summary": f"{self.name}-leaf" if is_leaf else f"{self.name}-synth", "findings": []}
+        return CompletionResponse(
+            message=Message(role=Role.assistant, content=json.dumps(data)),
+            usage={"prompt_tokens": 5, "completion_tokens": 5},
+        )
+
+
+class TestDualModelRouting:
+    @pytest.mark.asyncio
+    async def test_leaves_and_synthesis_use_separate_backends_when_configured(self, tmp_path):
+        target = tmp_path / "multi.py"
+        target.write_text(_make_functions_source(3))
+        methods = (ReviewMethod("m1", "desc1"),)
+        leaf_backend = TrackingBackend("quick")
+        synthesis_backend = TrackingBackend("powerful")
+
+        root = await run_review(
+            [target], methods=methods, backend=leaf_backend, synthesis_backend=synthesis_backend,
+            tokenizer=ApproxTokenizer(), leaf_token_budget=10_000,
+        )
+
+        # 3 leaf calls all went to the quick backend
+        assert len(leaf_backend.calls) == 3
+        assert all("Review lens" in c.messages[-1].content for c in leaf_backend.calls)
+        # method synthesis + root synthesis went to the powerful backend
+        assert len(synthesis_backend.calls) == 2
+        assert all("Review lens" not in c.messages[-1].content for c in synthesis_backend.calls)
+        assert root.result.summary == "powerful-synth"
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_same_backend_for_both_when_unconfigured(self, tmp_path):
+        target = tmp_path / "multi.py"
+        target.write_text(_make_functions_source(3))
+        methods = (ReviewMethod("m1", "desc1"),)
+        backend = TrackingBackend("shared")
+
+        await run_review(
+            [target], methods=methods, backend=backend, tokenizer=ApproxTokenizer(),
+            leaf_token_budget=10_000,
+        )
+
+        # 3 leaves + method synthesis + root synthesis, all on the one backend
+        assert len(backend.calls) == 5
+
+    @pytest.mark.asyncio
+    async def test_synthesis_model_builds_a_separate_backend(self, monkeypatch, tmp_path):
+        target = tmp_path / "multi.py"
+        target.write_text(_make_functions_source(2))
+        methods = (ReviewMethod("m1", "desc1"),)
+        leaf_backend = TrackingBackend("quick")
+        built_models: list[str | None] = []
+
+        def fake_default_backend(model, think):
+            built_models.append(model)
+            return TrackingBackend(f"synth-{model}")
+
+        monkeypatch.setattr(review_tree, "_default_backend", fake_default_backend)
+
+        await run_review(
+            [target], methods=methods, backend=leaf_backend, synthesis_model="big-model",
+            tokenizer=ApproxTokenizer(), leaf_token_budget=10_000,
+        )
+
+        assert built_models == ["big-model"]
+
+    @pytest.mark.asyncio
+    async def test_oversized_unit_synthesis_also_uses_synthesis_backend(self, tmp_path):
+        target = tmp_path / "a.py"
+        huge_body = "\n".join(f"    x{j} = {j}" for j in range(200))
+        target.write_text(f"def huge():\n{huge_body}\n    return 0\n")
+        methods = (ReviewMethod("m1", "desc1"),)
+        leaf_backend = TrackingBackend("quick")
+        synthesis_backend = TrackingBackend("powerful")
+
+        await run_review(
+            [target], methods=methods, backend=leaf_backend, synthesis_backend=synthesis_backend,
+            tokenizer=ApproxTokenizer(), leaf_token_budget=20,
+        )
+
+        assert len(leaf_backend.calls) > 1  # huge() got split into multiple leaf pieces
+        assert len(synthesis_backend.calls) >= 1  # at least the oversized-unit synthesis
+
+
 class TestThinkEffort:
     def test_default_backend_uses_low_think_by_default(self, monkeypatch, tmp_path):
         captured: dict = {}

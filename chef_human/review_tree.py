@@ -289,7 +289,17 @@ def token_budget_atom_check(
 
 @dataclass
 class ReviewConfig:
+    # Used for leaf calls -- one function/class body plus context, closer to
+    # structured classification than open-ended reasoning, so a quicker/
+    # smaller model is usually enough.
     backend: LLMBackend
+    # Used for every synthesis call (method-level, oversized-unit-fallback,
+    # and root) -- these have to weigh multiple sub-reviews against each
+    # other and catch cross-cutting issues, which benefits more from a
+    # stronger model. Defaults to the same backend as leaves when no
+    # separate synthesis model/backend is configured, so nothing changes
+    # unless a caller opts in.
+    synthesis_backend: LLMBackend
     tokenizer: Tokenizer
     # Computed once per run (lens-independent) and reused across every
     # ReviewMethod -- the same functions/classes and cross-references apply
@@ -359,7 +369,7 @@ def _parse_findings(raw: Any) -> list[Finding]:
 
 
 async def _complete_result(
-    config: ReviewConfig, system_prompt: str, user_prompt: str, label: str
+    config: ReviewConfig, backend: LLMBackend, system_prompt: str, user_prompt: str, label: str
 ) -> NodeResult:
     if config.on_progress:
         config.on_progress(f"{label} -- dispatching (budget={config.max_completion_tokens})")
@@ -371,7 +381,7 @@ async def _complete_result(
         temperature=0.0,
         max_tokens=config.max_completion_tokens,
     )
-    response = await config.backend.complete(request)
+    response = await backend.complete(request)
     data = _parse_json_object(response.message.content)
     usage = response.usage or {}
     completion_tokens = usage.get("completion_tokens", 0)
@@ -854,7 +864,7 @@ async def _execute_leaf(
     )
     node.connected = tuple(connected)
     node.result = await _complete_result(
-        config, LEAF_SYSTEM_PROMPT, _leaf_prompt(method, unit, header, connected), node_id
+        config, config.backend, LEAF_SYSTEM_PROMPT, _leaf_prompt(method, unit, header, connected), node_id
     )
     node.result.connected_included = included
     node.result.connected_omitted = omitted
@@ -890,6 +900,7 @@ async def _build_unit_subtree(
         node.children.append(child)
     node.result = await _complete_result(
         config,
+        config.synthesis_backend,
         SYNTHESIS_SYSTEM_PROMPT,
         _synthesis_prompt(node.goal, f"pieces of the oversized {unit.kind} '{unit.name}'", node.children),
         f"{node_id} (synthesis)",
@@ -926,6 +937,7 @@ async def _build_method_subtree(node_id: str, method: ReviewMethod, config: Revi
 
     node.result = await _complete_result(
         config,
+        config.synthesis_backend,
         SYNTHESIS_SYSTEM_PROMPT,
         _synthesis_prompt(node.goal, f"functions/classes reviewed under the '{method.id}' lens", node.children),
         f"{node_id} (synthesis)",
@@ -941,21 +953,34 @@ async def run_review(
     *,
     methods: tuple[ReviewMethod, ...] = DEFAULT_METHODS,
     backend: LLMBackend | None = None,
+    synthesis_backend: LLMBackend | None = None,
     tokenizer: Tokenizer | None = None,
     leaf_token_budget: int = DEFAULT_LEAF_TOKEN_BUDGET,
     max_completion_tokens: int = 30000,
     is_atom: AtomCheck = token_budget_atom_check,
     model: str | None = None,
+    synthesis_model: str | None = None,
     think: ThinkLevel = "low",
+    synthesis_think: ThinkLevel | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> ReviewNode:
     backend = backend or _default_backend(model, think)
+    # synthesis_backend defaults to the same backend as leaves -- nothing
+    # changes unless a caller explicitly asks for a stronger model on
+    # synthesis nodes via synthesis_model/synthesis_backend.
+    if synthesis_backend is None:
+        synthesis_backend = (
+            _default_backend(synthesis_model, synthesis_think if synthesis_think is not None else think)
+            if synthesis_model is not None
+            else backend
+        )
     tokenizer = tokenizer or create_tokenizer(getattr(backend, "model_name", ""))
 
     header_by_path, units = _extract_all_units(target_files)
     definition_map, caller_index = _build_definition_map(units)
     config = ReviewConfig(
         backend=backend,
+        synthesis_backend=synthesis_backend,
         tokenizer=tokenizer,
         units=units,
         header_by_path=header_by_path,
@@ -980,6 +1005,7 @@ async def run_review(
 
     root.result = await _complete_result(
         config,
+        config.synthesis_backend,
         SYNTHESIS_SYSTEM_PROMPT,
         _synthesis_prompt(root.goal, "different analysis lenses over the same code", root.children),
         "root (synthesis)",
@@ -1056,7 +1082,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Goal-tree code review prototype.")
     parser.add_argument("--target-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("review-runs"))
-    parser.add_argument("--model", default=None)
+    parser.add_argument("--model", default=None, help="Model for leaf calls (one function/class + context)")
+    parser.add_argument(
+        "--synthesis-model",
+        default=None,
+        help="Model for synthesis calls (method/oversized-unit/root) -- defaults to --model "
+        "when unset, so a stronger model can review sub-reviews without changing leaf cost",
+    )
     parser.add_argument("--leaf-token-budget", type=int, default=DEFAULT_LEAF_TOKEN_BUDGET)
     parser.add_argument("--max-completion-tokens", type=int, default=30000)
     parser.add_argument(
@@ -1082,6 +1114,7 @@ def main(argv: list[str] | None = None) -> int:
             leaf_token_budget=args.leaf_token_budget,
             max_completion_tokens=args.max_completion_tokens,
             model=args.model,
+            synthesis_model=args.synthesis_model,
             think=think,
             on_progress=None if args.quiet else _report_progress,
         )

@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, Literal
 
 import ollama
 
@@ -31,12 +31,12 @@ class OllamaBackend(LLMBackend):
         model: str = DEFAULT_MODEL,
         host: str = "http://localhost:11434",
         context_length: int = DEFAULT_CONTEXT_LENGTH,
-        think: bool = False,
+        think: bool | Literal["low", "medium", "high"] = False,
     ) -> None:
         self._model = model
         self._host = host.rstrip("/")
         self._context_length = context_length
-        self._think = think
+        self._think: bool | Literal["low", "medium", "high"] = think
         self._client = ollama.Client(host=self._host)
         self._async_client = ollama.AsyncClient(host=self._host)
 

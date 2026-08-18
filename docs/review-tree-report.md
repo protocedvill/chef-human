@@ -28,6 +28,13 @@ function/class-boundary-leaf redesign with cross-file connected context
   behavior of this model at synthesis time, not an occasional glitch.
 - Total cost: 120 LLM calls, 810,609 tokens (183,528 prompt / 627,081 completion),
   ~40s average per call.
+- **Dual-model routing (quick model for leaves, powerful model for synthesis)** was
+  implemented and validated live tonight: cuts wall-clock time dramatically (a 17-call
+  run finished in 2.5 minutes vs. minutes-per-call with a single strong model), but a
+  live run also immediately surfaced a real bug (Ollama hard-errors when `think` is
+  sent to a non-thinking model) and shows a real quality tradeoff (a false positive
+  slipped through the leaf model that flagged the target function's own documented
+  behavior as a bug). See the dedicated section below.
 
 ## BashTool truncation: diagnosis
 
@@ -135,9 +142,42 @@ purely by code structure, identical across lenses, as designed.
    finding's failure scenario against the actual file, ideally by executing it like
    the checks above) is the natural next capability to build, not more decomposition
    refinement.
-3. **The dual-model routing feature added this session** (`synthesis_backend`/
-   `--synthesis-model`, commit `1018fd6`) has not yet been run live — it's unit-tested
-   but the next live run should use it (e.g. a stronger model for the 8 synthesis
-   calls, keeping the fast model on the 112 leaves) to see whether it improves the
-   8/8 findings-array reliability problem specifically, since that's a synthesis-side
-   failure, not a leaf-side one.
+3. **Dual-model routing (`synthesis_backend`/`--synthesis-model`, commit `1018fd6`)
+   validated live** against `diff.py` (7 units, 2 lenses, 17 calls): leaves on
+   `qwen2.5-coder:7b`, synthesis on `qwen3.6:35b-a3b`. Results below.
+
+## Dual-model routing: live validation
+
+**A real bug surfaced immediately on the first attempt**: pairing a thinking-capable
+synthesis model with a non-thinking-capable leaf model crashed the whole run —
+`ollama._types.ResponseError: "qwen2.5-coder:7b" does not support thinking (status
+code: 400)`. This is exactly the failure mode dual-model routing invites (fast/small
+models frequently aren't thinking-capable), so it's not an edge case, it's close to
+the common case. Fixed in `OllamaBackend`: catch that specific error, downgrade to
+`think=False`, retry once, and remember the downgrade for the rest of that backend
+instance's life (commit `1d74753`). Re-ran clean afterward — the warning logged
+exactly once, then every subsequent leaf call went straight to `think=False`.
+
+**Speed**: dramatic. 17 calls (14 leaves + 3 synthesis) completed in **2.5 minutes**
+total — individual leaf calls took 1–5 seconds each (avg completion: 197 tokens),
+versus 20–70+ seconds per leaf and ~5,000+ average completion tokens when qwen3.6
+handled leaves itself. Zero truncation across all 14 leaves.
+
+**Quality**: mixed. All 3 synthesis nodes still needed `_merge_child_findings`
+recovery (same 100% pattern as the single-model run — this looks like a qwen3.6
+synthesis-task characteristic, independent of which model produced the leaves it's
+synthesizing). But spot-checking the leaves' own output: the *first* finding
+(`compute_diff` "returns an empty string when old_content and new_content are
+identical") is a **false positive** — that's the function's own documented, intended
+behavior per its docstring ("Returns empty string when old and new are identical"),
+not a bug. `qwen2.5-coder:7b` also didn't consistently follow the `category` field
+convention (`"Bug"`, `"Correctness"` instead of the lens's own id like
+`"correctness"`), unlike qwen3.6's leaves in the full run.
+
+**Verdict**: dual-model routing is a legitimate lever for cutting wall-clock time
+dramatically (this is the single biggest efficiency change available, far more than
+any budget/retry tuning), but the quick leaf model traded real precision for that
+speed — expect more false positives needing verification, not fewer. Worth using when
+iteration speed matters more than precision (e.g. a first pass to find candidates
+worth a slower, more careful second look), not as a drop-in replacement for a
+single-strong-model run.

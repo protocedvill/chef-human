@@ -82,15 +82,15 @@ class RefactorTool:
         if old_name == new_name:
             return ToolResult(output="No changes made — old name equals new name.")
 
-        # Check if new_name already exists in index
-        existing = self._index.lookup(new_name)
-        if existing:
-            existing_names = set(e.symbol.name for e in existing)
-            if new_name in existing_names:
-                logger.warning(
-                    "Symbol '%s' already exists in index; rename may cause conflicts",
-                    new_name,
-                )
+        # Check if new_name already exists in index. lookup() only returns
+        # entries whose name *is* new_name, so a truthy result already means
+        # a conflict -- no need to also verify membership in a name set
+        # built from those same results.
+        if self._index.lookup(new_name):
+            logger.warning(
+                "Symbol '%s' already exists in index; rename may cause conflicts",
+                new_name,
+            )
 
         # Phase 1: Discover files to change
         files_to_rename: list[Path] = []

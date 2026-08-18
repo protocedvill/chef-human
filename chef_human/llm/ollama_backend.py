@@ -37,6 +37,13 @@ class OllamaBackend(LLMBackend):
         self._host = host.rstrip("/")
         self._context_length = context_length
         self._think: bool | Literal["low", "medium", "high"] = think
+        # Set once a live call proves this model rejects the `think` option
+        # entirely (Ollama returns a hard 400, not a silent no-op) -- lets a
+        # single backend instance keep working for the rest of its life
+        # instead of failing on every call. Real-world trigger: routing a
+        # non-thinking-capable model (e.g. a small/fast one) to a caller that
+        # sets a global `think` default meant for thinking models.
+        self._think_unsupported = False
         self._client = ollama.Client(host=self._host)
         self._async_client = ollama.AsyncClient(host=self._host)
 
@@ -58,17 +65,38 @@ class OllamaBackend(LLMBackend):
     def context_length(self) -> int:
         return self._context_length
 
+    async def _chat(self, **kwargs: Any) -> Any:
+        """Wraps AsyncClient.chat with graceful degradation for models that
+        reject `think` outright (Ollama returns a hard 400, not a silent
+        no-op) -- downgrades to think=False and retries once, remembering
+        the downgrade for the rest of this backend instance's life so it
+        doesn't re-fail on every subsequent call."""
+        think = False if self._think_unsupported else self._think
+        try:
+            return await self._async_client.chat(think=think, **kwargs)
+        except ollama.ResponseError as exc:
+            if think is False or "does not support thinking" not in str(exc):
+                # Either already sending think=False (retrying identically
+                # would just fail the same way again) or an unrelated error.
+                raise
+            logger.warning(
+                "Model %s does not support the `think` option; disabling it for "
+                "this backend instance and retrying.",
+                self._model,
+            )
+            self._think_unsupported = True
+            return await self._async_client.chat(think=False, **kwargs)
+
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         ollama_messages = [_to_ollama_msg(m) for m in request.messages]
         ollama_tools = (
             [tool_to_dict(t) for t in request.tools] if request.tools else None
         )
 
-        response = await self._async_client.chat(
+        response = await self._chat(
             model=self._model,
             messages=ollama_messages,
             tools=ollama_tools or None,
-            think=self._think,
             options={
                 "temperature": request.temperature,
                 "num_predict": request.max_tokens,
@@ -104,11 +132,10 @@ class OllamaBackend(LLMBackend):
             [tool_to_dict(t) for t in request.tools] if request.tools else None
         )
 
-        stream = await self._async_client.chat(
+        stream = await self._chat(
             model=self._model,
             messages=ollama_messages,
             tools=ollama_tools or None,
-            think=self._think,
             options={
                 "temperature": request.temperature,
                 "num_predict": request.max_tokens,

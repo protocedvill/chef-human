@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -170,7 +171,19 @@ class BashTool:
 
     @staticmethod
     def _is_destructive(command: str) -> bool:
-        if ">" in command:
+        try:
+            # punctuation_chars makes shlex split shell operators (>, >>, |,
+            # etc.) into their own tokens, so a quoted ">" stays part of
+            # its quoted token instead of being mistaken for a redirect.
+            lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            tokens = list(lexer)
+        except ValueError:
+            tokens = None
+        if tokens is not None:
+            if any(tok.startswith(">") for tok in tokens):
+                return True
+        elif ">" in command:
             return True
         for segment in _SEGMENT_SEPARATORS.split(command):
             stripped = segment.strip()

@@ -656,6 +656,62 @@ class TestFindingsMergeRecovery:
         assert len(root.result.findings) == 1
         assert root.result.recovered_from_children == 0
 
+    @pytest.mark.asyncio
+    async def test_explicitly_dropped_finding_is_not_recovered(self, tmp_path):
+        """A synthesis call that lists a child's finding in "dropped" (with
+        a reason) is making a deliberate prioritization call -- it must NOT
+        get force-recovered like an accidental JSON-omission would."""
+        target = tmp_path / "multi.py"
+        target.write_text(_make_functions_source(2))
+        methods = (ReviewMethod("m1", "desc1"),)
+        real_bug = _finding(file="multi.py", summary="real bug", line=1)
+        false_positive = _finding(file="multi.py", summary="not actually a bug", line=2)
+
+        class DropOneBackend:
+            model_name = "drop-one"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def complete(self, request: CompletionRequest) -> CompletionResponse:
+                self.calls += 1
+                is_leaf = "Review lens" in request.messages[-1].content
+                if is_leaf:
+                    finding = real_bug if self.calls == 1 else false_positive
+                    data = {"summary": f"leaf {self.calls}", "findings": [finding]}
+                else:
+                    # synthesis keeps the real bug, explicitly drops the
+                    # false positive with a reason, and doesn't re-list it.
+                    data = {
+                        "summary": "synthesis escalated one, dropped one",
+                        "findings": [{**real_bug, "severity": "high"}],
+                        "dropped": [
+                            {
+                                "file": "multi.py",
+                                "line": 2,
+                                "category": false_positive["category"],
+                                "reason": "not backed by concrete evidence",
+                            }
+                        ],
+                    }
+                return CompletionResponse(
+                    message=Message(role=Role.assistant, content=json.dumps(data)),
+                    usage={"prompt_tokens": 5, "completion_tokens": 10},
+                )
+
+        root = await run_review(
+            [target], methods=methods, backend=DropOneBackend(), tokenizer=ApproxTokenizer(),
+            leaf_token_budget=10_000,
+        )
+
+        method_node = root.children[0]
+        assert len(method_node.result.findings) == 1
+        assert method_node.result.findings[0].summary == "real bug"
+        assert method_node.result.findings[0].severity == "high"
+        assert method_node.result.recovered_from_children == 0
+        assert len(method_node.result.dropped) == 1
+        assert method_node.result.dropped[0]["reason"] == "not backed by concrete evidence"
+
 
 class TrackingBackend:
     """Records which prompts it received so tests can verify routing."""

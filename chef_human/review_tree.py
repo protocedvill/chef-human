@@ -160,6 +160,9 @@ class ConnectedRef:
     relation: Literal["callee", "caller"]
 
 
+Severity = Literal["low", "medium", "high"]
+
+
 @dataclass(frozen=True)
 class Finding:
     file: str
@@ -167,6 +170,14 @@ class Finding:
     category: str
     summary: str
     failure_scenario: str
+    # Set by whichever call first reports the finding (leaf or synthesis)
+    # and freely rewritable by a synthesis call re-reporting an
+    # already-known finding -- e.g. two leaves each flagging one half of
+    # the same bug independently is "medium" alone but "high" once
+    # synthesis sees both halves together. Defaults to "medium" so old
+    # scripted-response tests and any caller not yet setting it explicitly
+    # still construct a valid Finding.
+    severity: Severity = "medium"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -175,6 +186,7 @@ class Finding:
             "category": self.category,
             "summary": self.summary,
             "failure_scenario": self.failure_scenario,
+            "severity": self.severity,
         }
 
 
@@ -198,6 +210,13 @@ class NodeResult:
     # fit the remaining token budget. 0/0 for non-leaf nodes.
     connected_included: int = 0
     connected_omitted: int = 0
+    # Synthesis-only: (file, line, category) keys the model explicitly
+    # listed in its own "dropped" array, with a reason -- see
+    # _merge_child_findings. Distinguishing "explicitly dropped" from
+    # "just missing from the findings array" is what lets a synthesis node
+    # actually prune a finding instead of _merge_child_findings blindly
+    # recovering everything it doesn't see.
+    dropped: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -243,6 +262,7 @@ class ReviewNode:
             "completion_tokens": self.result.completion_tokens if self.result else 0,
             "truncated": self.result.truncated if self.result else False,
             "recovered_from_children": self.result.recovered_from_children if self.result else 0,
+            "dropped": self.result.dropped if self.result else [],
             "connected_included": self.result.connected_included if self.result else 0,
             "connected_omitted": self.result.connected_omitted if self.result else 0,
             "children": [child.to_dict() for child in self.children],
@@ -374,6 +394,7 @@ def _parse_findings(raw: Any) -> list[Finding]:
         line = item.get("line")
         category = item.get("category")
         failure_scenario = item.get("failure_scenario")
+        severity = item.get("severity")
         findings.append(
             Finding(
                 file=file,
@@ -381,9 +402,42 @@ def _parse_findings(raw: Any) -> list[Finding]:
                 category=category if isinstance(category, str) else "uncategorized",
                 summary=summary,
                 failure_scenario=failure_scenario if isinstance(failure_scenario, str) else "",
+                severity=severity if severity in ("low", "medium", "high") else "medium",
             )
         )
     return findings
+
+
+def _finding_key(file: str, line: int | None, category: str) -> tuple[str, int | None, str]:
+    return (file, line, category.lower())
+
+
+def _parse_dropped(raw: Any) -> list[dict[str, Any]]:
+    """A synthesis call's explicit "I looked at this and decided it's not
+    real" list -- each entry needs enough to build the same (file, line,
+    category) key a Finding would have, so _merge_child_findings can match
+    it against a child's finding and treat the absence as deliberate rather
+    than a JSON-generation slip."""
+    if not isinstance(raw, list):
+        return []
+    dropped: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        file, category = item.get("file"), item.get("category")
+        if not isinstance(file, str) or not isinstance(category, str):
+            continue
+        line = item.get("line")
+        reason = item.get("reason")
+        dropped.append(
+            {
+                "file": file,
+                "line": line if isinstance(line, int) else None,
+                "category": category,
+                "reason": reason if isinstance(reason, str) else "",
+            }
+        )
+    return dropped
 
 
 async def _complete_result(
@@ -412,6 +466,7 @@ async def _complete_result(
         prompt_tokens=usage.get("prompt_tokens", 0),
         completion_tokens=completion_tokens,
         truncated=truncated,
+        dropped=_parse_dropped(data.get("dropped")),
     )
     if config.on_progress:
         status = "TRUNCATED" if truncated else f"{len(result.findings)} finding(s)"
@@ -420,7 +475,7 @@ async def _complete_result(
 
 
 def _merge_child_findings(
-    synthesized: list[Finding], children: list[ReviewNode]
+    synthesized: list[Finding], children: list[ReviewNode], dropped: list[dict[str, Any]] | None = None
 ) -> tuple[list[Finding], int]:
     """Synthesis calls reliably write a good narrative summary but
     unreliably populate the structured findings array: measured against
@@ -428,19 +483,31 @@ def _merge_child_findings(
     though their children found real, specific bugs. Union the synthesized
     findings with every immediate child's own (already-merged) findings,
     deduped by (file, line, category), so a synthesized node can never
-    report fewer distinct findings than its children did -- synthesis can
-    still add its own cross-cutting findings and rewrite descriptions, it
-    just can't silently make real ones disappear. Returns (merged, recovered_count)."""
-    seen = {(f.file, f.line, f.category.lower()) for f in synthesized}
+    silently lose a real finding to a JSON-generation slip.
+
+    But that recovery must not swallow a *deliberate* prioritization
+    decision -- synthesis's actual job, per SYNTHESIS_SYSTEM_PROMPT, is to
+    drop findings that don't hold up and escalate/re-describe ones that
+    matter more in combination, not just re-list its children verbatim.
+    `dropped` (the model's own explicit "I looked at this and it's not
+    real" list, parsed by _parse_dropped) is checked before recovering a
+    missing child finding: a key present there is treated as an intentional
+    prune, not an omission, and is NOT recovered. A key absent from both
+    `synthesized` and `dropped` is still assumed to be an accidental
+    omission and is recovered, same as before. Returns (merged,
+    recovered_count)."""
+    seen = {_finding_key(f.file, f.line, f.category) for f in synthesized}
+    dropped_keys = {_finding_key(d["file"], d["line"], d["category"]) for d in (dropped or [])}
     merged = list(synthesized)
     recovered = 0
     for child in children:
         for finding in (child.result.findings if child.result else []):
-            key = (finding.file, finding.line, finding.category.lower())
-            if key not in seen:
-                seen.add(key)
-                merged.append(finding)
-                recovered += 1
+            key = _finding_key(finding.file, finding.line, finding.category)
+            if key in seen or key in dropped_keys:
+                continue
+            seen.add(key)
+            merged.append(finding)
+            recovered += 1
     return merged, recovered
 
 
@@ -457,22 +524,37 @@ LEAF_SYSTEM_PROMPT = (
     "(other functions this code calls or is called by, shown as signature+docstring "
     "only, never their bodies) -- these are context only. Only report findings against "
     "the section explicitly marked as the code to review; never report a finding "
-    "against the background or related-signatures sections. Respond with a single "
-    'JSON object and nothing else, shaped like: {"summary": str, "findings": '
-    '[{"file": str, "line": int or null, "category": str, "summary": str, '
-    '"failure_scenario": str}]} -- "failure_scenario" holds that concrete evidence '
-    "regardless of lens. If you find nothing real, return an empty findings list -- "
-    "do not invent one to seem thorough."
+    "against the background or related-signatures sections. Also assign a \"severity\": "
+    "\"high\" for a finding that causes wrong output, a crash, a security hole, or "
+    "silent data loss; \"medium\" for a real bug that's contained or hard to trigger; "
+    "\"low\" for a minor/cosmetic issue that's still concrete enough to report. Respond "
+    'with a single JSON object and nothing else, shaped like: {"summary": str, '
+    '"findings": [{"file": str, "line": int or null, "category": str, "summary": str, '
+    '"failure_scenario": str, "severity": "low"|"medium"|"high"}]} -- "failure_scenario" '
+    "holds that concrete evidence regardless of lens. If you find nothing real, return "
+    "an empty findings list -- do not invent one to seem thorough."
 )
 
 SYNTHESIS_SYSTEM_PROMPT = (
-    "You are synthesizing several code-review sub-reviews into one coherent review "
-    "for this subtree. Merge duplicate or overlapping findings, drop anything that "
-    "isn't backed by concrete evidence (a failing input for a bug lens, or the "
-    "specific code in question for a design-quality lens), and call out any issue "
-    "that only becomes visible by combining two sub-reviews together. Respond with "
-    'a single JSON object, shaped like: {"summary": str, "findings": [...]}, using '
-    "the same finding fields as the sub-reviews."
+    "You are synthesizing several code-review sub-reviews into one coherent review for "
+    "this subtree. Your job is to prioritize and escalate, not just re-list: merge "
+    "duplicate/overlapping findings into one, and re-examine severity using the bigger "
+    "picture you have that no single sub-review did -- raise a finding's severity if "
+    "combining it with another sub-review's finding reveals it's worse than it looked "
+    "alone (e.g. two sub-reviews each flag one half of the same bug), and call out any "
+    "issue that only becomes visible by combining two sub-reviews together as its own "
+    "new finding. For any individual sub-review finding you conclude is NOT real (not "
+    "backed by concrete evidence -- a failing input for a bug lens, or the specific code "
+    "in question for a design-quality lens), do not just omit it: list it explicitly in "
+    "a \"dropped\" array with a one-sentence reason, so the harness can tell a deliberate "
+    "prune apart from something you simply forgot to re-list. Any sub-review finding you "
+    "don't explicitly keep in \"findings\" or explicitly reject in \"dropped\" is assumed "
+    "omitted by mistake and will be added back automatically -- so an omission is never a "
+    "safe way to drop something, only an explicit \"dropped\" entry is. Respond with a "
+    'single JSON object, shaped like: {"summary": str, "findings": [{"file": str, '
+    '"line": int or null, "category": str, "summary": str, "failure_scenario": str, '
+    '"severity": "low"|"medium"|"high"}], "dropped": [{"file": str, "line": int or null, '
+    '"category": str, "reason": str}]}.'
 )
 
 
@@ -519,7 +601,8 @@ def _synthesis_prompt(goal: str, cross_axis: str, children: list[ReviewNode]) ->
         assert result is not None
         findings_text = (
             "\n".join(
-                f"- [{f.category}] {f.file}:{f.line} -- {f.summary} ({f.failure_scenario})"
+                f"- [{f.severity}/{f.category}] {f.file}:{f.line} -- {f.summary} "
+                f"({f.failure_scenario})"
                 for f in result.findings
             )
             or "(no findings)"
@@ -1005,7 +1088,7 @@ async def _execute_synthesis_bottom_up(node: ReviewNode, config: ReviewConfig) -
         f"{node.node_id} (synthesis)",
     )
     node.result.findings, node.result.recovered_from_children = _merge_child_findings(
-        node.result.findings, node.children
+        node.result.findings, node.children, node.result.dropped
     )
 
 
@@ -1089,7 +1172,7 @@ async def run_review(
         "root (synthesis)",
     )
     root.result.findings, root.result.recovered_from_children = _merge_child_findings(
-        root.result.findings, root.children
+        root.result.findings, root.children, root.result.dropped
     )
     return root
 
@@ -1099,6 +1182,9 @@ def _iter_nodes(node: ReviewNode) -> list[ReviewNode]:
     for child in node.children:
         nodes.extend(_iter_nodes(child))
     return nodes
+
+
+_SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
 def render_markdown(root: ReviewNode, verified: list[Any] | None = None) -> str:
@@ -1144,8 +1230,22 @@ def render_markdown(root: ReviewNode, verified: list[Any] | None = None) -> str:
             omitted = node.result.connected_omitted if node.result else 0
             lines.append(f"- `{node.node_id}`: {included} included / {omitted} omitted")
         lines.append("")
+    dropped_nodes = [n for n in all_nodes if n.result and n.result.dropped]
+    if dropped_nodes:
+        lines.append(
+            "**Findings a synthesis node explicitly pruned** (kept out of the final list "
+            "on purpose, with a reason -- not lost to a JSON-generation slip):"
+        )
+        for node in dropped_nodes:
+            for d in node.result.dropped:  # type: ignore[union-attr]
+                loc = f"{d['file']}:{d['line']}" if d["line"] else d["file"]
+                lines.append(f"- `{node.node_id}` dropped [{d['category']}] {loc}: {d['reason']}")
+        lines.append("")
     if verified is not None:
-        kept = [v for v in verified if v.verdict != "refuted"]
+        kept = sorted(
+            (v for v in verified if v.verdict != "refuted"),
+            key=lambda v: _SEVERITY_ORDER.get(v.finding.severity, 1),
+        )
         if not kept:
             lines.append("No findings survived synthesis + verification.")
         else:
@@ -1155,7 +1255,7 @@ def render_markdown(root: ReviewNode, verified: list[Any] | None = None) -> str:
                 finding = v.finding
                 location = f"{finding.file}:{finding.line}" if finding.line else finding.file
                 tag = " (UNVERIFIED)" if v.verdict == "uncertain" else ""
-                lines.append(f"### [{finding.category}] {location}{tag}")
+                lines.append(f"### [{finding.severity}/{finding.category}] {location}{tag}")
                 lines.append("")
                 lines.append(finding.summary)
                 lines.append("")
@@ -1166,7 +1266,10 @@ def render_markdown(root: ReviewNode, verified: list[Any] | None = None) -> str:
                 lines.append("")
         return "\n".join(lines)
 
-    findings = root.result.findings if root.result else []
+    findings = sorted(
+        root.result.findings if root.result else [],
+        key=lambda f: _SEVERITY_ORDER.get(f.severity, 1),
+    )
     if not findings:
         lines.append("No findings survived synthesis.")
     else:
@@ -1174,7 +1277,7 @@ def render_markdown(root: ReviewNode, verified: list[Any] | None = None) -> str:
         lines.append("")
         for finding in findings:
             location = f"{finding.file}:{finding.line}" if finding.line else finding.file
-            lines.append(f"### [{finding.category}] {location}")
+            lines.append(f"### [{finding.severity}/{finding.category}] {location}")
             lines.append("")
             lines.append(finding.summary)
             lines.append("")

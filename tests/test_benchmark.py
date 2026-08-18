@@ -216,3 +216,144 @@ def test_list_command_does_not_run_agent(capsys):
     output = capsys.readouterr().out
     assert "hello_world" in output
     assert "inventory_refactor" in output
+
+
+def _init_source_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "source_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "a@b.c"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "tester"], cwd=repo, check=True)
+    (repo / "existing.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    return repo
+
+
+def _review_case(**overrides) -> BenchmarkCase:
+    defaults = dict(
+        case_id="review_case",
+        level="review",
+        title="Review case",
+        task="Review the code and write REVIEW.md. Do not modify anything else.",
+        seed_files={},
+        verification=None,
+        protect_all_existing_files=True,
+        workspace_kind="worktree",
+    )
+    defaults.update(overrides)
+    return BenchmarkCase(**defaults)
+
+
+class TestWorktreeCase:
+    def test_worktree_is_checked_out_from_source_repo(self, tmp_path, monkeypatch):
+        source_repo = _init_source_repo(tmp_path)
+
+        def fake_run(command, *, cwd, timeout, env=None):
+            assert (cwd / "existing.py").read_text() == "x = 1\n"
+            return _completed(command, stdout='{"success": true, "message": "found nothing"}')
+
+        monkeypatch.setattr(benchmark, "_run_process", fake_run)
+        result = benchmark.run_case(
+            _review_case(),
+            tmp_path / "workspace",
+            model=None,
+            agent_timeout=60,
+            source_repo=source_repo,
+        )
+
+        assert result.agent_success
+        assert result.verifier_success
+        assert result.passed
+        assert result.agent_message == "found nothing"
+        benchmark._prune_worktrees(source_repo)
+
+    def test_no_external_verifier_is_invoked_when_verification_is_none(self, tmp_path, monkeypatch):
+        source_repo = _init_source_repo(tmp_path)
+        calls: list[list[str]] = []
+
+        def fake_run(command, *, cwd, timeout, env=None):
+            calls.append(list(command))
+            return _completed(command, stdout='{"success": true}')
+
+        monkeypatch.setattr(benchmark, "_run_process", fake_run)
+        benchmark.run_case(
+            _review_case(),
+            tmp_path / "workspace",
+            model=None,
+            agent_timeout=60,
+            source_repo=source_repo,
+        )
+
+        assert len(calls) == 1
+        benchmark._prune_worktrees(source_repo)
+
+    def test_new_report_file_does_not_break_integrity(self, tmp_path, monkeypatch):
+        source_repo = _init_source_repo(tmp_path)
+
+        def fake_run(command, *, cwd, timeout, env=None):
+            (cwd / "REVIEW.md").write_text("- nothing found\n")
+            return _completed(command, stdout='{"success": true}')
+
+        monkeypatch.setattr(benchmark, "_run_process", fake_run)
+        result = benchmark.run_case(
+            _review_case(),
+            tmp_path / "workspace",
+            model=None,
+            agent_timeout=60,
+            source_repo=source_repo,
+        )
+
+        assert result.integrity_success
+        assert result.changed_files == ["REVIEW.md"]
+        benchmark._prune_worktrees(source_repo)
+
+    def test_modifying_an_existing_file_fails_integrity(self, tmp_path, monkeypatch):
+        source_repo = _init_source_repo(tmp_path)
+
+        def fake_run(command, *, cwd, timeout, env=None):
+            (cwd / "existing.py").write_text("x = 2\n")
+            return _completed(command, stdout='{"success": true}')
+
+        monkeypatch.setattr(benchmark, "_run_process", fake_run)
+        result = benchmark.run_case(
+            _review_case(),
+            tmp_path / "workspace",
+            model=None,
+            agent_timeout=60,
+            source_repo=source_repo,
+        )
+
+        assert not result.integrity_success
+        assert not result.passed
+        benchmark._prune_worktrees(source_repo)
+
+    def test_worktree_checks_out_the_requested_ref(self, tmp_path, monkeypatch):
+        source_repo = _init_source_repo(tmp_path)
+        (source_repo / "existing.py").write_text("x = 2\n")
+        subprocess.run(["git", "commit", "-q", "-am", "second"], cwd=source_repo, check=True)
+        first_commit = subprocess.run(
+            ["git", "rev-list", "--max-parents=0", "HEAD"],
+            cwd=source_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        seen = {}
+
+        def fake_run(command, *, cwd, timeout, env=None):
+            seen["content"] = (cwd / "existing.py").read_text()
+            return _completed(command, stdout='{"success": true}')
+
+        monkeypatch.setattr(benchmark, "_run_process", fake_run)
+        benchmark.run_case(
+            _review_case(worktree_ref=first_commit),
+            tmp_path / "workspace",
+            model=None,
+            agent_timeout=60,
+            source_repo=source_repo,
+        )
+
+        assert seen["content"] == "x = 1\n"
+        benchmark._prune_worktrees(source_repo)

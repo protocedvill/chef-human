@@ -185,6 +185,44 @@ def recommend_model_cmd(config_path: str | None) -> None:
     )
 
 
+@cli.command()
+@click.option("--config", "config_path", type=click.Path(exists=True), help="Path to config.toml")
+@click.option("--workspace", type=click.Path(), help="Workspace directory to check")
+@click.option("--json", "json_output", is_flag=True, help="Output machine-readable JSON")
+def doctor(config_path: str | None, workspace: str | None, json_output: bool) -> None:
+    """Check that chef-human is ready to run: Python, config, backend, model, workspace."""
+    from chef_human.agent.doctor import run_doctor
+
+    report = run_doctor(config_path=config_path, workspace=workspace)
+
+    if json_output:
+        click.echo(json.dumps(report.to_dict(), indent=2))
+    else:
+        from rich.markup import escape
+
+        console = Console()
+        style_by_status = {"ok": "green", "warn": "yellow", "fail": "red"}
+        for check in report.checks:
+            style = style_by_status[check.status]
+            console.print(
+                f"[{style}]{check.status.upper():<4}[/] {check.name}: {escape(check.message)}"
+            )
+            if check.remedy:
+                console.print(
+                    f"      -> {check.remedy}", style="dim", markup=False, highlight=False
+                )
+        console.print()
+        if report.ready:
+            console.print(f"[bold green]Ready.[/] Next: [bold]{report.next_command}[/]")
+        else:
+            console.print(
+                "[bold red]Not ready.[/] Fix the FAIL checks above, "
+                "then re-run [bold]chef-human doctor[/]."
+            )
+
+    sys.exit(report.exit_code)
+
+
 @cli.group()
 def session() -> None:
     """Manage saved sessions."""
@@ -377,7 +415,7 @@ def run(
             console.print(f"\n[dim]Tokens:[/] {p} prompt / {c} completion")
         if json_output:
             console.print()
-            console.print(json.dumps(result.to_dict(), indent=2))
+            console.print(json.dumps(result.to_dict(), indent=2), highlight=False)
     if not result.success:
         raise SystemExit(1)
 

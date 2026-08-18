@@ -11,10 +11,19 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 
-LEVELS = ("smoke", "core", "stretch", "expert", "frontier", "adversarial", "marathon")
+LEVELS = (
+    "smoke",
+    "core",
+    "stretch",
+    "expert",
+    "frontier",
+    "adversarial",
+    "marathon",
+    "review",
+)
 IGNORED_SNAPSHOT_PARTS = {
     ".chef-human",
     ".git",
@@ -39,9 +48,21 @@ class BenchmarkCase:
     title: str
     task: str
     seed_files: dict[str, str]
-    verification: Verification
+    verification: Verification | None = None
     protected_files: tuple[str, ...] = ()
     max_steps: int = 15
+    # "seed" (default) writes seed_files into an empty workspace. "worktree"
+    # instead checks out a real git worktree of this repository — used for
+    # benchmarks that exercise chef-human against its own, much larger,
+    # codebase rather than a small synthetic project.
+    workspace_kind: Literal["seed", "worktree"] = "seed"
+    worktree_ref: str = "HEAD"
+    # When set, every file present before the agent runs must stay
+    # byte-identical afterward (new files, e.g. a written report, are still
+    # allowed). Use this instead of enumerating protected_files one by one
+    # for cases — like a read-only code review — where nothing existing
+    # should be touched at all.
+    protect_all_existing_files: bool = False
 
 
 @dataclass
@@ -60,6 +81,7 @@ class BenchmarkResult:
     completion_tokens: int | None
     changed_files: list[str]
     verifier_output: str
+    agent_message: str | None = None
     error: str | None = None
     workspace: str | None = None
 
@@ -526,6 +548,28 @@ CASES: tuple[BenchmarkCase, ...] = (
         protected_files=("SPEC.md", "test_library.py"),
         max_steps=45,
     ),
+    BenchmarkCase(
+        case_id="chef_human_tools_self_review",
+        level="review",
+        title="Code-review chef-human's own tool implementations",
+        task=(
+            "You are in a git worktree of the chef-human repository (the project this very "
+            "agent is part of). Perform a careful code review of every file directly inside "
+            "the chef_human/tools/ directory — do not review any other directory. Look for "
+            "real correctness bugs: places where the code's actual behavior would surprise a "
+            "caller, not style nitpicks or missing features. For each bug you find, write one "
+            "entry to a new file, REVIEW.md, at the repository root, with: the file and "
+            "function/method, what is wrong, and a concrete input or call sequence that shows "
+            "the failure. Do not fix any bugs and do not modify any existing file — only "
+            "create REVIEW.md. When you are done, finish with a one- or two-sentence summary "
+            "of how many issues you found."
+        ),
+        seed_files={},
+        verification=None,
+        protect_all_existing_files=True,
+        max_steps=35,
+        workspace_kind="worktree",
+    ),
 )
 
 
@@ -552,6 +596,47 @@ def _write_seed(workspace: Path, files: dict[str, str]) -> None:
         path = workspace / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+
+def _repo_root() -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=Path(__file__).resolve().parent,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return Path(result.stdout.strip())
+
+
+def _create_worktree(source_repo: Path, workspace: Path, ref: str) -> None:
+    """Check out a detached-HEAD git worktree of `source_repo` at `workspace`.
+
+    `workspace` must not already exist — `git worktree add` creates it. Using
+    `--detach` avoids "branch already checked out" errors when `ref` is the
+    branch checked out in the primary worktree (e.g. `main`)."""
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["git", "worktree", "add", "--detach", str(workspace), ref],
+        cwd=source_repo,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git worktree add failed: {result.stderr.strip()}")
+
+
+def _prune_worktrees(source_repo: Path) -> None:
+    """Clean up git's worktree metadata after a case's directory was deleted
+    directly (e.g. by the benchmark's temporary-root cleanup) instead of via
+    `git worktree remove`. Safe to call even if nothing needs pruning."""
+    subprocess.run(
+        ["git", "worktree", "prune"],
+        cwd=source_repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def _prepare_agent_path(workspace: Path) -> dict[str, str]:
@@ -617,12 +702,19 @@ def run_case(
     *,
     model: str | None,
     agent_timeout: int,
+    source_repo: Path | None = None,
 ) -> BenchmarkResult:
-    workspace.mkdir(parents=True, exist_ok=False)
-    _write_seed(workspace, case.seed_files)
+    if case.workspace_kind == "worktree":
+        _create_worktree(source_repo or _repo_root(), workspace, case.worktree_ref)
+    else:
+        workspace.mkdir(parents=True, exist_ok=False)
+        _write_seed(workspace, case.seed_files)
     agent_env = _prepare_agent_path(workspace)
     before = _snapshot(workspace)
-    protected = {name: before[name] for name in case.protected_files}
+    if case.protect_all_existing_files:
+        protected = dict(before)
+    else:
+        protected = {name: before[name] for name in case.protected_files}
     command = [
         sys.executable,
         "-m",
@@ -660,32 +752,34 @@ def run_case(
     except subprocess.TimeoutExpired:
         errors.append(f"Agent exceeded the {agent_timeout}s case timeout")
 
-    verify_command = [
-        sys.executable if part == "{python}" else part
-        for part in case.verification.command
-    ]
     verifier_output = ""
-    verifier_success = False
-    try:
-        verified = _run_process(
-            verify_command,
-            cwd=workspace,
-            timeout=case.verification.timeout_seconds,
-            env=agent_env,
-        )
-        verifier_output = (verified.stdout + verified.stderr).strip()
-        verifier_success = verified.returncode == 0
-        if case.verification.expected_stdout is not None:
-            verifier_success = (
-                verifier_success
-                and verified.stdout == case.verification.expected_stdout
+    verifier_success = True
+    if case.verification is not None:
+        verify_command = [
+            sys.executable if part == "{python}" else part
+            for part in case.verification.command
+        ]
+        verifier_success = False
+        try:
+            verified = _run_process(
+                verify_command,
+                cwd=workspace,
+                timeout=case.verification.timeout_seconds,
+                env=agent_env,
             )
-        if not verifier_success:
-            errors.append("External verifier failed")
-    except subprocess.TimeoutExpired:
-        errors.append(
-            f"Verifier exceeded the {case.verification.timeout_seconds}s timeout"
-        )
+            verifier_output = (verified.stdout + verified.stderr).strip()
+            verifier_success = verified.returncode == 0
+            if case.verification.expected_stdout is not None:
+                verifier_success = (
+                    verifier_success
+                    and verified.stdout == case.verification.expected_stdout
+                )
+            if not verifier_success:
+                errors.append("External verifier failed")
+        except subprocess.TimeoutExpired:
+            errors.append(
+                f"Verifier exceeded the {case.verification.timeout_seconds}s timeout"
+            )
 
     after = _snapshot(workspace)
     changed_files = sorted(
@@ -698,6 +792,7 @@ def run_case(
     if agent_exit_code == 0 and agent_data and not agent_success:
         errors.append("Agent reported that the task failed")
     passed = agent_success and verifier_success and integrity_success
+    agent_message = agent_data.get("message")
     return BenchmarkResult(
         case_id=case.case_id,
         level=case.level,
@@ -713,6 +808,7 @@ def run_case(
         completion_tokens=agent_data.get("total_completion_tokens"),
         changed_files=changed_files,
         verifier_output=verifier_output[-4000:],
+        agent_message=agent_message[-4000:] if isinstance(agent_message, str) else None,
         error="; ".join(errors) or None,
         workspace=str(workspace),
     )
@@ -751,6 +847,8 @@ def _print_human(report: dict[str, Any]) -> None:
         )
         if result["error"]:
             print(f"       {result['error']}")
+        if result["agent_message"] and not result["verifier_output"]:
+            print(f"       {result['agent_message'][:200]}")
     print(
         f"Score: {report['passed']}/{report['total']} "
         f"({report['score_percent']:.1f}%)"
@@ -793,6 +891,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         temporary_root = Path(tempfile.mkdtemp(prefix="chef-human-benchmark-"))
         root = temporary_root
 
+    source_repo = _repo_root() if any(case.workspace_kind == "worktree" for case in cases) else None
+
     results: list[BenchmarkResult] = []
     try:
         for case in cases:
@@ -801,6 +901,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 root / case.case_id,
                 model=args.model,
                 agent_timeout=args.timeout,
+                source_repo=source_repo,
             )
             if temporary_root is not None:
                 result.workspace = None
@@ -808,6 +909,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         if temporary_root is not None:
             shutil.rmtree(temporary_root, ignore_errors=True)
+        if source_repo is not None:
+            _prune_worktrees(source_repo)
 
     report = _report(results)
     rendered = json.dumps(report, indent=2)

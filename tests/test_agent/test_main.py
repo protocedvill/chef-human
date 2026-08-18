@@ -38,6 +38,7 @@ class TestCLIStructure:
             ["run", "--help"],
             ["repl", "--help"],
             ["tui", "--help"],
+            ["doctor", "--help"],
             ["show-config", "--help"],
             ["recommend-model", "--help"],
             ["session", "--help"],
@@ -1069,3 +1070,71 @@ class TestSettingsInjectionReachesBackendConstruction:
 
         assert submitted_configs
         assert submitted_configs[0]["tool_timeout"] == custom_timeout
+
+
+class TestDoctorCommand:
+    def test_doctor_exits_zero_when_ready(self, runner):
+        from chef_human.agent.doctor import CheckResult, DoctorReport
+        from chef_human.main import cli
+
+        report = DoctorReport(
+            checks=[CheckResult("ollama_server", "ok", "reachable")],
+            next_command='chef-human run "..."',
+        )
+        with patch("chef_human.agent.doctor.run_doctor", return_value=report):
+            result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 0
+        assert "ollama_server" in result.output
+        assert "Ready" in result.output
+
+    def test_doctor_exits_one_when_a_check_fails(self, runner):
+        from chef_human.agent.doctor import CheckResult, DoctorReport
+        from chef_human.main import cli
+
+        report = DoctorReport(
+            checks=[CheckResult("ollama_server", "fail", "unreachable", remedy="ollama serve")],
+            next_command="chef-human doctor --json",
+        )
+        with patch("chef_human.agent.doctor.run_doctor", return_value=report):
+            result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "Not ready" in result.output
+
+    def test_doctor_json_output_is_valid_and_undecorated(self, runner):
+        import json as _json
+
+        from chef_human.agent.doctor import CheckResult, DoctorReport
+        from chef_human.main import cli
+
+        report = DoctorReport(
+            checks=[CheckResult("ollama_server", "ok", "reachable")],
+            next_command='chef-human run "..."',
+        )
+        with patch("chef_human.agent.doctor.run_doctor", return_value=report):
+            result = runner.invoke(cli, ["doctor", "--json"])
+
+        payload = _json.loads(result.output)
+        assert payload["schema_version"] == 1
+        assert payload["ready"] is True
+
+    def test_doctor_output_escapes_bracketed_remedy_text(self, runner):
+        from chef_human.agent.doctor import CheckResult, DoctorReport
+        from chef_human.main import cli
+
+        report = DoctorReport(
+            checks=[
+                CheckResult(
+                    "llamacpp",
+                    "warn",
+                    "llama_cpp is not installed",
+                    remedy='pip install -e ".[llamacpp]"',
+                )
+            ],
+            next_command='chef-human run "..."',
+        )
+        with patch("chef_human.agent.doctor.run_doctor", return_value=report):
+            result = runner.invoke(cli, ["doctor"])
+
+        assert '.[llamacpp]"' in result.output

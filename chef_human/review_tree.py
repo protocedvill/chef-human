@@ -217,6 +217,18 @@ class NodeResult:
     # actually prune a finding instead of _merge_child_findings blindly
     # recovering everything it doesn't see.
     dropped: list[dict[str, Any]] = field(default_factory=list)
+    # File-layer only: "validated" (the LLM actually checked findings
+    # against the file's real source) vs. "too_large_skipped" (the file's
+    # source didn't fit file_token_budget, so NO LLM call was made for this
+    # node at all -- findings below are the raw union of leaf children,
+    # unvalidated and un-escalated, not a best-effort truncated attempt).
+    validation_status: Literal["validated", "too_large_skipped"] = "validated"
+    # Network-layer only: cross-cluster references the network node noticed
+    # but declined to investigate because the referenced file isn't in its
+    # cluster -- {"file": str, "note": str} entries, populated by the
+    # model's own JSON output (never derived mechanically), so what's
+    # "uninvestigated" is an explicit claim, not a silent gap.
+    margin_references: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -263,6 +275,8 @@ class ReviewNode:
             "truncated": self.result.truncated if self.result else False,
             "recovered_from_children": self.result.recovered_from_children if self.result else 0,
             "dropped": self.result.dropped if self.result else [],
+            "validation_status": self.result.validation_status if self.result else "validated",
+            "margin_references": self.result.margin_references if self.result else [],
             "connected_included": self.result.connected_included if self.result else 0,
             "connected_omitted": self.result.connected_omitted if self.result else 0,
             "children": [child.to_dict() for child in self.children],
@@ -333,6 +347,21 @@ class ReviewConfig:
     definition_map: dict[str, list[CodeUnit]] = field(default_factory=dict)
     caller_index: dict[str, list[CodeUnit]] = field(default_factory=dict)
     leaf_token_budget: int = DEFAULT_LEAF_TOKEN_BUDGET
+    # File-layer budget for the file's own full source + out-of-file
+    # connected contracts + children's findings text. Unlike leaf_token_budget
+    # (which triggers a split-into-smaller-pieces fallback), exceeding this
+    # is a hard stop -- see _build_file_node: no LLM call is made, the node
+    # is marked validation_status="too_large_skipped", and its findings are
+    # the raw unvalidated union of its leaf children. Chunking an oversized
+    # file for this layer is an explicit hook left for later, not attempted
+    # here.
+    file_token_budget: int = 12000
+    # Network-layer clustering: max files per cluster ("1-6 nodes" per the
+    # design brief) and the agentic tool loop's turn/token bounds -- see
+    # chef_human/review_network.py.
+    network_max_cluster_size: int = 6
+    network_max_tool_turns: int = 6
+    network_token_budget: int = 20000
     is_atom: AtomCheck = token_budget_atom_check
     # Thinking models (Ollama's `think` option) spend part of this budget on
     # <think> reasoning before ever emitting the JSON answer. A prior version
@@ -440,6 +469,25 @@ def _parse_dropped(raw: Any) -> list[dict[str, Any]]:
     return dropped
 
 
+def _parse_margin_references(raw: Any) -> list[dict[str, Any]]:
+    """Network-layer only: cross-cluster references the model explicitly
+    named as uninvestigated. Harmless no-op for any other node type -- the
+    key is simply absent from those prompts' expected schema, so this
+    always returns [] there."""
+    if not isinstance(raw, list):
+        return []
+    refs: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        file = item.get("file")
+        if not isinstance(file, str):
+            continue
+        note = item.get("note")
+        refs.append({"file": file, "note": note if isinstance(note, str) else ""})
+    return refs
+
+
 async def _complete_result(
     config: ReviewConfig, backend: LLMBackend, system_prompt: str, user_prompt: str, label: str
 ) -> NodeResult:
@@ -467,6 +515,7 @@ async def _complete_result(
         completion_tokens=completion_tokens,
         truncated=truncated,
         dropped=_parse_dropped(data.get("dropped")),
+        margin_references=_parse_margin_references(data.get("margin_references")),
     )
     if config.on_progress:
         status = "TRUNCATED" if truncated else f"{len(result.findings)} finding(s)"
@@ -556,6 +605,56 @@ SYNTHESIS_SYSTEM_PROMPT = (
     '"severity": "low"|"medium"|"high"}], "dropped": [{"file": str, "line": int or null, '
     '"category": str, "reason": str}]}.'
 )
+
+# File-layer validation: same contract as SYNTHESIS_SYSTEM_PROMPT (severity,
+# escalate, explicit "dropped" with reasons) plus one addition -- this call
+# is given the file's actual full source (see _file_prompt), so it has
+# ground truth a plain lens/root synthesis call never had. That's the
+# direct fix for false leaf claims (e.g. a claimed shell/injection call that
+# doesn't exist in the file) making it past synthesis unchecked: a model
+# that can just read the file doesn't need an external verifier to catch
+# "there's no shell call here."
+FILE_SYSTEM_PROMPT = SYNTHESIS_SYSTEM_PROMPT + (
+    " You are ALSO given the actual full source of the file below, plus signature+docstring-only "
+    "contracts for any function/class this file's code calls or is called by outside the file "
+    "(never their bodies -- context only, never report a finding against that section). Use the "
+    "real source as ground truth over any sub-review's own wording: verify every finding you keep "
+    "against it directly, citing file:line, and drop (with a reason, in \"dropped\") anything the "
+    "actual code contradicts, no matter how confidently the sub-review stated it."
+)
+
+
+def _file_prompt(
+    goal: str, file_path: Path, source: str, connected: list[ConnectedRef], children: list[ReviewNode]
+) -> str:
+    parts = [f"Goal: {goal}\n", f"## Full source of {file_path}\n```python\n{source}\n```"]
+    if connected:
+        section = [
+            "## Out-of-file related signatures (context only -- you have NOT seen these bodies, "
+            "only signature+docstring; never report a finding against this section)"
+        ]
+        for ref in connected:
+            section.append(f"- ({ref.relation}) `{ref.path}`: {ref.signature.strip()}")
+            if ref.docstring:
+                section.append(f'  """{ref.docstring}"""')
+        parts.append("\n".join(section))
+    findings_parts = []
+    for child in children:
+        result = child.result
+        assert result is not None
+        findings_text = (
+            "\n".join(
+                f"- [{f.severity}/{f.category}] {f.file}:{f.line} -- {f.summary} "
+                f"({f.failure_scenario})"
+                for f in result.findings
+            )
+            or "(no findings)"
+        )
+        findings_parts.append(
+            f"--- Sub-review: {child.node_id} ---\nSummary: {result.summary}\nFindings:\n{findings_text}\n"
+        )
+    parts.append(f"## {len(children)} sub-review(s) to validate against the source above\n" + "\n".join(findings_parts))
+    return "\n\n".join(parts)
 
 
 def _leaf_prompt(
@@ -832,6 +931,29 @@ def _build_definition_map(
     return definition_map, caller_index
 
 
+def build_file_edges(
+    units: list[CodeUnit], definition_map: dict[str, list[CodeUnit]]
+) -> dict[frozenset[Path], int]:
+    """File-level connectivity, aggregated from the same per-function
+    call/definition data already computed for leaf connected-context (no
+    new dependency, no tree-sitter/SymbolIndex needed -- see the design
+    note in chef_human/review_network.py for why that heavier machinery was
+    ruled out). For every unit's call to a name that resolves to a
+    definition in a *different* file, increments an edge-weight counter for
+    that unordered file pair. Returns {frozenset({path_a, path_b}): weight}
+    -- used by review_network.cluster_files() to decide which files belong
+    in the same network."""
+    edges: dict[frozenset[Path], int] = {}
+    for unit in units:
+        for name in unit.calls:
+            for candidate in definition_map.get(name, []):
+                if candidate.path == unit.path:
+                    continue
+                key = frozenset((unit.path, candidate.path))
+                edges[key] = edges.get(key, 0) + 1
+    return edges
+
+
 def _assemble_connected_context(
     unit: CodeUnit,
     definition_map: dict[str, list[CodeUnit]],
@@ -1012,32 +1134,34 @@ def _build_unit_skeleton(
     return node
 
 
-def _build_method_skeleton(
-    node_id: str, method: ReviewMethod, config: ReviewConfig, depth: int, pending: list[_PendingLeaf]
+def _build_file_node_skeleton(
+    node_id: str,
+    file_path: Path,
+    methods: tuple[ReviewMethod, ...],
+    config: ReviewConfig,
+    depth: int,
+    pending: list[_PendingLeaf],
 ) -> ReviewNode:
-    if len(config.units) == 1:
-        # Only one function/class in scope for this whole run -- synthesizing
-        # "across 1 sub-review" adds nothing and doubles the LLM calls for
-        # what's otherwise a trivial case. Promote the single unit's own
-        # subtree straight to the method level, same shortcut the old
-        # token-budget-atomic scope check used to take.
-        unit = config.units[0]
-        header = config.header_by_path.get(unit.path)
-        return _build_unit_skeleton(node_id, method, unit, header, depth, config, pending)
-
+    """The new file layer: direct children are leaf (or oversized-split)
+    subtrees for every (lens, unit) pair where unit.path == file_path --
+    i.e. every lens's leaves for this file, not one file per lens like the
+    old lens-major structure. This is the regrouping that lets the file
+    node's own validation call see ALL findings about this file in one
+    place, next to the file's actual source (see _execute_file_node)."""
+    file_units = [u for u in config.units if u.path == file_path]
     node = ReviewNode(
         node_id=node_id,
-        goal=f"[{method.id}] review {len(config.units)} function/class unit(s)",
-        method=method.id,
+        goal=f"Validate findings for {file_path} ({len(file_units)} unit(s), {len(methods)} lens(es))",
+        method=None,
         depth=depth,
-        scope=tuple(u.chunk for u in config.units),
-        cross_axis=f"functions/classes reviewed under the '{method.id}' lens",
+        scope=tuple(u.chunk for u in file_units),
     )
-    for unit in config.units:
-        header = config.header_by_path.get(unit.path)
-        child_id = f"{node_id}/{unit.path.stem}.{unit.name}"
-        child = _build_unit_skeleton(child_id, method, unit, header, depth + 1, config, pending)
-        node.children.append(child)
+    for method in methods:
+        for unit in file_units:
+            header = config.header_by_path.get(unit.path)
+            child_id = f"{node_id}/{method.id}.{unit.name}"
+            child = _build_unit_skeleton(child_id, method, unit, header, depth + 1, config, pending)
+            node.children.append(child)
     return node
 
 
@@ -1072,6 +1196,71 @@ async def _execute_all_leaves(pending: list[_PendingLeaf], config: ReviewConfig)
     await asyncio.gather(*(_run(item) for item in pending))
 
 
+async def _execute_file_node(
+    node: ReviewNode, file_path: Path, source_by_path: dict[Path, str], config: ReviewConfig
+) -> None:
+    """File-layer validation: unlike _execute_synthesis_bottom_up, this can
+    hard-fail without ever calling the LLM (validation_status=
+    "too_large_skipped") if the file's own source doesn't fit
+    config.file_token_budget -- an explicit, visible skip, not a truncated
+    best-effort attempt. That's a deliberate scope limit for this pass, not
+    a bug: chunking an oversized file for file-layer validation is left as
+    a follow-up hook."""
+    source = source_by_path[file_path]
+    source_tokens = config.tokenizer.count(source)
+
+    if source_tokens > config.file_token_budget:
+        seen: set[tuple[str, int | None, str]] = set()
+        findings: list[Finding] = []
+        for child in node.children:
+            for finding in (child.result.findings if child.result else []):
+                key = _finding_key(finding.file, finding.line, finding.category)
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(finding)
+        node.result = NodeResult(
+            summary=(
+                f"File too large to validate ({source_tokens} tokens > "
+                f"file_token_budget={config.file_token_budget}) -- no LLM call was made for "
+                "this node. Findings below are the raw, unvalidated union of leaf output."
+            ),
+            findings=findings,
+            validation_status="too_large_skipped",
+            recovered_from_children=len(findings),
+        )
+        if config.on_progress:
+            config.on_progress(f"{node.node_id} -- SKIPPED (too large: {source_tokens} tokens)")
+        return
+
+    file_units = [u for u in config.units if u.path == file_path]
+    connected_by_key: dict[tuple[Path, str, str], ConnectedRef] = {}
+    remaining = config.file_token_budget - source_tokens
+    for unit in file_units:
+        refs, _included, _omitted = _assemble_connected_context(
+            unit, config.definition_map, config.caller_index, config.tokenizer, max(remaining, 0)
+        )
+        for ref in refs:
+            if ref.path == file_path:
+                continue  # in-file refs are redundant once the model has the full source
+            key = (ref.path, ref.name, ref.relation)
+            if key in connected_by_key:
+                continue
+            connected_by_key[key] = ref
+            remaining -= config.tokenizer.count(f"{ref.path}: {ref.signature}\n{ref.docstring}")
+
+    connected = sorted(connected_by_key.values(), key=lambda r: (str(r.path), r.name))
+    node.result = await _complete_result(
+        config,
+        config.synthesis_backend,
+        FILE_SYSTEM_PROMPT,
+        _file_prompt(node.goal, file_path, source, connected, node.children),
+        f"{node.node_id} (file validation)",
+    )
+    node.result.findings, node.result.recovered_from_children = _merge_child_findings(
+        node.result.findings, node.children, node.result.dropped
+    )
+
+
 async def _execute_synthesis_bottom_up(node: ReviewNode, config: ReviewConfig) -> None:
     """Post-order: children (recursively) before this node's own synthesis
     call, so a node's synthesis prompt always sees fully-resolved children.
@@ -1100,6 +1289,10 @@ async def run_review(
     synthesis_backend: LLMBackend | None = None,
     tokenizer: Tokenizer | None = None,
     leaf_token_budget: int = DEFAULT_LEAF_TOKEN_BUDGET,
+    file_token_budget: int = 12000,
+    network_max_cluster_size: int = 6,
+    network_max_tool_turns: int = 6,
+    network_token_budget: int = 20000,
     max_completion_tokens: int = 30000,
     is_atom: AtomCheck = token_budget_atom_check,
     model: str | None = None,
@@ -1112,7 +1305,9 @@ async def run_review(
     backend = backend or _default_backend(model, think)
     # synthesis_backend defaults to the same backend as leaves -- nothing
     # changes unless a caller explicitly asks for a stronger model on
-    # synthesis nodes via synthesis_model/synthesis_backend.
+    # synthesis nodes via synthesis_model/synthesis_backend. Also used for
+    # the file and network layers (see design note: no separate model tier
+    # for those, per the user's own call).
     if synthesis_backend is None:
         synthesis_backend = (
             _default_backend(synthesis_model, synthesis_think if synthesis_think is not None else think)
@@ -1132,11 +1327,51 @@ async def run_review(
         definition_map=definition_map,
         caller_index=caller_index,
         leaf_token_budget=leaf_token_budget,
+        file_token_budget=file_token_budget,
+        network_max_cluster_size=network_max_cluster_size,
+        network_max_tool_turns=network_max_tool_turns,
+        network_token_budget=network_token_budget,
         max_completion_tokens=max_completion_tokens,
         on_progress=on_progress,
         is_atom=is_atom,
         leaf_semaphore=asyncio.Semaphore(max(1, leaf_concurrency)),
     )
+    source_by_path = {path: path.read_text(encoding="utf-8") for path in target_files}
+
+    # Phase 0: cluster files into networks of densely-connected files (pure
+    # function, no LLM) -- see build_file_edges/review_network.cluster_files.
+    file_edges = build_file_edges(units, definition_map)
+    from chef_human import review_network
+
+    clusters = review_network.cluster_files(target_files, file_edges, config.network_max_cluster_size)
+
+    # Phase 1: build the whole tree's structure -- network -> file -> leaf/
+    # oversized-split -- with no LLM calls (atom/split decisions are pure
+    # tokenizer checks), collecting every leaf into one flat queue across
+    # every file and lens, and every file node alongside its path so phase 3
+    # can look its source back up.
+    pending: list[_PendingLeaf] = []
+    file_node_entries: list[tuple[ReviewNode, Path]] = []
+    network_nodes: list[ReviewNode] = []
+    for cluster_index, cluster_paths in enumerate(clusters):
+        net_id = f"root/net{cluster_index}"
+        net_units = [u for u in units if u.path in cluster_paths]
+        net_node = ReviewNode(
+            node_id=net_id,
+            goal=(
+                f"Validate cross-file findings for a cluster of {len(cluster_paths)} "
+                f"densely-connected file(s): {', '.join(str(p) for p in cluster_paths)}"
+            ),
+            method=None,
+            depth=1,
+            scope=tuple(u.chunk for u in net_units),
+        )
+        for file_path in cluster_paths:
+            file_node_id = f"{net_id}/{file_path.stem}"
+            file_node = _build_file_node_skeleton(file_node_id, file_path, methods, config, 2, pending)
+            net_node.children.append(file_node)
+            file_node_entries.append((file_node, file_path))
+        network_nodes.append(net_node)
 
     root = ReviewNode(
         node_id="root",
@@ -1144,26 +1379,32 @@ async def run_review(
         method=None,
         depth=0,
         scope=tuple(u.chunk for u in units),
-        cross_axis="different analysis lenses over the same code",
+        cross_axis="different network clusters covering the reviewed files",
+        children=network_nodes,
     )
-    # Phase 1: build the whole tree's structure (no LLM calls -- atom/split
-    # decisions are pure tokenizer checks) and collect every leaf into one
-    # flat queue, across every method/lens.
-    pending: list[_PendingLeaf] = []
-    for method in methods:
-        method_node = _build_method_skeleton(f"root/{method.id}", method, config, 1, pending)
-        root.children.append(method_node)
 
     # Phase 2: run every leaf call (config.backend, the leaf model) before
-    # any synthesis call touches config.synthesis_backend -- see
+    # any file/network/root call touches config.synthesis_backend -- see
     # _execute_all_leaves for why this ordering is the point.
     await _execute_all_leaves(pending, config)
 
-    # Phase 3: bottom-up synthesis (config.synthesis_backend), one model in
-    # memory for this whole phase instead of swapping per method.
-    for method_node in root.children:
-        await _execute_synthesis_bottom_up(method_node, config)
+    # Phase 3: file-layer validation (config.synthesis_backend), batched
+    # together. Each file node's own non-leaf children (oversized-unit
+    # synthesis pieces, if any) resolve bottom-up first via the existing
+    # generic synthesis helper -- a no-op for plain leaves -- before the
+    # file node's own real-source validation call runs.
+    for file_node, file_path in file_node_entries:
+        for child in file_node.children:
+            await _execute_synthesis_bottom_up(child, config)
+        await _execute_file_node(file_node, file_path, source_by_path, config)
 
+    # Phase 4: network-layer agentic loops (config.synthesis_backend),
+    # batched together -- one model in memory for the whole phase, same
+    # principle as every other phase boundary in this function.
+    for net_node, cluster_paths in zip(network_nodes, clusters):
+        await review_network.run_network_node(net_node, cluster_paths, source_by_path, config)
+
+    # Phase 5: root synthesis over networks.
     root.result = await _complete_result(
         config,
         config.synthesis_backend,
@@ -1174,6 +1415,13 @@ async def run_review(
     root.result.findings, root.result.recovered_from_children = _merge_child_findings(
         root.result.findings, root.children, root.result.dropped
     )
+    # Aggregate every network's margin_references so cross-network gaps are
+    # visible at the top level too, not just buried in per-network output.
+    root.result.margin_references = [
+        ref
+        for net_node in network_nodes
+        for ref in (net_node.result.margin_references if net_node.result else [])
+    ]
     return root
 
 
@@ -1241,6 +1489,25 @@ def render_markdown(root: ReviewNode, verified: list[Any] | None = None) -> str:
                 loc = f"{d['file']}:{d['line']}" if d["line"] else d["file"]
                 lines.append(f"- `{node.node_id}` dropped [{d['category']}] {loc}: {d['reason']}")
         lines.append("")
+    skipped_nodes = [n for n in all_nodes if n.result and n.result.validation_status == "too_large_skipped"]
+    if skipped_nodes:
+        lines.append(
+            "**File(s) too large to validate** (no LLM call was made for these file nodes -- "
+            "findings below are the raw, unvalidated union of leaf output):"
+        )
+        for node in skipped_nodes:
+            lines.append(f"- `{node.node_id}` ({node.goal})")
+        lines.append("")
+    margin_nodes = [n for n in all_nodes if n.result and n.result.margin_references]
+    if margin_nodes:
+        lines.append(
+            "**Cross-cluster references a network node explicitly declined to investigate** "
+            "(out of scope for that cluster, not silently ignored):"
+        )
+        for node in margin_nodes:
+            for ref in node.result.margin_references:  # type: ignore[union-attr]
+                lines.append(f"- `{node.node_id}` margin: {ref['file']} -- {ref['note']}")
+        lines.append("")
     if verified is not None:
         kept = sorted(
             (v for v in verified if v.verdict != "refuted"),
@@ -1303,6 +1570,25 @@ def main(argv: list[str] | None = None) -> int:
         "when unset, so a stronger model can review sub-reviews without changing leaf cost",
     )
     parser.add_argument("--leaf-token-budget", type=int, default=DEFAULT_LEAF_TOKEN_BUDGET)
+    parser.add_argument(
+        "--file-token-budget", type=int, default=12000,
+        help="File-layer budget for a file's own full source + out-of-file contracts. A file "
+        "over budget gets NO LLM call for its file node (validation_status=too_large_skipped, "
+        "findings pass through unvalidated) rather than being chunked or truncated.",
+    )
+    parser.add_argument(
+        "--network-max-cluster-size", type=int, default=6,
+        help="Max files per densely-connected network cluster (default 6).",
+    )
+    parser.add_argument(
+        "--network-max-tool-turns", type=int, default=6,
+        help="Max read_code_span tool-call turns per network node before it's forced to finalize.",
+    )
+    parser.add_argument(
+        "--network-token-budget", type=int, default=20000,
+        help="Cumulative token budget for a network node's read_code_span calls across its "
+        "whole tool loop.",
+    )
     parser.add_argument("--max-completion-tokens", type=int, default=30000)
     parser.add_argument(
         "--think",
@@ -1337,6 +1623,10 @@ def main(argv: list[str] | None = None) -> int:
         run_review(
             target_files,
             leaf_token_budget=args.leaf_token_budget,
+            file_token_budget=args.file_token_budget,
+            network_max_cluster_size=args.network_max_cluster_size,
+            network_max_tool_turns=args.network_max_tool_turns,
+            network_token_budget=args.network_token_budget,
             max_completion_tokens=args.max_completion_tokens,
             model=args.model,
             synthesis_model=args.synthesis_model,

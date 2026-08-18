@@ -361,8 +361,10 @@ class TestHeaderContextPropagation:
         methods = (ReviewMethod("m1", "desc1"),)
         backend = ScriptedBackend(
             [
-                {"summary": "leaf", "findings": []},
-                {"summary": "root", "findings": []},
+                {"summary": "leaf", "findings": []},  # leaf: m1.f
+                {"summary": "file validation", "findings": []},  # file layer
+                {"summary": "network validation", "findings": []},  # network layer
+                {"summary": "root", "findings": []},  # root synthesis
             ]
         )
 
@@ -371,25 +373,28 @@ class TestHeaderContextPropagation:
             leaf_token_budget=10_000,
         )
 
-        # one unit (f) -> the single-unit shortcut means method_node IS the
-        # leaf directly, no separate header-only node anywhere
-        method_node = root.children[0]
-        assert method_node.children == []
-        assert method_node.header_context is not None
-        assert "import os" in method_node.header_context.text
+        # one file, one unit (f) -> root -> net0 -> file "a" -> leaf m1.f
+        # directly, no separate header-only node anywhere
+        file_node = root.children[0].children[0]
+        leaf = file_node.children[0]
+        assert leaf.children == []
+        assert leaf.header_context is not None
+        assert "import os" in leaf.header_context.text
 
 
 class TestRunReview:
     @pytest.mark.asyncio
-    async def test_single_function_uses_method_level_shortcut(self, tmp_path):
+    async def test_single_function_single_file(self, tmp_path):
         target = tmp_path / "a.py"
         target.write_text("def f():\n    return 1\n")
         methods = (ReviewMethod("m1", "desc1"), ReviewMethod("m2", "desc2"))
         backend = ScriptedBackend(
             [
-                {"summary": "m1 leaf", "findings": [_finding(summary="m1 bug")]},
-                {"summary": "m2 leaf", "findings": []},
-                {"summary": "root synthesis", "findings": [_finding(summary="m1 bug")]},
+                {"summary": "m1 leaf", "findings": [_finding(summary="m1 bug")]},  # leaf m1.f
+                {"summary": "m2 leaf", "findings": []},  # leaf m2.f
+                {"summary": "file validation", "findings": [_finding(summary="m1 bug")]},  # file
+                {"summary": "network validation", "findings": [_finding(summary="m1 bug")]},  # network
+                {"summary": "root synthesis", "findings": [_finding(summary="m1 bug")]},  # root
             ]
         )
 
@@ -398,11 +403,13 @@ class TestRunReview:
             leaf_token_budget=10_000,
         )
 
-        # one call per method (leaf, no separate method-synthesis since
-        # there's only one unit) + one root synthesis call
-        assert len(backend.calls) == 3
-        assert len(root.children) == 2
-        assert root.children[0].children == []
+        # 2 leaves (one per method) + 1 file validation + 1 network + 1 root
+        assert len(backend.calls) == 5
+        # root -> net0 -> file "a" -> 2 leaves (m1.f, m2.f)
+        assert len(root.children) == 1
+        file_node = root.children[0].children[0]
+        assert len(file_node.children) == 2
+        assert all(leaf.children == [] for leaf in file_node.children)
         assert root.result is not None
         assert root.result.summary == "root synthesis"
         assert [f.summary for f in root.result.findings] == ["m1 bug"]
@@ -419,13 +426,15 @@ class TestRunReview:
             leaf_token_budget=10_000,
         )
 
-        method_node = root.children[0]
-        assert len(method_node.children) == 4
-        assert all(child.children == [] for child in method_node.children)
-        assert all(child.result and child.result.findings for child in method_node.children)
-        # 4 leaves, then method synthesis (since >1 unit), then root synthesis
-        assert method_node.result.summary == "call-5"
-        assert root.result.summary == "call-6"
+        file_node = root.children[0].children[0]
+        assert len(file_node.children) == 4
+        assert all(child.children == [] for child in file_node.children)
+        assert all(child.result and child.result.findings for child in file_node.children)
+        # 4 leaves, then file validation, then network, then root synthesis
+        assert file_node.result.summary == "call-5"
+        network_node = root.children[0]
+        assert network_node.result.summary == "call-6"
+        assert root.result.summary == "call-7"
 
     @pytest.mark.asyncio
     async def test_custom_atom_check_that_cannot_shrink_falls_back_to_leaf(self, tmp_path):
@@ -435,6 +444,8 @@ class TestRunReview:
         backend = ScriptedBackend(
             [
                 {"summary": "leaf", "findings": []},
+                {"summary": "file validation", "findings": []},
+                {"summary": "network validation", "findings": []},
                 {"summary": "root synthesis", "findings": []},
             ]
         )
@@ -445,13 +456,13 @@ class TestRunReview:
             is_atom=lambda unit, header, tok, budget: False,
         )
 
-        # single-unit shortcut applies regardless of is_atom (only 1 unit in
-        # scope), and the unit can't actually be split further, so it still
-        # executes directly as a leaf rather than looping forever
-        method_node = root.children[0]
-        assert method_node.children == []
-        assert method_node.result is not None
-        assert method_node.result.summary == "leaf"
+        # the single unit can't actually be split further (a one-line body),
+        # so it still executes directly as a leaf rather than looping forever
+        file_node = root.children[0].children[0]
+        leaf = file_node.children[0]
+        assert leaf.children == []
+        assert leaf.result is not None
+        assert leaf.result.summary == "leaf"
 
     @pytest.mark.asyncio
     async def test_no_functions_content_still_terminates(self, tmp_path):
@@ -470,9 +481,12 @@ class TestRunReview:
         )
 
         assert root.result is not None
-        method_node = root.children[0]
-        assert len(method_node.children) > 1
-        assert all(child.children == [] for child in method_node.children)
+        # one (method, pseudo-unit) pair -> the oversized-split wrapper node
+        file_node = root.children[0].children[0]
+        assert len(file_node.children) == 1
+        oversized_node = file_node.children[0]
+        assert len(oversized_node.children) > 1
+        assert all(child.children == [] for child in oversized_node.children)
 
     @pytest.mark.asyncio
     async def test_functions_across_multiple_files_get_cross_file_context(self, tmp_path):
@@ -488,8 +502,10 @@ class TestRunReview:
             leaf_token_budget=10_000,
         )
 
-        method_node = root.children[0]
-        caller_leaf = next(c for c in method_node.children if "caller" in c.node_id)
+        # caller() calls callee() -- the two files share a cross-file edge,
+        # so cluster_files puts them in one network together.
+        all_nodes = review_tree._iter_nodes(root)
+        caller_leaf = next(n for n in all_nodes if "caller" in n.node_id and not n.children)
         assert any(ref.name == "callee" for ref in caller_leaf.connected)
 
 
@@ -534,6 +550,8 @@ class TestMalformedResponses:
                         {"summary": "missing file"},  # skipped
                     ],
                 },
+                {"summary": "file validation", "findings": [_finding(summary="valid")]},
+                {"summary": "network validation", "findings": [_finding(summary="valid")]},
                 {"summary": "root synthesis", "findings": []},
             ]
         )
@@ -543,7 +561,7 @@ class TestMalformedResponses:
             leaf_token_budget=10_000,
         )
 
-        leaf = root.children[0]
+        leaf = root.children[0].children[0].children[0]
         assert leaf.result is not None
         assert [f.summary for f in leaf.result.findings] == ["valid"]
         assert leaf.result.findings[0].category == "uncategorized"
@@ -566,6 +584,8 @@ class TestProgressCallback:
         backend = ScriptedBackend(
             [
                 {"summary": "leaf", "findings": []},
+                {"summary": "file validation", "findings": []},
+                {"summary": "network validation", "findings": []},
                 {"summary": "root", "findings": []},
             ]
         )
@@ -576,11 +596,13 @@ class TestProgressCallback:
             leaf_token_budget=10_000, on_progress=messages.append,
         )
 
-        assert len(messages) == 4  # dispatch+done for each of the 2 calls
-        assert "root/m1" in messages[0]
+        assert len(messages) == 8  # dispatch+done for each of the 4 calls
+        assert "root/net0/a/m1" in messages[0]
         assert "dispatching" in messages[0]
         assert "done" in messages[1]
-        assert "root (synthesis)" in messages[2]
+        assert "file validation" in messages[2]
+        assert "network" in messages[4]
+        assert "root (synthesis)" in messages[6]
 
     @pytest.mark.asyncio
     async def test_no_progress_callback_by_default(self, tmp_path):
@@ -588,6 +610,8 @@ class TestProgressCallback:
         target.write_text("x = 1\n")
         backend = ScriptedBackend(
             [{"summary": "leaf", "findings": []} for _ in review_tree.DEFAULT_METHODS]
+            + [{"summary": "file validation", "findings": []}]
+            + [{"summary": "network validation", "findings": []}]
             + [{"summary": "root", "findings": []}]
         )
 
@@ -627,11 +651,14 @@ class TestFindingsMergeRecovery:
             leaf_token_budget=10_000,
         )
 
-        method_node = root.children[0]
-        leaf_count = len(method_node.children)
+        network_node = root.children[0]
+        file_node = network_node.children[0]
+        leaf_count = len(file_node.children)
         assert leaf_count == 4
-        assert len(method_node.result.findings) == leaf_count
-        assert method_node.result.recovered_from_children == leaf_count
+        assert len(file_node.result.findings) == leaf_count
+        assert file_node.result.recovered_from_children == leaf_count
+        assert len(network_node.result.findings) == leaf_count
+        assert network_node.result.recovered_from_children == leaf_count
         assert len(root.result.findings) == leaf_count
         assert root.result.recovered_from_children == leaf_count
 
@@ -644,6 +671,8 @@ class TestFindingsMergeRecovery:
         backend = ScriptedBackend(
             [
                 {"summary": "leaf", "findings": [shared]},
+                {"summary": "file validation", "findings": [shared]},
+                {"summary": "network validation", "findings": [shared]},
                 {"summary": "root", "findings": [shared]},
             ]
         )
@@ -704,13 +733,17 @@ class TestFindingsMergeRecovery:
             leaf_token_budget=10_000,
         )
 
-        method_node = root.children[0]
-        assert len(method_node.result.findings) == 1
-        assert method_node.result.findings[0].summary == "real bug"
-        assert method_node.result.findings[0].severity == "high"
-        assert method_node.result.recovered_from_children == 0
-        assert len(method_node.result.dropped) == 1
-        assert method_node.result.dropped[0]["reason"] == "not backed by concrete evidence"
+        # every non-leaf layer (file, network, root) gets the identical
+        # scripted "escalate one, drop one" response here, so checking any
+        # one of them (file layer, the deepest non-leaf node) proves the
+        # drop/recover distinction survives the new layering.
+        file_node = root.children[0].children[0]
+        assert len(file_node.result.findings) == 1
+        assert file_node.result.findings[0].summary == "real bug"
+        assert file_node.result.findings[0].severity == "high"
+        assert file_node.result.recovered_from_children == 0
+        assert len(file_node.result.dropped) == 1
+        assert file_node.result.dropped[0]["reason"] == "not backed by concrete evidence"
 
 
 class TrackingBackend:
@@ -748,8 +781,9 @@ class TestDualModelRouting:
         # 3 leaf calls all went to the quick backend
         assert len(leaf_backend.calls) == 3
         assert all("Review lens" in c.messages[-1].content for c in leaf_backend.calls)
-        # method synthesis + root synthesis went to the powerful backend
-        assert len(synthesis_backend.calls) == 2
+        # file validation + network validation + root synthesis went to the
+        # powerful backend
+        assert len(synthesis_backend.calls) == 3
         assert all("Review lens" not in c.messages[-1].content for c in synthesis_backend.calls)
         assert root.result.summary == "powerful-synth"
 
@@ -765,8 +799,9 @@ class TestDualModelRouting:
             leaf_token_budget=10_000,
         )
 
-        # 3 leaves + method synthesis + root synthesis, all on the one backend
-        assert len(backend.calls) == 5
+        # 3 leaves + file validation + network validation + root synthesis,
+        # all on the one backend
+        assert len(backend.calls) == 6
 
     @pytest.mark.asyncio
     async def test_synthesis_model_builds_a_separate_backend(self, monkeypatch, tmp_path):
@@ -870,7 +905,7 @@ class TestTruncationDetection:
             leaf_token_budget=10_000, max_completion_tokens=50,
         )
 
-        leaf = root.children[0]
+        leaf = root.children[0].children[0].children[0]
         assert leaf.result is not None
         assert leaf.result.truncated is True
         assert leaf.result.summary == ""
@@ -902,9 +937,9 @@ class TestTruncationDetection:
             leaf_token_budget=10_000, max_completion_tokens=50,
         )
 
-        # exactly 2 calls for this tree: 1 leaf (single-unit shortcut) + 1
-        # root synthesis -- no retries
-        assert backend.call_count == 2
+        # exactly 4 calls for this tree: 1 leaf + 1 file validation + 1
+        # network validation + 1 root synthesis -- no retries
+        assert backend.call_count == 4
 
     def test_default_max_completion_tokens_is_30000(self):
         import inspect
@@ -918,6 +953,8 @@ class TestTruncationDetection:
         target.write_text("x = 1\n")
         backend = ScriptedBackend(
             [{"summary": "leaf", "findings": []} for _ in review_tree.DEFAULT_METHODS]
+            + [{"summary": "file validation", "findings": []}]
+            + [{"summary": "network validation", "findings": []}]
             + [{"summary": "root", "findings": []}]
         )
 
@@ -959,6 +996,8 @@ class TestRenderAndSerialize:
         target.write_text("x = 1\n")
         backend = ScriptedBackend(
             [{"summary": "leaf", "findings": []} for _ in review_tree.DEFAULT_METHODS]
+            + [{"summary": "file validation", "findings": []}]
+            + [{"summary": "network validation", "findings": []}]
             + [{"summary": "root", "findings": [_finding()]}]
         )
 
@@ -968,7 +1007,10 @@ class TestRenderAndSerialize:
         payload = root.to_dict()
 
         assert payload["node_id"] == "root"
-        assert len(payload["children"]) == len(review_tree.DEFAULT_METHODS)
+        # root -> one network (single file) -> one file node -> one leaf per lens
+        assert len(payload["children"]) == 1
+        assert len(payload["children"][0]["children"]) == 1
+        assert len(payload["children"][0]["children"][0]["children"]) == len(review_tree.DEFAULT_METHODS)
         assert payload["findings"][0]["file"] == "a.py"
         assert "header_context" in payload
         assert "connected" in payload

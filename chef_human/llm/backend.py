@@ -42,6 +42,7 @@ class CompletionRequest:
 class CompletionResponse:
     message: Message
     usage: dict[str, int] | None = None
+    thinking: str | None = None
 
 
 @dataclass

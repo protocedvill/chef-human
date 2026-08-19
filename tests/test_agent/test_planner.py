@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1569,6 +1570,44 @@ class TestUsageCallback:
         await planner.generate_plan("Do the thing")
 
         assert received == []
+
+
+class TestThinkingDebugLogging:
+    """Ollama's think mode returns a separate `thinking` field alongside the
+    real answer -- Planner._complete logs it at DEBUG so it's visible under
+    debug logging without being folded into the normal response content."""
+
+    @pytest.mark.asyncio
+    async def test_thinking_is_logged_when_present(self, caplog):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content='["Step 1", "Step 2"]'),
+            thinking="weighing how to split this goal",
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        with caplog.at_level(logging.DEBUG, logger="chef_human.agent.planner"):
+            await planner.generate_plan("Do the thing")
+
+        assert any(
+            "weighing how to split this goal" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_nothing_logged_when_thinking_absent(self, caplog):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content='["Step 1", "Step 2"]'),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        with caplog.at_level(logging.DEBUG, logger="chef_human.agent.planner"):
+            await planner.generate_plan("Do the thing")
+
+        assert not any("LLM thinking" in record.message for record in caplog.records)
 
 
 def _make_mock_backend(steps: list[PlanNode]) -> MagicMock:

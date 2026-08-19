@@ -1005,6 +1005,8 @@ class ReActLoop:
                     len(response.message.content),
                     response.usage,
                 )
+                if response.thinking:
+                    logger.debug("LLM thinking: %s", response.thinking)
                 self._ui.on_reasoning(response.message.content)
 
                 if response.usage:

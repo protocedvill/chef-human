@@ -122,6 +122,7 @@ class OllamaBackend(LLMBackend):
                 "prompt_tokens": response.get("prompt_eval_count", 0),
                 "completion_tokens": response.get("eval_count", 0),
             },
+            thinking=reply.get("thinking") or None,
         )
 
     async def complete_stream(
@@ -145,6 +146,7 @@ class OllamaBackend(LLMBackend):
         )
 
         full_content = ""
+        full_thinking = ""
         tool_calls: list[dict[str, Any]] | None = None
         final_usage: dict[str, int] | None = None
 
@@ -156,6 +158,7 @@ class OllamaBackend(LLMBackend):
             if content_token:
                 full_content += content_token
                 yield content_token, None
+            full_thinking += msg.get("thinking", "") or ""
 
             # Last chunk may carry tool_calls
             if "tool_calls" in msg and msg["tool_calls"]:
@@ -176,7 +179,9 @@ class OllamaBackend(LLMBackend):
             content=full_content,
             tool_calls=tool_calls,
         )
-        yield "", CompletionResponse(message=msg, usage=final_usage)
+        yield "", CompletionResponse(
+            message=msg, usage=final_usage, thinking=full_thinking or None
+        )
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         embeddings = []

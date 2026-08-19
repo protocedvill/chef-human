@@ -382,6 +382,8 @@ class Planner:
         finally:
             if self.on_llm_end is not None:
                 self.on_llm_end()
+        if response.thinking:
+            logger.debug("LLM thinking (%s): %s", activity, response.thinking)
         if response.usage and self.on_usage is not None:
             self.on_usage(
                 response.usage.get("prompt_tokens", 0),

@@ -80,6 +80,72 @@ async def test_unrelated_response_errors_are_not_swallowed(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_complete_captures_thinking_when_present(monkeypatch):
+    backend = OllamaBackend(model="qwen2.5-coder:7b", think="low")
+
+    async def fake_chat(**kwargs):
+        return {
+            "message": {"content": "ok", "thinking": "reasoning about the task"},
+            "prompt_eval_count": 1,
+            "eval_count": 1,
+        }
+
+    monkeypatch.setattr(backend._async_client, "chat", AsyncMock(side_effect=fake_chat))
+
+    response = await backend.complete(
+        CompletionRequest(messages=[Message(role=Role.user, content="hi")])
+    )
+
+    assert response.thinking == "reasoning about the task"
+
+
+@pytest.mark.asyncio
+async def test_complete_thinking_is_none_when_absent(monkeypatch):
+    backend = OllamaBackend(model="qwen2.5-coder:7b", think=False)
+
+    async def fake_chat(**kwargs):
+        return {"message": {"content": "ok"}, "prompt_eval_count": 1, "eval_count": 1}
+
+    monkeypatch.setattr(backend._async_client, "chat", AsyncMock(side_effect=fake_chat))
+
+    response = await backend.complete(
+        CompletionRequest(messages=[Message(role=Role.user, content="hi")])
+    )
+
+    assert response.thinking is None
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_accumulates_thinking_across_chunks(monkeypatch):
+    backend = OllamaBackend(model="qwen2.5-coder:7b", think="low")
+
+    async def fake_stream():
+        yield {"message": {"content": "", "thinking": "step one. "}}
+        yield {"message": {"content": "hello", "thinking": "step two."}}
+        yield {
+            "message": {"content": ""},
+            "done": True,
+            "prompt_eval_count": 1,
+            "eval_count": 1,
+        }
+
+    async def fake_chat(**kwargs):
+        return fake_stream()
+
+    monkeypatch.setattr(backend._async_client, "chat", AsyncMock(side_effect=fake_chat))
+
+    final_response = None
+    async for _token, response in backend.complete_stream(
+        CompletionRequest(messages=[Message(role=Role.user, content="hi")])
+    ):
+        if response is not None:
+            final_response = response
+
+    assert final_response is not None
+    assert final_response.thinking == "step one. step two."
+
+
+@pytest.mark.asyncio
 async def test_no_retry_when_think_already_false(monkeypatch):
     backend = OllamaBackend(model="qwen2.5-coder:7b", think=False)
 

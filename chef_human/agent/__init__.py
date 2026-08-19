@@ -208,9 +208,18 @@ def create_agent(
         dep_graph=context.dep_graph,
     )
     planner = Planner(llm_backend=create_planner_backend(backend, settings=cfg))
+    # Ollama's `think` mode spends completion tokens on reasoning before any
+    # actual answer content, from the same budget as max_tokens -- a plain
+    # max_response_tokens-sized budget starves out the real response and the
+    # turn comes back with zero content and no tool call. Same starvation
+    # pattern already hit planning/verification calls (see
+    # docs/adr/0001-evidence-carry-forward-across-whole-plan-replan.md's
+    # sibling fixes); this covers the main execution loop's own calls.
+    max_tokens = cfg.max_response_tokens * (4 if cfg.ollama_think else 1)
     react_config = ReActConfig(
         max_steps=max_steps,
         tool_timeout=cfg.tool_timeout,
+        max_tokens_per_response=max_tokens,
     )
 
     loop = ReActLoop(

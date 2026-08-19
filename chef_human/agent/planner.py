@@ -837,7 +837,7 @@ class Planner:
             CompletionRequest(
                 messages=[Message(role=Role.user, content=prompt)],
                 temperature=0.0,
-                max_tokens=100,
+                max_tokens=self._PLANNING_MAX_TOKENS,
             ),
             activity=activity,
         )
@@ -857,7 +857,7 @@ class Planner:
             CompletionRequest(
                 messages=[Message(role=Role.user, content=repair_prompt)],
                 temperature=0.0,
-                max_tokens=100,
+                max_tokens=self._PLANNING_MAX_TOKENS,
             ),
             activity="repairing verifier response",
         )

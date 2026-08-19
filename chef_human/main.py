@@ -540,6 +540,8 @@ async def _run_task_in_tui(
             stream=stream,
             save_dir=save_dir,
             disable_ask_user=app.auto_mode,
+            max_tokens_per_response=resolved_settings.max_response_tokens
+            * (4 if resolved_settings.ollama_think else 1),
         )
         loop = ReActLoop(
             llm_backend=backend,
@@ -786,6 +788,8 @@ async def _run_repl(
             tool_timeout=resolved_tool_timeout,
             stream=True,
             save_sessions=False,
+            max_tokens_per_response=resolved_settings.max_response_tokens
+            * (4 if resolved_settings.ollama_think else 1),
         )
 
         loop = ReActLoop(

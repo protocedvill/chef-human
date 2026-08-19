@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
+from typing import Any, Callable
 
 from chef_human.agent.prompts import (
     PLANNER_SYSTEM_PROMPT,
@@ -22,6 +23,11 @@ from chef_human.llm.backend import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Sentinel distinct from any valid parsed value (including None), used by
+# Planner._loads_step_data to signal "neither JSON nor Python-literal parsing
+# worked" without colliding with a legitimately parsed `null`/`None`.
+_UNPARSEABLE = object()
 
 _VERIFIER_REPAIR_PROMPT = """Your previous response did not follow the required format.
 
@@ -829,30 +835,67 @@ class Planner:
 
         return description
 
+    @staticmethod
+    def _loads_step_data(text: str) -> Any:
+        """Parse a plan array/object out of `text`, tolerating both valid JSON
+        and a Python-repr-style literal (single-quoted keys/strings, True/
+        False/None) that some models emit instead. Returns _UNPARSEABLE if
+        neither parse succeeds, so callers can fall back to line-splitting
+        instead of silently swallowing the whole literal into one step's
+        description (see the parser bug this replaced: a single-line
+        Python-repr list previously became one step whose description was
+        the raw `"{'description': ..., 'type': 'leaf'}"` text)."""
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        try:
+            return ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            return _UNPARSEABLE
+
     def _parse_steps(self, content: str) -> list[PlanNode]:
         array_match = re.search(r"\[.*\]", content, re.DOTALL)
         if array_match:
-            try:
-                data = json.loads(array_match.group(0))
-            except json.JSONDecodeError:
+            data = self._loads_step_data(array_match.group(0))
+            if data is _UNPARSEABLE:
                 return [
                     PlanNode(description=self._clean_description(s), index=i + 1)
                     for i, s in enumerate(content.strip().split("\n"))
                     if s.strip()
                 ]
         else:
-            try:
-                data = json.loads(content)
-            except json.JSONDecodeError:
+            data = self._loads_step_data(content)
+            if data is _UNPARSEABLE:
                 return [
                     PlanNode(description=self._clean_description(s), index=i + 1)
                     for i, s in enumerate(content.strip().split("\n"))
                     if s.strip()
                 ]
 
+        if isinstance(data, dict):
+            # A model that emits a single step often skips the enclosing
+            # array and just returns that one step's object directly. Treat
+            # it as a one-item list instead of falling through to the
+            # str(data) fallback below, which would stringify the dict as
+            # Python repr (single-quoted) and hand that raw text back as one
+            # step's description.
+            data = [data]
+
         if isinstance(data, list) and all(isinstance(item, (str, dict)) for item in data):
             steps = []
             for i, item in enumerate(data):
+                if isinstance(item, str) and item.strip().startswith("{"):
+                    # Some models double-encode: a JSON array of strings,
+                    # where each string is itself a stringified step object
+                    # (e.g. '{"description": "...", "type": "leaf"}' or the
+                    # Python-repr equivalent) rather than a real JSON object
+                    # in the array. Unwrap it the same way, instead of
+                    # taking the raw "{'description': ...}" text as the
+                    # step's description verbatim.
+                    unwrapped = self._loads_step_data(item)
+                    if isinstance(unwrapped, dict):
+                        item = unwrapped
                 if isinstance(item, dict):
                     description = self._clean_description(item.get("description", str(item)))
                     requested_branch = str(item.get("type", "leaf")).strip().lower() == "branch"

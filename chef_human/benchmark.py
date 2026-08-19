@@ -57,6 +57,13 @@ class BenchmarkCase:
     # codebase rather than a small synthetic project.
     workspace_kind: Literal["seed", "worktree"] = "seed"
     worktree_ref: str = "HEAD"
+    # Absolute path to an external repo to worktree instead of this one.
+    # None (default) means "this repository" (chef-human itself), resolved
+    # via _repo_root() -- set this for cases that need a real, unfamiliar
+    # codebase (as opposed to self-review cases, which deliberately use
+    # chef-human's own source so the agent can be told what project it's
+    # looking at).
+    source_repo: str | None = None
     # When set, every file present before the agent runs must stay
     # byte-identical afterward (new files, e.g. a written report, are still
     # allowed). Use this instead of enumerating protected_files one by one
@@ -719,6 +726,38 @@ CASES: tuple[BenchmarkCase, ...] = (
         max_steps=35,
         workspace_kind="worktree",
     ),
+    BenchmarkCase(
+        case_id="vague_feature_request_real_repo",
+        level="frontier",
+        title="Vague feature request against an unfamiliar real codebase",
+        task="Let's add a web interface to this project",
+        seed_files={},
+        # Deliberately just the bare, everyday-phrased request with no
+        # scope, no hints about the target directory, and no repo
+        # description -- this is verbatim what was actually typed against a
+        # real project (ubertooth, a USB Bluetooth-sniffing tool, mostly C
+        # firmware/host code) and reproduced a specific failure: the planner
+        # collapsed the whole task into pure exploration (list the
+        # directory, glob for source files, search for existing web
+        # dirs, read the README) and finished without ever writing a single
+        # line of implementation. Adding scope hints here would make the
+        # planner's job easier and risk not reproducing that failure at
+        # all, which defeats the point of this case.
+        verification=Verification(
+            # No fixed expected output is possible for a task this open-
+            # ended -- what this case actually checks is the specific
+            # failure it was built to catch: did the agent do *anything*
+            # beyond reading/exploring the repo? A real git worktree makes
+            # this a one-line check: `git status --porcelain` is empty iff
+            # nothing was created or modified.
+            command=("sh", "-c", 'test -n "$(git status --porcelain)"'),
+            timeout_seconds=15,
+        ),
+        max_steps=40,
+        workspace_kind="worktree",
+        source_repo="~/ubertooth",
+        worktree_ref="master",
+    ),
 )
 
 
@@ -861,7 +900,11 @@ def run_case(
     source_repo: Path | None = None,
 ) -> BenchmarkResult:
     if case.workspace_kind == "worktree":
-        _create_worktree(source_repo or _repo_root(), workspace, case.worktree_ref)
+        if case.source_repo:
+            repo = Path(case.source_repo).expanduser().resolve()
+        else:
+            repo = source_repo or _repo_root()
+        _create_worktree(repo, workspace, case.worktree_ref)
     else:
         workspace.mkdir(parents=True, exist_ok=False)
         _write_seed(workspace, case.seed_files)
@@ -1060,7 +1103,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         temporary_root = Path(tempfile.mkdtemp(prefix="chef-human-benchmark-"))
         root = temporary_root
 
-    source_repo = _repo_root() if any(case.workspace_kind == "worktree" for case in cases) else None
+    worktree_cases = [c for c in cases if c.workspace_kind == "worktree"]
+    default_source_repo = _repo_root() if any(c.source_repo is None for c in worktree_cases) else None
+    used_repos = {
+        Path(c.source_repo).expanduser().resolve() if c.source_repo else default_source_repo
+        for c in worktree_cases
+    }
+    used_repos.discard(None)
 
     results: list[BenchmarkResult] = []
     try:
@@ -1070,7 +1119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 root / case.case_id,
                 model=args.model,
                 agent_timeout=args.timeout,
-                source_repo=source_repo,
+                source_repo=default_source_repo,
             )
             if temporary_root is not None:
                 result.workspace = None
@@ -1078,8 +1127,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         if temporary_root is not None:
             shutil.rmtree(temporary_root, ignore_errors=True)
-        if source_repo is not None:
-            _prune_worktrees(source_repo)
+        for repo in used_repos:
+            _prune_worktrees(repo)
 
     report = _report(results)
     rendered = json.dumps(report, indent=2)

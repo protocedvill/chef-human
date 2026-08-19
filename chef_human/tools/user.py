@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from typing import Any
@@ -36,7 +37,11 @@ class AskUserTool:
         print(f"\n[Agent asks]: {question}")
         print("[Type your response, or 'skip' to continue without answering]: ", end="", flush=True)
         try:
-            response = sys.stdin.readline().strip()
+            # Run the blocking read in a thread so it doesn't stall the
+            # event loop -- other UI surfaces (e.g. the Textual TUI) run
+            # concurrent asyncio tasks that would otherwise freeze while
+            # waiting on stdin here.
+            response = (await asyncio.to_thread(sys.stdin.readline)).strip()
         except (EOFError, KeyboardInterrupt):
             response = ""
 

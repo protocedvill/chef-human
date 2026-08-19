@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from chef_human.tools.fsutil import atomic_write_text, count_lines
 from chef_human.tools.diff import FileChange, compute_diff, find_closest_match
 from chef_human.tools.registry import ToolResult
 
@@ -112,14 +113,14 @@ class WriteTool:
 
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            resolved.write_text(content, encoding="utf-8")
+            atomic_write_text(resolved, content)
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
 
         if self._file_context is not None:
             self._file_context.remember(path, content)
 
-        lines = content.count("\n") + 1
+        lines = count_lines(content)
         output_parts: list[str] = [f"Wrote {lines} lines to {path}"]
 
         diff = compute_diff(old_content or "", content, path=path)
@@ -179,7 +180,7 @@ class EditTool:
                 return ToolResult(success=False, error=f"Outside workspace: {path}")
             try:
                 resolved.parent.mkdir(parents=True, exist_ok=True)
-                resolved.write_text(new_string, encoding="utf-8")
+                atomic_write_text(resolved, new_string)
             except Exception as exc:
                 return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
             if self._file_context is not None:
@@ -188,7 +189,7 @@ class EditTool:
                 self._diff_store.record_transaction(
                     [FileChange(path, None, new_string)], "edit"
                 )
-            lines = new_string.count("\n") + 1
+            lines = count_lines(new_string)
             return ToolResult(output=f"Created {path} ({lines} lines)")
 
         if not self._workspace.is_within_workspace(resolved):
@@ -209,7 +210,7 @@ class EditTool:
             # than falling into that interleaving footgun.
             new_content = new_string
             try:
-                resolved.write_text(new_content, encoding="utf-8")
+                atomic_write_text(resolved, new_content)
             except Exception as exc:
                 return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
             if self._file_context is not None:
@@ -225,7 +226,7 @@ class EditTool:
             # partial) and this branch (read as NOT creation, verdict:
             # not_complete) every turn, forever, since the two tools'
             # wording described the identical action inconsistently.
-            lines = new_content.count("\n") + 1
+            lines = count_lines(new_content)
             output_parts = [f"Wrote {lines} lines to {path}"]
             diff = compute_diff(old_content, new_content, path=path)
             if diff:
@@ -261,7 +262,7 @@ class EditTool:
             new_content = old_content.replace(matched_old, new_string, 1)
 
         try:
-            resolved.write_text(new_content, encoding="utf-8")
+            atomic_write_text(resolved, new_content)
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
 

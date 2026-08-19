@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any
 
+from chef_human.tools.fsutil import atomic_write_text
 from chef_human.tools.diff import compute_diff
 from chef_human.tools.registry import ToolResult
 
@@ -194,12 +195,12 @@ class PatchTool:
             )
 
         if new_content == old_content:
-            resolved.write_text(new_content, encoding="utf-8")
+            atomic_write_text(resolved, new_content)
             output = f"Applied patch to {path} (no changes)"
             return ToolResult(output=output)
 
         try:
-            resolved.write_text(new_content, encoding="utf-8")
+            atomic_write_text(resolved, new_content)
         except Exception as exc:
             return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
 

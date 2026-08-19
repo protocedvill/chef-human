@@ -131,14 +131,29 @@ class TestRefactorTool:
         assert result.success
         assert len(diff_store._entries) >= 1
 
-    async def test_rollback_on_write_failure(self, tool: RefactorTool, symbol_index: SymbolIndex, workspace: WorkspaceManager, diff_store: DiffStore, tmp_path: Path):
+    async def test_rollback_on_write_failure(
+        self, tool: RefactorTool, symbol_index: SymbolIndex, workspace: WorkspaceManager,
+        diff_store: DiffStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
         original_shapes = (tmp_path / "shapes.py").read_text()
-        # Make main.py readonly to trigger write failure
         main_path = tmp_path / "main.py"
-        main_path.chmod(0o444)
+
+        # Writes go through fsutil.atomic_write_text (temp file + os.replace), which
+        # isn't blocked by chmod-ing the target file readonly -- rename only needs
+        # directory write permission. Simulate a write failure on main.py directly.
+        import chef_human.tools.refactor as refactor_module
+
+        real_atomic_write = refactor_module.atomic_write_text
+
+        def failing_write(path: Path, content: str) -> None:
+            if path == main_path:
+                raise OSError("simulated write failure")
+            real_atomic_write(path, content)
+
+        monkeypatch.setattr(refactor_module, "atomic_write_text", failing_write)
+
         result = await tool.run(old_name="Circle", new_name="Ellipse", scope="all")
         assert not result.success
-        main_path.chmod(0o644)
         assert (tmp_path / "shapes.py").read_text() == original_shapes
 
     async def test_rename_multiple_occurrences_in_one_file(self, tool: RefactorTool, tmp_path: Path):

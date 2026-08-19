@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from chef_human.tools.registry import ToolResult
@@ -53,16 +52,13 @@ class GotoDefinitionTool:
                 continue
             seen_files.add(entry.file_path)
 
-            self._file_context.get(entry.file_path)
-
-            file_path = Path(entry.file_path)
-            try:
-                lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except Exception:
+            content = self._file_context.get(entry.file_path)
+            if content is None:
                 output_parts.append(
                     f"  {entry.file_path}:{entry.symbol.line} — {entry.symbol.signature}"
                 )
                 continue
+            lines = content.splitlines()
 
             start = max(0, entry.symbol.line - 1 - _CONTEXT_LINES)
             end = min(len(lines), entry.symbol.line + _CONTEXT_LINES)

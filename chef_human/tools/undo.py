@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from chef_human.tools.fsutil import atomic_write_text
 from chef_human.tools.diff import FileChange, RedoEntry
 from chef_human.tools.registry import ToolResult
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from chef_human.agent.workspace import WorkspaceManager
@@ -77,24 +81,40 @@ class UndoTool:
         try:
             for change in changes:
                 resolved = self._workspace.resolve(change.path)
-                snapshots[resolved] = (
-                    resolved.read_text(encoding="utf-8") if resolved.exists() else None
-                )
+                if resolved not in snapshots:
+                    # Capture only on first touch -- see redo.py's identical
+                    # comment for why: a transaction touching the same path
+                    # twice must roll back to the pre-transaction content,
+                    # not an intermediate one.
+                    snapshots[resolved] = (
+                        resolved.read_text(encoding="utf-8") if resolved.exists() else None
+                    )
                 content = change.new_content if use_new else change.old_content
                 if content is None:
                     resolved.unlink(missing_ok=True)
                 else:
                     resolved.parent.mkdir(parents=True, exist_ok=True)
-                    resolved.write_text(content, encoding="utf-8")
+                    atomic_write_text(resolved, content)
         except Exception as exc:
+            rollback_errors: list[str] = []
             for resolved, content in snapshots.items():
                 try:
                     if content is None:
                         resolved.unlink(missing_ok=True)
                     else:
                         resolved.parent.mkdir(parents=True, exist_ok=True)
-                        resolved.write_text(content, encoding="utf-8")
-                except Exception:
-                    pass
+                        atomic_write_text(resolved, content)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{resolved}: {rollback_exc}")
+            if rollback_errors:
+                logger.error(
+                    "Undo rollback failed for %d file(s) after transaction error (%s): %s",
+                    len(rollback_errors), exc, "; ".join(rollback_errors),
+                )
+                return (
+                    f"Undo transaction failed ({exc}) AND rollback also failed for "
+                    f"{len(rollback_errors)} file(s) -- workspace may be left in a "
+                    f"partially-applied state: {'; '.join(rollback_errors)}"
+                )
             return f"Undo transaction failed and was rolled back: {exc}"
         return None

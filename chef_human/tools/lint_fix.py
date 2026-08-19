@@ -98,7 +98,10 @@ class LintFixTool:
 
         if check_only:
             cmd = [ruff_path, "check", str(target)]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                return ToolResult(success=False, error=f"ruff check timed out after 30s on {target}")
             issues = result.stdout.strip()
             if not issues:
                 return ToolResult(output="No lint issues found.")
@@ -114,7 +117,10 @@ class LintFixTool:
         if select:
             cmd.extend(["--select", select])
 
-        fix_result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        try:
+            fix_result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            return ToolResult(success=False, error=f"ruff check --fix timed out after 30s on {target}")
 
         # Read after state
         after_map = self._read_files(target)

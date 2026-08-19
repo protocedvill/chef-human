@@ -244,6 +244,7 @@ class DiffStore:
 
     def clear(self) -> None:
         self._entries.clear()
+        self._redo_stack.clear()
 
     def push_redo(self, entry: RedoEntry) -> None:
         self._redo_stack.append(entry)

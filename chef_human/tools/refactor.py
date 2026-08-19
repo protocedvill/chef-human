@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from chef_human.tools.fsutil import atomic_write_text
 from chef_human.tools.diff import FileChange, compute_diff
 from chef_human.tools.registry import ToolResult
 
@@ -160,7 +161,7 @@ class RefactorTool:
                     error=f"Cannot read {file_path}: {exc}",
                 )
 
-            new_content, count = pattern.subn(new_name, content)
+            new_content, count = pattern.subn(lambda m: new_name, content)
             if count == 0:
                 continue
 
@@ -173,7 +174,7 @@ class RefactorTool:
                 })
             else:
                 try:
-                    file_path.write_text(new_content, encoding="utf-8")
+                    atomic_write_text(file_path, new_content)
                 except Exception as exc:
                     # Rollback all previous changes
                     self._rollback(results)
@@ -236,7 +237,7 @@ class RefactorTool:
         for r in reversed(results):
             if "old_content" in r:
                 try:
-                    Path(r["path"]).write_text(r["old_content"], encoding="utf-8")
+                    atomic_write_text(Path(r["path"]), r["old_content"])
                 except Exception:
                     pass
 

@@ -75,6 +75,42 @@ _ENV_INJECTION_VARS: tuple[str, ...] = (
 )
 
 
+def is_blacklisted(command: str) -> bool:
+    """Shell security policy, standalone: whether `command` matches an
+    unconditionally-blocked pattern. Split out of BashTool so the policy
+    can be tested/reused (e.g. by react_loop.py's own approval gate)
+    without needing a BashTool instance, which otherwise also drags in
+    subprocess execution and workspace resolution."""
+    cmd_lower = command.strip().lower()
+    return any(pattern in cmd_lower for pattern in BLACKLIST)
+
+
+def is_destructive(command: str) -> bool:
+    """Shell security policy, standalone: whether `command` looks like it
+    could destroy data (see DESTRUCTIVE_PREFIXES/_SEGMENT_SEPARATORS above
+    for the matching approach and its known limits)."""
+    try:
+        # punctuation_chars makes shlex split shell operators (>, >>, |,
+        # etc.) into their own tokens, so a quoted ">" stays part of
+        # its quoted token instead of being mistaken for a redirect.
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        tokens = None
+    if tokens is not None:
+        if any(tok.startswith(">") for tok in tokens):
+            return True
+    elif ">" in command:
+        return True
+    for segment in _SEGMENT_SEPARATORS.split(command):
+        stripped = segment.strip()
+        for prefix in DESTRUCTIVE_PREFIXES:
+            if stripped.startswith(prefix):
+                return True
+    return False
+
+
 class BashTool:
     name = "bash"
     description = (
@@ -100,7 +136,7 @@ class BashTool:
     async def run(self, command: str, timeout: int = TIMEOUT_DEFAULT, workdir: str | None = None) -> ToolResult:
         timeout = min(timeout, self.TIMEOUT_MAX)
 
-        if self._is_blacklisted(command):
+        if is_blacklisted(command):
             logger.warning("Blocked blacklisted command: %s", command[:80])
             return ToolResult(success=False, error="Command blocked: operation not allowed")
 
@@ -109,8 +145,8 @@ class BashTool:
         if not self._workspace.is_within_workspace(cwd):
             return ToolResult(success=False, error=f"Outside workspace: {cwd}")
 
-        is_destructive = self._is_destructive(command)
-        if is_destructive:
+        destructive = is_destructive(command)
+        if destructive:
             # This flag does not block execution here -- react_loop.py gates
             # destructive commands behind user approval *before* calling
             # BashTool.run() at all (its own separate _is_destructive_command
@@ -162,32 +198,3 @@ class BashTool:
         env["HOME"] = str(Path.home())
         return env
 
-    def _is_blacklisted(self, command: str) -> bool:
-        cmd_lower = command.strip().lower()
-        for pattern in BLACKLIST:
-            if pattern in cmd_lower:
-                return True
-        return False
-
-    @staticmethod
-    def _is_destructive(command: str) -> bool:
-        try:
-            # punctuation_chars makes shlex split shell operators (>, >>, |,
-            # etc.) into their own tokens, so a quoted ">" stays part of
-            # its quoted token instead of being mistaken for a redirect.
-            lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-            lexer.whitespace_split = True
-            tokens = list(lexer)
-        except ValueError:
-            tokens = None
-        if tokens is not None:
-            if any(tok.startswith(">") for tok in tokens):
-                return True
-        elif ">" in command:
-            return True
-        for segment in _SEGMENT_SEPARATORS.split(command):
-            stripped = segment.strip()
-            for prefix in DESTRUCTIVE_PREFIXES:
-                if stripped.startswith(prefix):
-                    return True
-        return False

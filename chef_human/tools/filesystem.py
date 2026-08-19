@@ -159,6 +159,25 @@ class EditTool:
         self._diff_store = diff_store
         self._file_context = file_context
 
+    def _write_and_remember(self, resolved: Path, path: str, content: str) -> str | None:
+        """Write `content` to disk and refresh the file-context cache.
+
+        Shared by every EditTool branch that ends in "write the new content" --
+        each branch still records its own diff/transaction afterward (that part
+        genuinely differs: create uses a transaction with no old_content, the
+        other branches use `record()` with a real diff), but the write +
+        mkdir + file_context.remember mechanics were identical three times over.
+        Returns an error string on failure, None on success.
+        """
+        try:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(resolved, content)
+        except Exception as exc:
+            return f"Cannot write {path}: {exc}"
+        if self._file_context is not None:
+            self._file_context.remember(path, content)
+        return None
+
     async def run(
         self,
         path: str,
@@ -178,13 +197,9 @@ class EditTool:
             # ask_user round-trip) to notice and retry with `write` instead.
             if not self._workspace.is_within_workspace(resolved):
                 return ToolResult(success=False, error=f"Outside workspace: {path}")
-            try:
-                resolved.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write_text(resolved, new_string)
-            except Exception as exc:
-                return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
-            if self._file_context is not None:
-                self._file_context.remember(path, new_string)
+            error = self._write_and_remember(resolved, path, new_string)
+            if error is not None:
+                return ToolResult(success=False, error=error)
             if self._diff_store:
                 self._diff_store.record_transaction(
                     [FileChange(path, None, new_string)], "edit"
@@ -209,12 +224,9 @@ class EditTool:
             # above), treat it the same way here for consistency, rather
             # than falling into that interleaving footgun.
             new_content = new_string
-            try:
-                atomic_write_text(resolved, new_content)
-            except Exception as exc:
-                return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
-            if self._file_context is not None:
-                self._file_context.remember(path, new_content)
+            error = self._write_and_remember(resolved, path, new_content)
+            if error is not None:
+                return ToolResult(success=False, error=error)
             # Deliberately phrased like WriteTool's own message ("Wrote N
             # lines to {path}"), not "replaced the contents of an existing
             # file" -- that wording was observed causing the step-verifier
@@ -261,13 +273,9 @@ class EditTool:
         else:
             new_content = old_content.replace(matched_old, new_string, 1)
 
-        try:
-            atomic_write_text(resolved, new_content)
-        except Exception as exc:
-            return ToolResult(success=False, error=f"Cannot write {path}: {exc}")
-
-        if self._file_context is not None:
-            self._file_context.remember(path, new_content)
+        error = self._write_and_remember(resolved, path, new_content)
+        if error is not None:
+            return ToolResult(success=False, error=error)
 
         diff = compute_diff(old_content, new_content, path=path)
 

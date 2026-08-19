@@ -81,12 +81,7 @@ class LookupSymbolTool:
     def _format(self, entries: list[IndexEntry]) -> str:
         lines: list[str] = []
         for entry in entries[:50]:
-            rel = entry.file_path
-            try:
-                p = self._workspace.resolve(entry.file_path)
-                rel = str(p.relative_to(self._workspace.root))
-            except Exception:
-                pass
+            rel = self._workspace.relative_display(entry.file_path)
             lines.append(
                 f"{entry.symbol.kind:12s} {entry.symbol.name:30s} "
                 f"{rel}:{entry.symbol.line}  {entry.symbol.signature}"

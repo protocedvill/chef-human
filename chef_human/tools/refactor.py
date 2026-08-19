@@ -176,8 +176,16 @@ class RefactorTool:
                 try:
                     atomic_write_text(file_path, new_content)
                 except Exception as exc:
-                    # Rollback all previous changes
-                    self._rollback(results)
+                    rollback_failures = self._rollback(results)
+                    if rollback_failures:
+                        return ToolResult(
+                            success=False,
+                            error=(
+                                f"Cannot write {file_path}: {exc} -- AND rollback also "
+                                f"failed for {len(rollback_failures)} file(s), workspace "
+                                f"may be left partially renamed: {', '.join(rollback_failures)}"
+                            ),
+                        )
                     return ToolResult(
                         success=False,
                         error=f"Cannot write {file_path}: {exc}",
@@ -233,13 +241,21 @@ class RefactorTool:
                 continue
         return matches
 
-    def _rollback(self, results: list[dict[str, Any]]) -> None:
+    def _rollback(self, results: list[dict[str, Any]]) -> list[str]:
+        """Restore every already-applied change's original content. Returns
+        the list of paths that failed to roll back (empty if all succeeded),
+        rather than silently swallowing failures -- a caller that reports
+        "rolled back" when some files weren't is worse than one that admits
+        the workspace is left partially renamed."""
+        failures: list[str] = []
         for r in reversed(results):
             if "old_content" in r:
                 try:
                     atomic_write_text(Path(r["path"]), r["old_content"])
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.error("Refactor rollback failed for %s: %s", r["path"], exc)
+                    failures.append(r["path"])
+        return failures
 
     def _format_dry_run(
         self, old_name: str, new_name: str, results: list[dict[str, Any]]

@@ -82,12 +82,7 @@ class ReferenceFinderTool:
         if include_definitions and all_defs:
             output_parts.append(f"\n  **Definitions ({len(all_defs)}):**")
             for f in all_defs:
-                try:
-                    rel = self._workspace.resolve(f)
-                    r = str(rel.relative_to(self._workspace.root))
-                except Exception:
-                    r = f
-                output_parts.append(f"    {r}")
+                output_parts.append(f"    {self._workspace.relative_display(f)}")
 
         if all_refs:
             refs_shown = all_refs[: max_results - len(all_defs)]
@@ -95,12 +90,7 @@ class ReferenceFinderTool:
                 f"\n  **References ({len(all_refs)}):**"
             )
             for file_path_str, line_num in refs_shown:
-                try:
-                    rel = self._workspace.resolve(file_path_str)
-                    r = str(rel.relative_to(self._workspace.root))
-                except Exception:
-                    r = file_path_str
-                output_parts.append(f"    {r}:{line_num}")
+                output_parts.append(f"    {self._workspace.relative_display(file_path_str)}:{line_num}")
 
             remaining = len(all_refs) - len(refs_shown)
             if remaining > 0:

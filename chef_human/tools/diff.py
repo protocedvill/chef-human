@@ -207,28 +207,28 @@ class DiffStore:
         self._entries.append(entry)
         self._redo_stack.clear()
 
-    def get_all(self, path: str | None = None) -> list[DiffEntry]:
+    def _last_index(self, path: str | None) -> int | None:
+        """Index of the most recent entry matching `path` (or the very last
+        entry if path is None), shared by last()/pop_last() so the two can't
+        drift on what "matches" means. get_all() doesn't need an index but
+        reuses the same `path is None or e.path == path` predicate below."""
         if path is None:
-            return list(self._entries)
-        return [e for e in self._entries if e.path == path]
-
-    def last(self, path: str | None = None) -> DiffEntry | None:
-        if path is None:
-            return self._entries[-1] if self._entries else None
-        for entry in reversed(self._entries):
-            if entry.path == path:
-                return entry
-        return None
-
-    def pop_last(self, path: str | None = None) -> DiffEntry | None:
-        if not self._entries:
-            return None
-        if path is None:
-            return self._entries.pop()
+            return len(self._entries) - 1 if self._entries else None
         for i in range(len(self._entries) - 1, -1, -1):
             if self._entries[i].path == path:
-                return self._entries.pop(i)
+                return i
         return None
+
+    def get_all(self, path: str | None = None) -> list[DiffEntry]:
+        return [e for e in self._entries if path is None or e.path == path]
+
+    def last(self, path: str | None = None) -> DiffEntry | None:
+        index = self._last_index(path)
+        return self._entries[index] if index is not None else None
+
+    def pop_last(self, path: str | None = None) -> DiffEntry | None:
+        index = self._last_index(path)
+        return self._entries.pop(index) if index is not None else None
 
     def get_summary(self) -> str:
         if not self._entries:

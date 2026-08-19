@@ -63,6 +63,19 @@ class WorkspaceManager:
         except ValueError:
             return False
 
+    def relative_display(self, path: str | Path) -> str:
+        """Best-effort workspace-relative path for display in tool output,
+        falling back to the input as given on any resolution error (e.g. a
+        symbol index entry pointing outside the workspace). Several tools
+        (reference_finder, lookup_symbol) reimplemented this same
+        resolve+relative_to+except pattern independently; centralizing it
+        here means a change to how display paths are computed only needs
+        to happen once."""
+        try:
+            return str(self.resolve(path).relative_to(self._root))
+        except Exception:
+            return str(path)
+
     def is_ignored(self, path: str | Path) -> bool:
         try:
             p = self.resolve(path)

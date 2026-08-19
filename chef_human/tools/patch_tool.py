@@ -15,6 +15,18 @@ if TYPE_CHECKING:
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*")
 
 
+def _normalize_patch_input(patch: str) -> str:
+    """Strip a model's markdown ```diff fences (and surrounding whitespace)
+    off a raw patch string, leaving just the unified-diff hunk text.
+    Pulled out of run() as its own function so patch-input format handling
+    can change (e.g. to support more fence styles) without touching patch
+    application or diff-recording logic."""
+    patch_text = patch.strip("\n").strip()
+    patch_text = re.sub(r"^```(?:diff)?\s*\n?", "", patch_text)
+    patch_text = re.sub(r"\n```\s*$", "", patch_text)
+    return patch_text
+
+
 def _strip_prefix_and_newline(line: str) -> str:
     """Remove diff prefix char (space, -, +) and trailing newline."""
     return line[1:].rstrip("\n\r")
@@ -175,11 +187,7 @@ class PatchTool:
         if not patch.strip():
             return ToolResult(success=False, error="Patch is empty")
 
-        # Strip any leading diff header lines that are not hunks
-        patch_text = patch.strip("\n").strip()
-        # Remove leading/trailing ```diff ... ``` markers if present
-        patch_text = re.sub(r"^```(?:diff)?\s*\n?", "", patch_text)
-        patch_text = re.sub(r"\n```\s*$", "", patch_text)
+        patch_text = _normalize_patch_input(patch)
 
         try:
             old_content = resolved.read_text(encoding="utf-8")

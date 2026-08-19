@@ -27,7 +27,14 @@ Rules:
   source files) before any step that writes or edits files. Do not plan straight from a task
   description or a plan/design document to implementation -- what to build depends on what
   already exists, not just on what the document says.
-- Output ONLY a JSON array of strings, e.g. ["Step 1", "Step 2", "Step 3"]
+- Output ONLY a JSON array. Each element is either a plain string (treated as a leaf, a single
+  concrete action) or an object {"description": "...", "type": "leaf"|"branch"}. Use "type":
+  "branch" only when a step is itself a large sub-goal that needs its own breakdown into further
+  steps before it's actionable — it will be decomposed by a further call, so do not also spell out
+  its own sub-steps inline. Use "leaf" (or a plain string) for anything that already resolves to
+  one concrete tool call. Most steps should be leaves; reach for "branch" only for a step whose
+  scope clearly doesn't fit in one action, e.g. ["Explore the existing code", {"description":
+  "Implement the scheduler module", "type": "branch"}, "Run the tests"]
 - Do NOT include any explanation or markdown — just the JSON array"""
 
 

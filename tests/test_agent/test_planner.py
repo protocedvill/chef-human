@@ -121,6 +121,29 @@ class TestCurrentStep:
         assert step is not None
         assert step.description == "c"
 
+    def test_walks_multi_level_tree_in_dfs_pre_order(self):
+        grandchild_a = PlanNode(description="branch-1a", status=StepStatus.completed)
+        grandchild_b = PlanNode(description="branch-1b", status=StepStatus.pending)
+        branch_1 = PlanNode(
+            description="branch 1",
+            children=[grandchild_a, grandchild_b],
+        )
+        leaf_2 = PlanNode(description="leaf 2", status=StepStatus.pending)
+        plan = Plan(goal="g", steps=[branch_1, leaf_2])
+
+        step = plan.current_leaf()
+        assert step is not None
+        assert step.description == "branch-1b"
+
+        grandchild_b.status = StepStatus.completed
+        step = plan.current_leaf()
+        assert step is not None
+        assert step.description == "leaf 2"
+
+        leaf_2.status = StepStatus.completed
+        assert plan.current_leaf() is None
+        assert plan.is_complete()
+
 
 class TestParseSteps:
     def test_json_array_of_strings(self):
@@ -206,6 +229,23 @@ class TestParseSteps:
         steps = planner._parse_steps(content)
         # Does not match "all strings" or "all dicts", so falls to final return
         assert len(steps) >= 1
+
+    def test_string_items_default_to_leaf(self):
+        planner = Planner(_make_mock_backend([]))
+        steps = planner._parse_steps('["Step A"]')
+        assert steps[0].requested_branch is False
+
+    def test_object_with_branch_type_is_flagged(self):
+        planner = Planner(_make_mock_backend([]))
+        content = '[{"description": "Implement the module", "type": "branch"}, {"description": "Run tests", "type": "leaf"}]'
+        steps = planner._parse_steps(content)
+        assert steps[0].requested_branch is True
+        assert steps[1].requested_branch is False
+
+    def test_object_without_type_defaults_to_leaf(self):
+        planner = Planner(_make_mock_backend([]))
+        steps = planner._parse_steps('[{"description": "Read file"}]')
+        assert steps[0].requested_branch is False
 
 
 class TestNormalizeSteps:
@@ -439,6 +479,141 @@ class TestGeneratePlan:
             "Create slugify.py",
             "Implement slugify.py",
         ]
+
+    @pytest.mark.asyncio
+    async def test_branch_child_is_recursively_expanded(self):
+        root_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps(
+                    [
+                        "Explore the existing code",
+                        {"description": "Implement the scheduler module", "type": "branch"},
+                        "Run the tests",
+                    ]
+                ),
+            )
+        )
+        branch_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps(["Write scheduler.py", "Write scheduler tests"]),
+            )
+        )
+        mock_complete = AsyncMock(side_effect=[root_response, branch_response])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = await planner.generate_plan("Build a task scheduler")
+
+        assert mock_complete.await_count == 2
+        assert len(plan.steps) == 3
+        branch = plan.steps[1]
+        assert branch.description == "Implement the scheduler module"
+        assert not branch.is_leaf
+        assert [c.description for c in branch.children] == [
+            "Write scheduler.py",
+            "Write scheduler tests",
+        ]
+        # Leaves elsewhere in the tree are untouched by the branch's own expansion.
+        assert plan.steps[0].is_leaf
+        assert plan.steps[2].is_leaf
+
+    @pytest.mark.asyncio
+    async def test_branch_expansion_receives_ancestor_chain(self):
+        root_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps(
+                    [{"description": "Implement the scheduler module", "type": "branch"}]
+                ),
+            )
+        )
+        branch_response = CompletionResponse(
+            message=Message(role=Role.assistant, content='["Write scheduler.py"]'),
+        )
+        mock_complete = AsyncMock(side_effect=[root_response, branch_response])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        await planner.generate_plan("Build a task scheduler")
+
+        second_call_messages = mock_complete.await_args_list[1].args[0].messages
+        user_content = second_call_messages[-1].content
+        assert "Build a task scheduler" in user_content
+        assert "Implement the scheduler module" in user_content
+
+    @pytest.mark.asyncio
+    async def test_no_hard_depth_cap_recurses_multiple_levels(self):
+        # Each level returns exactly one branch child until the third level,
+        # which finally returns a leaf -- nothing in generate_plan should
+        # stop this early.
+        level1 = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps([{"description": "Level 1", "type": "branch"}]),
+            )
+        )
+        level2 = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps([{"description": "Level 2", "type": "branch"}]),
+            )
+        )
+        level3 = CompletionResponse(
+            message=Message(role=Role.assistant, content='["Level 3 leaf"]'),
+        )
+        mock_complete = AsyncMock(side_effect=[level1, level2, level3])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = await planner.generate_plan("Deeply nested task")
+
+        assert mock_complete.await_count == 3
+        level1_node = plan.steps[0]
+        level2_node = level1_node.children[0]
+        level3_node = level2_node.children[0]
+        assert level1_node.description == "Level 1"
+        assert level2_node.description == "Level 2"
+        assert level3_node.description == "Level 3 leaf"
+        assert level3_node.is_leaf
+        assert plan.current_leaf() is level3_node
+
+    @pytest.mark.asyncio
+    async def test_cleanup_filters_apply_per_expansion_call(self):
+        # The env-setup filter should apply independently to the branch's
+        # own expansion call, not just the root call.
+        root_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps(
+                    [{"description": "Implement the feature", "type": "branch"}]
+                ),
+            )
+        )
+        branch_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps(
+                    [
+                        "Install Python if it is not already installed",
+                        "Write feature.py",
+                    ]
+                ),
+            )
+        )
+        mock_complete = AsyncMock(side_effect=[root_response, branch_response])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = await planner.generate_plan("Add a feature")
+
+        branch = plan.steps[0]
+        assert [c.description for c in branch.children] == ["Write feature.py"]
 
 
 class TestUpdatePlan:

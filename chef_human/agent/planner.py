@@ -69,6 +69,13 @@ class PlanNode:
     node_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     index: int = 0
     children: list["PlanNode"] = field(default_factory=list)
+    # Generation-time hint only (like `index`, not identity, not persisted
+    # via `to_dict()`): whether the LLM asked for this node to be
+    # decomposed further. Consulted once, right after the node is created,
+    # to decide whether to issue a further expansion call for it -- a node
+    # is only actually a leaf/branch based on whether `children` ends up
+    # populated, not based on this flag.
+    requested_branch: bool = False
 
     @property
     def is_leaf(self) -> bool:
@@ -232,28 +239,96 @@ class Planner:
         repo_context: str = "",
         planning_facts: dict[str, bool] | None = None,
     ) -> Plan:
-        messages = [
-            Message(role=Role.system, content=PLANNER_SYSTEM_PROMPT),
-        ]
-        if repo_context:
-            messages.append(
-                Message(role=Role.system, content=f"## Project Context\n\n{repo_context}")
-            )
-        messages.append(Message(role=Role.user, content=f"Task: {task}"))
+        plan = Plan(goal=task)
+        await self._expand_node(
+            plan.root,
+            ancestors=[],
+            task=task,
+            repo_context=repo_context,
+            planning_facts=planning_facts,
+            is_root=True,
+        )
+        return plan
 
+    async def _expand_node(
+        self,
+        node: PlanNode,
+        *,
+        ancestors: list[str],
+        task: str,
+        repo_context: str,
+        planning_facts: dict[str, bool] | None,
+        is_root: bool,
+    ) -> None:
+        """Decompose `node` into its immediate children via one LLM call,
+        then recurse into any child the LLM marked as a branch. `ancestors`
+        is the chain of descriptions from the root goal down through every
+        ancestor to (but not including) `node` itself, so a deeply nested
+        expansion call doesn't drift from the overall task. There is no hard
+        depth cap here -- convergence relies on the LLM eventually emitting
+        a leaf for every child."""
+        messages = self._build_expand_messages(
+            task=task,
+            repo_context=repo_context,
+            ancestors=ancestors,
+            node=node,
+            is_root=is_root,
+        )
         response = await self._complete(
             CompletionRequest(messages=messages, temperature=0.0, max_tokens=2048),
             activity="planning",
         )
-
-        steps = self._normalize_steps(
+        children = self._normalize_steps(
             task,
             self._parse_steps(response.message.content),
             planning_facts=planning_facts,
         )
-        plan = Plan(goal=task)
-        plan.steps = steps
-        return plan
+        node.children = children
+
+        child_ancestors = ancestors if is_root else ancestors + [node.description]
+        for child in children:
+            if child.requested_branch:
+                await self._expand_node(
+                    child,
+                    ancestors=child_ancestors,
+                    task=task,
+                    repo_context=repo_context,
+                    planning_facts=planning_facts,
+                    is_root=False,
+                )
+
+    @staticmethod
+    def _build_expand_messages(
+        *,
+        task: str,
+        repo_context: str,
+        ancestors: list[str],
+        node: PlanNode,
+        is_root: bool,
+    ) -> list[Message]:
+        messages = [Message(role=Role.system, content=PLANNER_SYSTEM_PROMPT)]
+        if repo_context:
+            messages.append(
+                Message(role=Role.system, content=f"## Project Context\n\n{repo_context}")
+            )
+        if is_root:
+            messages.append(Message(role=Role.user, content=f"Task: {task}"))
+            return messages
+
+        chain = "\n".join(f"- {d}" for d in ([task] + ancestors))
+        messages.append(
+            Message(
+                role=Role.user,
+                content=(
+                    f"Overall goal: {task}\n\n"
+                    f"Ancestor chain (root goal down to this sub-goal):\n{chain}\n\n"
+                    "Break the following sub-goal down into its own immediate next steps "
+                    "(do not re-plan the overall goal, only this sub-goal):\n"
+                    f"{node.description}"
+                ),
+            )
+        )
+        return messages
 
     async def verify_step(
         self,
@@ -419,14 +494,22 @@ class Planner:
                 continue
             seen_descriptions.add(key)
             normalized.append(
-                PlanNode(description=description, index=len(normalized) + 1)
+                PlanNode(
+                    description=description,
+                    index=len(normalized) + 1,
+                    requested_branch=step.requested_branch,
+                )
             )
 
         if normalized:
             return normalized
 
         return [
-            PlanNode(description=cls._clean_description(step.description), index=i + 1)
+            PlanNode(
+                description=cls._clean_description(step.description),
+                index=i + 1,
+                requested_branch=step.requested_branch,
+            )
             for i, step in enumerate(steps)
             if cls._clean_description(step.description)
         ]
@@ -485,20 +568,23 @@ class Planner:
                     if s.strip()
                 ]
 
-        if isinstance(data, list):
-            if all(isinstance(item, str) for item in data):
-                return [
-                    PlanNode(description=self._clean_description(item), index=i + 1)
-                    for i, item in enumerate(data)
-                ]
-            elif all(isinstance(item, dict) for item in data):
-                return [
+        if isinstance(data, list) and all(isinstance(item, (str, dict)) for item in data):
+            steps = []
+            for i, item in enumerate(data):
+                if isinstance(item, dict):
+                    description = self._clean_description(item.get("description", str(item)))
+                    requested_branch = str(item.get("type", "leaf")).strip().lower() == "branch"
+                else:
+                    description = self._clean_description(item)
+                    requested_branch = False
+                steps.append(
                     PlanNode(
-                        description=self._clean_description(item.get("description", str(item))),
+                        description=description,
                         index=i + 1,
+                        requested_branch=requested_branch,
                     )
-                    for i, item in enumerate(data)
-                ]
+                )
+            return steps
         return [PlanNode(description=self._clean_description(str(data)), index=1)]
 
     @staticmethod

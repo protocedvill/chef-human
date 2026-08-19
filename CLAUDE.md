@@ -141,13 +141,10 @@ rejecting already-correct work until `RetryManager`'s 5-consecutive-failure cap 
   sentence to `STEP_VERIFY_PROMPT` establishing current file contents as ground truth over whether *this*
   turn's tool call produced a visible change.
 
-**Known, not-yet-fixed follow-up**: the root cause underlying both of the above is broader than either
-individual fix — `_step_evidence_key` keys accumulated per-step evidence (files written, successful
-commands) by the exact step-description string, so *any* replan that rewords a step orphans all
-evidence accumulated under the old wording, even when the step's real-world goal was already achieved.
-This can still surface as a false escalation on long tasks with multiple replans; if it recurs, the fix
-likely needs evidence to survive across a replan for steps whose underlying goal is unchanged, not
-another narrow evidence-acceptance patch.
+Evidence is now keyed by stable `PlanNode.node_id` rather than description text, which closed most of
+the false-escalation surface above. A narrower gap remains in `update_plan()`'s whole-plan replan
+fallback — see `docs/adr/0001-evidence-carry-forward-across-whole-plan-replan.md` for the mechanism and
+the settled (not yet implemented) fix.
 
 ### Tools (`chef_human/tools/`)
 

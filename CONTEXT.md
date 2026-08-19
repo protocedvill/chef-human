@@ -18,4 +18,4 @@
 
 **Flagged (node)** — a node the planner was uncertain how to decompose. Surfaced to a human operator during the one-time whole-tree review pass, when one is present. In headless operation, a flagged node is instead decomposed further rather than left as a guessed leaf.
 
-**Current leaf** — the leaf execution should work on next: the first non-completed leaf found in tree order.
+**Current leaf** — the leaf execution should work on next: the first *pending* leaf found in tree order. Deliberately narrower than "not yet completed" — an `in_progress` leaf (work already underway on it) is not a current leaf, which matters for replan-target selection (see `docs/adr/0001-evidence-carry-forward-across-whole-plan-replan.md`).

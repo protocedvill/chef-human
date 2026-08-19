@@ -5,12 +5,14 @@ import json
 import logging
 import re
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
 from chef_human.agent.prompts import (
     PLANNER_SYSTEM_PROMPT,
+    build_atomicity_check_prompt,
     build_rollup_verify_prompt,
     build_verify_prompt,
 )
@@ -140,6 +142,14 @@ class PlanNode:
     # pass (ticket 07) so a human reviewer knows where to look; cleared when
     # a review action resolves the node (edit, mark-as-leaf, redecompose).
     flagged: bool = field(default=False, repr=False, compare=False)
+    # Generation-time hint (like `requested_branch`, not identity, not
+    # persisted): the atomicity check's own REASON text when it reclassified
+    # this node from leaf to branch -- it already names the distinct pieces
+    # bundled into the step (e.g. "bundles subscribe, publish, retries, and
+    # dead-lettering"), so the breakdown call expanding this node is told
+    # what to split by instead of re-deriving that structure from scratch.
+    # Empty for a node marked "branch" directly by the generation call.
+    atomicity_reason: str = field(default="", repr=False, compare=False)
 
     @property
     def is_leaf(self) -> bool:
@@ -301,6 +311,19 @@ class Planner:
     _SLOW_CONVERGENCE_DEPTH = 5
     _SLOW_CONVERGENCE_NODE_COUNT = 25
 
+    # Budget for calls that generate a plan's step JSON (initial expansion,
+    # sub-goal breakdown, and the whole-tree-review redecompose path) --
+    # deliberately generous. A "thinking" model (Settings.ollama_think /
+    # OllamaBackend(think=True)) spends tokens on its reasoning trace before
+    # ever emitting the JSON array, and those reasoning tokens count against
+    # the same completion budget as the answer. At the previous 2048 cap, a
+    # complex task's plan-generation call was observed to spend the entire
+    # budget thinking and return empty content -- silently producing a
+    # zero-step plan with no error surfaced anywhere. 8192 was validated
+    # against a medium-complexity task with think=True: a real multi-level,
+    # non-redundant decomposition completed well within budget.
+    _PLANNING_MAX_TOKENS = 8192
+
     _STEP_PREFIX_RE = re.compile(r"^step\s+\d+\s*[:.\-]\s*", re.IGNORECASE)
     _FILE_TARGET_RE = re.compile(r"[`'\"]?([\w\-./]+\.\w{1,10})[`'\"]?")
     _ENV_SETUP_RE = re.compile(
@@ -414,7 +437,7 @@ class Planner:
             is_root=is_root,
         )
         response = await self._complete(
-            CompletionRequest(messages=messages, temperature=0.0, max_tokens=2048),
+            CompletionRequest(messages=messages, temperature=0.0, max_tokens=self._PLANNING_MAX_TOKENS),
             activity="planning",
         )
         children = self._normalize_steps(
@@ -422,7 +445,29 @@ class Planner:
             self._parse_steps(response.message.content),
             planning_facts=planning_facts,
         )
+        # Attach children to the tree before classifying them: the
+        # atomicity check needs real .parent/.children links to see nearby
+        # tree structure, which only exist once set_children() has run.
         node.set_children(children)
+        if node.atomicity_reason and len(children) == 1:
+            # `node` itself is a branch only because the atomicity check
+            # reclassified it (not because the generation call explicitly
+            # tagged it "branch" -- that case is trusted as-is, however many
+            # children it yields). A breakdown of an atomicity-reclassified
+            # node that produces exactly one child achieved nothing
+            # structurally -- it can only be the same scope restated (a real
+            # split of a bundled step always yields multiple pieces).
+            # Observed without this guard: a flagged node's breakdown call
+            # kept regenerating a single reworded paraphrase of itself,
+            # which the atomicity check flagged again, forever (e.g. "Write
+            # notify.py implementing the Bus class with subscribe..." <->
+            # "Create notify.py with the Bus class implementation
+            # including..."). Force it to stay a leaf rather than running it
+            # through another atomicity check that would just repeat the
+            # cycle.
+            children[0].requested_branch = False
+        else:
+            await self._classify_children(task, children)
         convergence.record(depth=depth + 1, new_nodes=len(children))
 
         child_ancestors = ancestors if is_root else ancestors + [node.description]
@@ -438,6 +483,137 @@ class Planner:
                     depth=depth + 1,
                     convergence=convergence,
                 )
+
+    _ATOMICITY_TREE_CONTEXT_LIMIT = 40
+
+    async def _classify_children(self, task: str, children: list[PlanNode]) -> None:
+        """Independently double-check every child the generation call left
+        as a leaf, via one dedicated LLM call per leaf. The call that wrote
+        a step's wording is not a reliable judge of whether that step is
+        actually atomic -- it has every incentive to describe its own output
+        as done and actionable, the same bias that makes self-grading
+        unreliable elsewhere in this codebase. A step already marked
+        "branch" is trusted as-is (it already gets decomposed further); this
+        only exists to catch the false-negative case, a step that bundles
+        multiple pieces of work but was left as "leaf" anyway.
+
+        Callers must attach `children` to the tree (`node.set_children(...)`)
+        before calling this -- each check needs real `.parent`/`.children`
+        links to see nearby tree structure, not just the step's own
+        wording. Judging a step in total isolation from the rest of the
+        tree let it recommend a "breakdown" that just recreated an
+        equivalent step one level up, forever (e.g. "ls" being broken down
+        into "list current directory contents", whose own atomicity check
+        then broke it back down into "ls") -- there was nothing in the
+        step's own wording to reveal that loop, only the surrounding tree
+        structure could."""
+        for child in children:
+            if child.requested_branch:
+                continue
+            nearby = self._collect_nearby_nodes(child, limit=self._ATOMICITY_TREE_CONTEXT_LIMIT)
+            tree_context = self._render_nearby_tree(child, nearby)
+            needs_breakdown, reason = await self._check_atomicity(
+                task, child.description, tree_context
+            )
+            if needs_breakdown:
+                logger.debug(
+                    "Atomicity check reclassified leaf as branch: %r (%s)",
+                    child.description,
+                    reason,
+                )
+                child.requested_branch = True
+                child.atomicity_reason = reason
+
+    @staticmethod
+    def _collect_nearby_nodes(node: PlanNode, *, limit: int) -> list[PlanNode]:
+        """BFS outward from `node`, treating the tree as undirected (a
+        node's parent and children both count as neighbors), collecting up
+        to `limit` nodes in nearest-first order -- ancestors, siblings,
+        cousins, and descendants alike, not just the straight-line ancestor
+        chain a normal expansion call sees. `node` itself is included
+        first."""
+        visited = {node.node_id}
+        collected = [node]
+        queue: deque[PlanNode] = deque([node])
+        while queue and len(collected) < limit:
+            current = queue.popleft()
+            neighbors: list[PlanNode] = list(current.children)
+            if current.parent is not None:
+                neighbors.append(current.parent)
+            for neighbor in neighbors:
+                if neighbor.node_id in visited:
+                    continue
+                visited.add(neighbor.node_id)
+                collected.append(neighbor)
+                queue.append(neighbor)
+                if len(collected) >= limit:
+                    break
+        return collected
+
+    @staticmethod
+    def _render_nearby_tree(node: PlanNode, nearby: list[PlanNode]) -> str:
+        """Renders `nearby` (from `_collect_nearby_nodes`) as an indented
+        tree, marking `node` inline. A node whose parent fell outside the
+        BFS ball becomes a top-level entry in the render (the ball's
+        boundary), not nested under a parent that isn't shown."""
+        nearby_ids = {n.node_id for n in nearby}
+        roots = [n for n in nearby if n.parent is None or n.parent.node_id not in nearby_ids]
+        lines: list[str] = []
+
+        def label(n: PlanNode) -> str:
+            text = "(overall task)" if n.description == "root" else n.description
+            return f"{text}  <-- the step being checked" if n.node_id == node.node_id else text
+
+        def render(n: PlanNode, depth: int) -> None:
+            lines.append("  " * depth + f"- {label(n)}")
+            for child in n.children:
+                if child.node_id in nearby_ids:
+                    render(child, depth + 1)
+
+        for root in roots:
+            render(root, 0)
+        return "\n".join(lines)
+
+    async def _check_atomicity(self, goal: str, step: str, tree_context: str) -> tuple[bool, str]:
+        prompt = build_atomicity_check_prompt(goal=goal, step=step, tree_context=tree_context)
+        response = await self._complete(
+            CompletionRequest(
+                messages=[Message(role=Role.user, content=prompt)],
+                temperature=0.0,
+                max_tokens=self._PLANNING_MAX_TOKENS,
+            ),
+            activity="checking step atomicity",
+        )
+        return self._parse_atomicity_verdict(response.message.content)
+
+    @staticmethod
+    def _parse_atomicity_verdict(content: str) -> tuple[bool, str]:
+        """Returns (needs_breakdown, reason). Fails open (False, i.e. trust
+        the leaf as-is) on anything unparseable, rather than retrying like
+        step verification does -- an unparseable atomicity check should not
+        block planning altogether, and leaving a genuinely-too-broad step as
+        a leaf is a recoverable failure (the agent still attempts it; a
+        subsequent replan can still split it), not a silent data loss."""
+        text = content.strip()
+        reason_match = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE)
+        reason = reason_match.group(1).strip() if reason_match else ""
+        verdict_match = re.search(
+            r"^\s*VERDICT:\s*(ATOMIC|NEEDS_BREAKDOWN|NEEDS BREAKDOWN)\s*$",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        verdict_text = (
+            verdict_match.group(1).upper().replace(" ", "_") if verdict_match else ""
+        )
+        if not verdict_text:
+            bare_lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if bare_lines:
+                first_line = bare_lines[0].upper().replace(" ", "_")
+                if first_line in {"ATOMIC", "NEEDS_BREAKDOWN"}:
+                    verdict_text = first_line
+                    if not reason and len(bare_lines) > 1:
+                        reason = " ".join(bare_lines[1:]).strip()
+        return verdict_text == "NEEDS_BREAKDOWN", reason
 
     @staticmethod
     def _build_expand_messages(
@@ -458,6 +634,11 @@ class Planner:
             return messages
 
         chain = "\n".join(f"- {d}" for d in ([task] + ancestors))
+        why_line = (
+            f"\n\nWhy this needs breaking down: {node.atomicity_reason}"
+            if node.atomicity_reason
+            else ""
+        )
         messages.append(
             Message(
                 role=Role.user,
@@ -467,6 +648,15 @@ class Planner:
                     "Break the following sub-goal down into its own immediate next steps "
                     "(do not re-plan the overall goal, only this sub-goal):\n"
                     f"{node.description}"
+                    f"{why_line}\n\n"
+                    "This must produce at least two steps, each covering a genuinely "
+                    "different piece of the sub-goal above -- a different responsibility, "
+                    "feature, or concern, not the same scope restated in different words. "
+                    "If the reason above names specific bundled pieces (e.g. "
+                    "\"subscribe, publish, retries, and dead-lettering\"), split along "
+                    "exactly those lines: one step per named piece. A response with only "
+                    "one step, or where every step still describes the same overall scope "
+                    "as the sub-goal itself, is not a real breakdown and will be rejected."
                 ),
             )
         )
@@ -502,13 +692,20 @@ class Planner:
             is_failure=is_failure,
         )
         response = await self._complete(
-            CompletionRequest(messages=messages, temperature=0.0, max_tokens=2048),
+            CompletionRequest(messages=messages, temperature=0.0, max_tokens=self._PLANNING_MAX_TOKENS),
             activity="replanning",
         )
         children = self._normalize_steps(
             plan.goal, self._parse_steps(response.message.content)
         )
         node.set_children(children)
+        if node.atomicity_reason and len(children) == 1:
+            # See the matching guard in _expand_node: a single-child
+            # breakdown of an atomicity-reclassified node is not a real
+            # decomposition.
+            children[0].requested_branch = False
+        else:
+            await self._classify_children(plan.goal, children)
         convergence = _ConvergenceTracker(subtree_label=node.description)
         convergence.record(depth=1, new_nodes=len(children))
 
@@ -717,7 +914,7 @@ class Planner:
             ),
         ]
         response = await self._complete(
-            CompletionRequest(messages=messages, temperature=0.0, max_tokens=2048),
+            CompletionRequest(messages=messages, temperature=0.0, max_tokens=self._PLANNING_MAX_TOKENS),
             activity="replanning",
         )
         steps = self._normalize_steps(plan.goal, self._parse_steps(response.message.content))

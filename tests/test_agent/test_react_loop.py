@@ -4256,9 +4256,10 @@ class TestTokenTracking:
         )
         result = await loop.run("do something")
 
-        # 50 (main loop) + 40 (planner's generate_plan) = 90
-        assert result.total_prompt_tokens == 90
-        assert result.total_completion_tokens == 18
+        # 50 (main loop) + 40 (planner's expansion call) + 40 (atomicity
+        # check on the single leaf child) = 130
+        assert result.total_prompt_tokens == 130
+        assert result.total_completion_tokens == 26
 
     @pytest.mark.asyncio
     async def test_planner_usage_reported_to_ui_live(self):

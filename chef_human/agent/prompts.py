@@ -141,6 +141,32 @@ VERDICT: COMPLETE, PARTIAL, or NOT_COMPLETE
 REASON: <one short sentence about THIS branch's own sub-goal only>"""
 
 
+ATOMICITY_CHECK_PROMPT = """You are checking whether a single planned step is small enough to execute directly as one concrete tool call, or whether it actually bundles multiple distinct pieces of work and needs to be broken down into its own sub-steps first. This is an independent second opinion -- the step's own wording was written by whatever proposed it, which is not a reliable judge of its own scope, so judge the substance of what the step is asking for, not how short or confident its sentence reads.
+
+Overall goal: {goal}
+
+Nearby plan structure (the step being checked is marked below; ancestors, siblings, and any existing descendants are shown so you can tell whether this step already sits next to, or duplicates, work covered elsewhere in the plan):
+{tree_context}
+
+Step to check: {step}
+
+Say ATOMIC if the step resolves to one concrete action: reading one file, writing or editing one specific piece of content, running one command, or a single similarly-scoped operation. Say NEEDS_BREAKDOWN if the step bundles more than one distinct piece of work -- multiple separate features or responsibilities, multiple "and"s joining unrelated concerns, or a goal broad enough that a competent engineer would naturally split it into several steps before starting. A short sentence can still be NEEDS_BREAKDOWN: "implement subscribe, publish, retries, and dead-lettering" is four things wearing one sentence, not one thing.
+
+Examples:
+- "Add a constructor and an area() method to the Rectangle class in shapes.py" -> ATOMIC (one class, two closely related pieces of its own construction -- a single coherent edit)
+- "Implement the Rectangle class in shapes.py with a constructor, area(), perimeter(), from_diagonal(), and largest_by_area()" -> NEEDS_BREAKDOWN (five separate members, several of which are independent enough to write and verify one at a time)
+- "Run pytest and report the results" -> ATOMIC (one command, one concrete outcome)
+- "Write notify.py implementing subscribe, publish, retries, and dead-lettering" -> NEEDS_BREAKDOWN (four distinct responsibilities named explicitly; each is substantial enough to get its own step)
+- "Add a docstring to the publish() method in notify.py" -> ATOMIC (one small, self-contained edit)
+- "Write test_shapes.py with tests for the constructor, area(), perimeter(), from_diagonal(), and largest_by_area()" -> NEEDS_BREAKDOWN (a full test suite covering five separate behaviors, not one test)
+
+Never say NEEDS_BREAKDOWN if doing so would just recreate a step that is already its own parent or an equivalent step already visible in the nearby structure above (e.g. "ls" under a parent step that already says "list the directory contents" is ATOMIC -- breaking it down further would only restate the same single action in different words). If breaking this step down would not produce children meaningfully smaller or more concrete than the step itself, say ATOMIC instead.
+
+Respond with exactly two lines and nothing else:
+VERDICT: ATOMIC or NEEDS_BREAKDOWN
+REASON: <one short sentence>"""
+
+
 AGENT_FINISH_PROMPT = """
 The task is now complete. Summarize what was accomplished:
 - What changes were made
@@ -171,6 +197,14 @@ def build_verify_prompt(
         or "(no immediate tool calls this turn -- only reasoning text was produced)",
         recent_history=recent_history.strip() or "(no recent tool history available)",
         finish_summary=finish_summary.strip() or "(no finish request summary provided)",
+    )
+
+
+def build_atomicity_check_prompt(goal: str, step: str, tree_context: str = "") -> str:
+    return ATOMICITY_CHECK_PROMPT.format(
+        goal=goal,
+        step=step,
+        tree_context=tree_context.strip() or "(no other steps yet)",
     )
 
 

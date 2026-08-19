@@ -526,7 +526,8 @@ class TestGeneratePlan:
         assert len(plan.steps) == 1
 
     @pytest.mark.asyncio
-    async def test_llm_called_with_correct_messages(self):
+    async def test_llm_called_with_correct_messages(self, monkeypatch):
+        monkeypatch.setattr(Planner, "_check_atomicity", AsyncMock(return_value=(False, "")))
         mock_complete = AsyncMock(return_value=CompletionResponse(
             message=Message(role=Role.assistant, content='["Step 1"]'),
         ))
@@ -546,7 +547,8 @@ class TestGeneratePlan:
         assert "Do the thing" in messages[1].content
 
     @pytest.mark.asyncio
-    async def test_llm_called_with_repo_context(self):
+    async def test_llm_called_with_repo_context(self, monkeypatch):
+        monkeypatch.setattr(Planner, "_check_atomicity", AsyncMock(return_value=(False, "")))
         mock_complete = AsyncMock(return_value=CompletionResponse(
             message=Message(role=Role.assistant, content='["Step 1"]'),
         ))
@@ -586,7 +588,8 @@ class TestGeneratePlan:
         ]
 
     @pytest.mark.asyncio
-    async def test_branch_child_is_recursively_expanded(self):
+    async def test_branch_child_is_recursively_expanded(self, monkeypatch):
+        monkeypatch.setattr(Planner, "_check_atomicity", AsyncMock(return_value=(False, "")))
         root_response = CompletionResponse(
             message=Message(
                 role=Role.assistant,
@@ -626,7 +629,8 @@ class TestGeneratePlan:
         assert plan.steps[2].is_leaf
 
     @pytest.mark.asyncio
-    async def test_branch_expansion_receives_ancestor_chain(self):
+    async def test_branch_expansion_receives_ancestor_chain(self, monkeypatch):
+        monkeypatch.setattr(Planner, "_check_atomicity", AsyncMock(return_value=(False, "")))
         root_response = CompletionResponse(
             message=Message(
                 role=Role.assistant,
@@ -651,7 +655,8 @@ class TestGeneratePlan:
         assert "Implement the scheduler module" in user_content
 
     @pytest.mark.asyncio
-    async def test_no_hard_depth_cap_recurses_multiple_levels(self):
+    async def test_no_hard_depth_cap_recurses_multiple_levels(self, monkeypatch):
+        monkeypatch.setattr(Planner, "_check_atomicity", AsyncMock(return_value=(False, "")))
         # Each level returns exactly one branch child until the third level,
         # which finally returns a leaf -- nothing in generate_plan should
         # stop this early.
@@ -693,6 +698,7 @@ class TestGeneratePlan:
     ):
         monkeypatch.setattr(Planner, "_SLOW_CONVERGENCE_DEPTH", 2)
         monkeypatch.setattr(Planner, "_SLOW_CONVERGENCE_NODE_COUNT", 999)
+        monkeypatch.setattr(Planner, "_check_atomicity", AsyncMock(return_value=(False, "")))
 
         level1 = CompletionResponse(
             message=Message(
@@ -734,7 +740,8 @@ class TestGeneratePlan:
         assert not any("not converged" in record.message for record in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_cleanup_filters_apply_per_expansion_call(self):
+    async def test_cleanup_filters_apply_per_expansion_call(self, monkeypatch):
+        monkeypatch.setattr(Planner, "_check_atomicity", AsyncMock(return_value=(False, "")))
         # The env-setup filter should apply independently to the branch's
         # own expansion call, not just the root call.
         root_response = CompletionResponse(
@@ -765,6 +772,331 @@ class TestGeneratePlan:
 
         branch = plan.steps[0]
         assert [c.description for c in branch.children] == ["Write feature.py"]
+
+
+class TestAtomicityCheck:
+    """A leaf the generation call proposed is not trusted as atomic on its
+    own say-so -- _classify_children runs an independent LLM check per leaf
+    (_check_atomicity) and can reclassify it as a branch."""
+
+    @pytest.mark.asyncio
+    async def test_leaf_reclassified_as_branch_gets_expanded(self, monkeypatch):
+        async def fake_atomicity(self, goal, step, tree_context):
+            if step == "Implement subscribe, publish, and retries":
+                return True, "bundles three features"
+            return False, "fine"
+
+        monkeypatch.setattr(Planner, "_check_atomicity", fake_atomicity)
+
+        root_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps(["Implement subscribe, publish, and retries"]),
+            )
+        )
+        breakdown_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps(["Implement subscribe", "Implement publish", "Implement retries"]),
+            )
+        )
+        mock_complete = AsyncMock(side_effect=[root_response, breakdown_response])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = await planner.generate_plan("Build a notification bus")
+
+        # Root expansion + the reclassified leaf's own breakdown expansion --
+        # the atomicity checks themselves are stubbed, not real completions.
+        assert mock_complete.await_count == 2
+        node = plan.steps[0]
+        assert not node.is_leaf
+        assert [c.description for c in node.children] == [
+            "Implement subscribe",
+            "Implement publish",
+            "Implement retries",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_leaf_confirmed_atomic_stays_a_leaf(self):
+        root_response = CompletionResponse(
+            message=Message(role=Role.assistant, content=json.dumps(["Write hello.py"])),
+        )
+        atomicity_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content="VERDICT: ATOMIC\nREASON: one file, one write",
+            )
+        )
+        mock_complete = AsyncMock(side_effect=[root_response, atomicity_response])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = await planner.generate_plan("Print hello")
+
+        assert mock_complete.await_count == 2
+        assert plan.steps[0].is_leaf
+
+    @pytest.mark.asyncio
+    async def test_branch_marked_children_skip_the_atomicity_check(self, monkeypatch):
+        checked_steps: list[str] = []
+
+        async def fake_atomicity(self, goal, step, tree_context):
+            checked_steps.append(step)
+            return False, "fine"
+
+        monkeypatch.setattr(Planner, "_check_atomicity", fake_atomicity)
+
+        root_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps(
+                    [{"description": "Implement the scheduler module", "type": "branch"}]
+                ),
+            )
+        )
+        branch_response = CompletionResponse(
+            message=Message(role=Role.assistant, content=json.dumps(["Write scheduler.py"])),
+        )
+        mock_complete = AsyncMock(side_effect=[root_response, branch_response])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        await planner.generate_plan("Build a task scheduler")
+
+        # A step the generation call already marked "branch" is trusted
+        # as-is and never sent through the atomicity check -- only its
+        # eventual leaf descendant ("Write scheduler.py") is.
+        assert checked_steps == ["Write scheduler.py"]
+
+    @pytest.mark.asyncio
+    async def test_atomicity_prompt_includes_goal_and_step(self):
+        root_response = CompletionResponse(
+            message=Message(role=Role.assistant, content=json.dumps(["Do the one thing"])),
+        )
+        atomicity_response = CompletionResponse(
+            message=Message(role=Role.assistant, content="VERDICT: ATOMIC\nREASON: fine"),
+        )
+        mock_complete = AsyncMock(side_effect=[root_response, atomicity_response])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        await planner.generate_plan("Some overall goal")
+
+        second_call_messages = mock_complete.await_args_list[1].args[0].messages
+        content = second_call_messages[-1].content
+        assert "Some overall goal" in content
+        assert "Do the one thing" in content
+
+    @pytest.mark.asyncio
+    async def test_unparseable_atomicity_response_fails_open_to_leaf(self):
+        root_response = CompletionResponse(
+            message=Message(role=Role.assistant, content=json.dumps(["Do the one thing"])),
+        )
+        atomicity_response = CompletionResponse(
+            message=Message(role=Role.assistant, content="not a verdict at all"),
+        )
+        mock_complete = AsyncMock(side_effect=[root_response, atomicity_response])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = await planner.generate_plan("Some overall goal")
+
+        assert mock_complete.await_count == 2
+        assert plan.steps[0].is_leaf
+
+
+class TestNearbyTreeContext:
+    """_collect_nearby_nodes/_render_nearby_tree give the atomicity check
+    visibility into the surrounding tree, not just the one step's own
+    wording -- added after an isolated-per-node check produced an infinite
+    oscillation: 'ls' judged NEEDS_BREAKDOWN into 'list current directory
+    contents', which was itself then judged NEEDS_BREAKDOWN back into 'ls',
+    forever, because neither call had any way to see it was about to
+    recreate a step that already existed one level up."""
+
+    def _chain(self, *descriptions):
+        """Builds a straight-line chain of PlanNodes, each the sole child of
+        the previous one, returning (root, deepest_node)."""
+        root = PlanNode(description="root")
+        current = root
+        for desc in descriptions:
+            child = PlanNode(description=desc)
+            current.set_children([child])
+            current = child
+        return root, current
+
+    def test_collect_nearby_nodes_is_nearest_first_and_respects_limit(self):
+        root, leaf = self._chain("a", "b", "c", "d", "e")
+        # leaf's description is "e"; walk to "c" (two hops up from leaf).
+        target = leaf.parent.parent
+        assert target.description == "c"
+
+        collected = Planner._collect_nearby_nodes(target, limit=3)
+
+        # "c" itself, then its immediate neighbors (child "d", parent "b") --
+        # order between same-distance neighbors follows children-then-parent,
+        # not semantically meaningful, but the *set* of closest 3 is exact.
+        assert [n.description for n in collected] == ["c", "d", "b"]
+
+    def test_collect_nearby_nodes_includes_siblings_and_ancestors(self):
+        parent = PlanNode(description="parent")
+        target = PlanNode(description="target")
+        sibling = PlanNode(description="sibling")
+        parent.set_children([target, sibling])
+        grandparent = PlanNode(description="grandparent")
+        grandparent.set_children([parent])
+
+        collected = Planner._collect_nearby_nodes(target, limit=40)
+
+        assert {n.description for n in collected} == {
+            "target",
+            "parent",
+            "sibling",
+            "grandparent",
+        }
+
+    def test_render_nearby_tree_marks_the_checked_node(self):
+        parent = PlanNode(description="List current directory contents")
+        target = PlanNode(description="ls")
+        parent.set_children([target])
+
+        nearby = Planner._collect_nearby_nodes(target, limit=40)
+        rendered = Planner._render_nearby_tree(target, nearby)
+
+        assert "List current directory contents" in rendered
+        assert "ls  <-- the step being checked" in rendered
+
+    def test_render_nearby_tree_shows_root_as_overall_task(self):
+        root, target = self._chain("only step")
+
+        nearby = Planner._collect_nearby_nodes(target, limit=40)
+        rendered = Planner._render_nearby_tree(target, nearby)
+
+        assert "(overall task)" in rendered
+        assert "root" not in rendered.replace("(overall task)", "")
+
+    @pytest.mark.asyncio
+    async def test_check_atomicity_prompt_includes_nearby_structure(self):
+        """End-to-end: a leaf's sibling must actually show up in the prompt
+        text sent to the atomicity-check LLM call, not just in the internal
+        tree-context string that never reaches the model."""
+        root_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps(["List current directory contents", "ls"]),
+            )
+        )
+        atomicity_response = CompletionResponse(
+            message=Message(role=Role.assistant, content="VERDICT: ATOMIC\nREASON: fine"),
+        )
+        mock_complete = AsyncMock(
+            side_effect=[root_response, atomicity_response, atomicity_response]
+        )
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        await planner.generate_plan("Explore the workspace")
+
+        # The second call checks "List current directory contents"; its
+        # sibling "ls" should be visible in that call's prompt.
+        second_call_content = mock_complete.await_args_list[1].args[0].messages[0].content
+        assert "List current directory contents" in second_call_content
+        assert "ls" in second_call_content
+
+
+class TestSingleChildBreakdownGuard:
+    """A breakdown call for an atomicity-reclassified node that produces
+    only one child is not a real decomposition -- that child is forced to
+    stay a leaf instead of being sent through another atomicity check,
+    which previously oscillated forever (a flagged node's breakdown kept
+    regenerating a single reworded paraphrase of itself, re-flagged every
+    time). An *explicitly* branch-tagged step (the generation call's own
+    "type": "branch", not an atomicity reclassification) is trusted as-is
+    even if its own breakdown also yields exactly one child -- that case is
+    covered by TestGeneratePlan's existing multi-level recursion tests."""
+
+    @pytest.mark.asyncio
+    async def test_reclassified_node_with_single_child_breakdown_stays_bounded(self, monkeypatch):
+        async def fake_atomicity(self, goal, step, tree_context):
+            # Every leaf looks like it bundles too much, so every leaf gets
+            # reclassified -- the guard, not the check itself, must be what
+            # stops this from recursing forever.
+            return True, "bundles multiple concerns"
+
+        monkeypatch.setattr(Planner, "_check_atomicity", fake_atomicity)
+
+        root_response = CompletionResponse(
+            message=Message(role=Role.assistant, content=json.dumps(["Do a big thing"])),
+        )
+        # Every subsequent expansion call also returns exactly one
+        # (reworded) child -- the failure pattern actually observed.
+        breakdown_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant, content=json.dumps(["Do a slightly different big thing"])
+            ),
+        )
+        mock_complete = AsyncMock(side_effect=[root_response, breakdown_response])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = await planner.generate_plan("Some overall goal")
+
+        # Exactly 2 calls: the root's own generation, then the one
+        # breakdown of the reclassified leaf. No third call -- the
+        # guard stopped the resulting single child from being
+        # atomicity-checked (and thus re-flagged) again.
+        assert mock_complete.await_count == 2
+        node = plan.steps[0]
+        assert not node.is_leaf
+        grandchild = node.children[0]
+        assert grandchild.description == "Do a slightly different big thing"
+        assert grandchild.is_leaf
+
+    @pytest.mark.asyncio
+    async def test_explicit_branch_with_single_child_is_still_trusted(self):
+        """Mirrors TestGeneratePlan.test_branch_child_is_recursively_expanded
+        but with only one item in the branch's own breakdown -- an
+        explicitly-tagged branch is trusted even when its breakdown yields
+        just one child, unlike an atomicity-reclassified one."""
+        root_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps(
+                    [{"description": "Implement the scheduler module", "type": "branch"}]
+                ),
+            )
+        )
+        branch_response = CompletionResponse(
+            message=Message(role=Role.assistant, content=json.dumps(["Write scheduler.py"])),
+        )
+        atomicity_response = CompletionResponse(
+            message=Message(role=Role.assistant, content="VERDICT: ATOMIC\nREASON: fine"),
+        )
+        mock_complete = AsyncMock(
+            side_effect=[root_response, branch_response, atomicity_response]
+        )
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = await planner.generate_plan("Build a task scheduler")
+
+        # 3 calls: root generation, the explicit branch's own breakdown
+        # (yielding one child), and the atomicity check on that child --
+        # unlike the reclassified case, this child's parent was never
+        # itself reclassified, so _classify_children still runs normally.
+        assert mock_complete.await_count == 3
+        branch = plan.steps[0]
+        assert not branch.is_leaf
+        assert [c.description for c in branch.children] == ["Write scheduler.py"]
 
 
 class TestUpdatePlan:
@@ -901,7 +1233,8 @@ class TestReplanSubtree:
         assert [c.description for c in target.children] == ["Fixed part"]
 
     @pytest.mark.asyncio
-    async def test_sends_ancestor_chain_and_failure_context(self):
+    async def test_sends_ancestor_chain_and_failure_context(self, monkeypatch):
+        monkeypatch.setattr(Planner, "_check_atomicity", AsyncMock(return_value=(False, "")))
         mock_complete = AsyncMock(return_value=CompletionResponse(
             message=Message(role=Role.assistant, content='["Fixed sub-step"]'),
         ))
@@ -1165,7 +1498,10 @@ class TestUsageCallback:
 
         await planner.generate_plan("Do the thing")
 
-        assert received == [(30, 5)]
+        # One completion for the expansion call, one for the atomicity check
+        # on its single leaf child -- both go through _complete, so both
+        # report usage.
+        assert received == [(30, 5), (30, 5)]
 
     @pytest.mark.asyncio
     async def test_verify_step_reports_usage(self):

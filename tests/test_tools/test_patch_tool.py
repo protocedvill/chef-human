@@ -61,7 +61,16 @@ class TestApplyPatch:
         old = "a\nb\n"
         patch_lines = ["@@ -2,0 +2,1 @@", "+inserted\n"]
         result = _apply_patch(old, "\n".join(patch_lines))
-        assert result is not None
+        # old_start=2, old_count=0 means "insert after old line 2" (unified
+        # diff convention, verified against `diff -U0`'s real output) --
+        # the inserted line must land *after* "b", not before it.
+        assert result == "a\nb\ninserted\n"
+
+    def test_insertion_hunk_at_start_of_file(self):
+        old = "a\nb\n"
+        patch_lines = ["@@ -0,0 +1,1 @@", "+inserted\n"]
+        result = _apply_patch(old, "\n".join(patch_lines))
+        assert result == "inserted\na\nb\n"
 
     def test_patch_no_changes(self):
         old = "a\nb\nc\n"

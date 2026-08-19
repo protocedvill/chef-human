@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from chef_human.tools.fsutil import atomic_write_text
+from chef_human.tools.fsutil import set_file_content
 from chef_human.tools.diff import FileChange, RedoEntry
 from chef_human.tools.registry import ToolResult
 
@@ -41,7 +41,7 @@ class UndoTool:
         changes = entry.changes or (
             FileChange(entry.path, entry.old_content, entry.new_content),
         )
-        error = self._apply_atomically(changes, use_new=False)
+        error = self._apply_atomically(changes)
         if error is not None:
             self._store.push_entry(entry)
             return ToolResult(success=False, error=error)
@@ -74,9 +74,11 @@ class UndoTool:
 
         return ToolResult(output="\n".join(output_parts))
 
-    def _apply_atomically(
-        self, changes: tuple[FileChange, ...], *, use_new: bool
-    ) -> str | None:
+    def _apply_atomically(self, changes: tuple[FileChange, ...]) -> str | None:
+        # No use_new toggle -- undo only ever restores old_content (that's
+        # its whole job; redo.py's own _apply_atomically covers the
+        # opposite direction). A prior version of this method carried a
+        # use_new parameter that was always passed False by its one caller.
         snapshots: dict[Path, str | None] = {}
         try:
             for change in changes:
@@ -89,21 +91,12 @@ class UndoTool:
                     snapshots[resolved] = (
                         resolved.read_text(encoding="utf-8") if resolved.exists() else None
                     )
-                content = change.new_content if use_new else change.old_content
-                if content is None:
-                    resolved.unlink(missing_ok=True)
-                else:
-                    resolved.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_write_text(resolved, content)
+                set_file_content(resolved, change.old_content)
         except Exception as exc:
             rollback_errors: list[str] = []
             for resolved, content in snapshots.items():
                 try:
-                    if content is None:
-                        resolved.unlink(missing_ok=True)
-                    else:
-                        resolved.parent.mkdir(parents=True, exist_ok=True)
-                        atomic_write_text(resolved, content)
+                    set_file_content(resolved, content)
                 except Exception as rollback_exc:
                     rollback_errors.append(f"{resolved}: {rollback_exc}")
             if rollback_errors:

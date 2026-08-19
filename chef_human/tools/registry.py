@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import Any, Protocol
 
 from chef_human.llm.backend import ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -70,7 +73,22 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
 
 
 def get_tool_policy(name: str) -> ToolPolicy:
-    return TOOL_POLICIES.get(name, ToolPolicy())
+    policy = TOOL_POLICIES.get(name)
+    if policy is None:
+        # A tool with no policy entry gets treated as non-mutating for step-
+        # verification purposes (see ReActLoop's deterministic guards) --
+        # not a security bypass (WorkspaceManager, not this policy, is what
+        # actually enforces file-access boundaries), but a real developer
+        # trap: add a new mutating tool and forget its TOOL_POLICIES entry,
+        # and the step verifier silently stops recognizing its writes as
+        # evidence. Logging makes that omission visible instead of silent.
+        logger.warning(
+            "No ToolPolicy registered for tool %r -- defaulting to non-mutating. "
+            "Add an entry to TOOL_POLICIES if this tool reads or writes files.",
+            name,
+        )
+        return ToolPolicy()
+    return policy
 
 
 class Tool(Protocol):

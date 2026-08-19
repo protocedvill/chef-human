@@ -59,10 +59,15 @@ def _apply_patch(file_content: str, patch_text: str, reverse: bool = False) -> s
             )
 
         if old_count == 0:
-            # Insertion: no old lines to match
-            insert_pos = old_start - 1  # 0-indexed
-            if insert_pos < 0:
-                insert_pos = 0
+            # Insertion: no old lines to match. Unified-diff convention for
+            # a pure insertion is old_start = the (1-indexed) old-file line
+            # number *after* which to insert (e.g. "@@ -2,0 +3 @@" inserts
+            # after old line 2); old_start=0 means "insert at the very
+            # start of the file, before line 1". So the 0-indexed insertion
+            # point is old_start itself, not old_start - 1 -- the previous
+            # `old_start - 1` put every insertion one line too early
+            # (verified against `diff -U0`'s actual output for this case).
+            insert_pos = max(0, old_start)
             stripped = [_strip_prefix(line) for line in new_lines]
             lines[insert_pos:insert_pos] = stripped
             continue

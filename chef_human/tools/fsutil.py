@@ -15,6 +15,20 @@ def count_lines(content: str) -> int:
     return content.count("\n") + (0 if content.endswith("\n") else 1)
 
 
+def set_file_content(path: Path, content: str | None, encoding: str = "utf-8") -> None:
+    """Set `path`'s content to `content`, or delete it if `content` is None.
+
+    This "apply a snapshot" primitive is what both undo.py and redo.py need
+    twice each: once to apply the target state, once to restore a snapshot
+    on rollback if applying fails partway through a transaction. The two
+    call sites were previously identical copy-pasted blocks."""
+    if content is None:
+        path.unlink(missing_ok=True)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, content)
+
+
 def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
     """Write `content` to `path` without ever leaving a truncated/partial file on disk.
 

@@ -118,10 +118,18 @@ class RefactorTool:
                 fp = str(entry.file_path)
                 if fp not in seen:
                     seen.add(fp)
-                    files_to_rename.append(self._workspace.resolve(fp))
+                    resolved_fp = self._workspace.resolve(fp)
+                    if self._workspace.is_within_workspace(resolved_fp):
+                        files_to_rename.append(resolved_fp)
 
             if scope == "all":
-                # Add dependent files via dependency graph
+                # Add dependent files via dependency graph. Symbol-index and
+                # dep-graph entries are themselves built only from files the
+                # workspace already discovered (SymbolIndex/DependencyGraph
+                # are seeded from WorkspaceManager.list_files), so this
+                # boundary check should never actually reject anything in
+                # practice -- it's defense-in-depth for consistency with
+                # scope='file' above, which does check explicitly.
                 if self._dep_graph is not None:
                     for entry in entries:
                         try:
@@ -130,7 +138,8 @@ class RefactorTool:
                                 ds = str(d)
                                 if ds not in seen:
                                     seen.add(ds)
-                                    files_to_rename.append(d)
+                                    if self._workspace.is_within_workspace(d):
+                                        files_to_rename.append(d)
                         except Exception:
                             continue
 
@@ -139,7 +148,8 @@ class RefactorTool:
                 for f in grep_files:
                     if str(f) not in seen:
                         seen.add(str(f))
-                        files_to_rename.append(f)
+                        if self._workspace.is_within_workspace(f):
+                            files_to_rename.append(f)
 
         if len(files_to_rename) > _MAX_RENAME_FILES:
             return ToolResult(

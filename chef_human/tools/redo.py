@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from chef_human.tools.fsutil import atomic_write_text
+from chef_human.tools.fsutil import set_file_content
 from chef_human.tools.diff import DiffEntry, FileChange, compute_diff
 from chef_human.tools.registry import ToolResult
 
@@ -80,20 +80,12 @@ class RedoTool:
                     snapshots[resolved] = (
                         resolved.read_text(encoding="utf-8") if resolved.exists() else None
                     )
-                if change.new_content is None:
-                    resolved.unlink(missing_ok=True)
-                else:
-                    resolved.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_write_text(resolved, change.new_content)
+                set_file_content(resolved, change.new_content)
         except Exception as exc:
             rollback_errors: list[str] = []
             for resolved, content in snapshots.items():
                 try:
-                    if content is None:
-                        resolved.unlink(missing_ok=True)
-                    else:
-                        resolved.parent.mkdir(parents=True, exist_ok=True)
-                        atomic_write_text(resolved, content)
+                    set_file_content(resolved, content)
                 except Exception as rollback_exc:
                     rollback_errors.append(f"{resolved}: {rollback_exc}")
             if rollback_errors:

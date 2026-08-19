@@ -36,8 +36,8 @@ class TestLintFixTool:
     async def test_non_python_file(self, tool: LintFixTool, tmp_path: Path):
         create_file(tmp_path, "test.js", "var x = 1;")
         result = await tool.run(path=str(tmp_path / "test.js"))
-        assert result.success
-        assert "No supported linter" in result.output
+        assert not result.success
+        assert "No supported linter" in result.error
 
     async def test_ruff_not_available(self, tool: LintFixTool, tmp_path: Path):
         create_file(tmp_path, "test.py", "import os\n")

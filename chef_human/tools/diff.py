@@ -52,8 +52,11 @@ def find_closest_match(
 
     Uses a windowed strategy: for every line in content that shares a common
     substring with old_string's first content line, extract a window of
-    old_string's line count + 5 lines and score it with SequenceMatcher.
-    Returns the best match above min_ratio, or None.
+    exactly old_string's line count and score it with SequenceMatcher.
+    Returns the best match above min_ratio, or None. Windows near the end
+    of content that would run short are shifted back to stay full-length,
+    so multiple anchor candidates near EOF can end up scoring the same
+    trailing window -- redundant but not incorrect.
     """
     if not old_string or not content:
         return None

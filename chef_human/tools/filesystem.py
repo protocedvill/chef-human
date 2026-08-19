@@ -40,14 +40,19 @@ class ReadTool:
     async def run(self, path: str, offset: int = 1, limit: int | None = None) -> ToolResult:
         resolved = self._workspace.resolve(path)
 
+        # Check workspace membership before touching the filesystem at all --
+        # exists()/is_file() are themselves stat calls that would otherwise
+        # leak a bit of information about paths outside the workspace (e.g.
+        # "File not found" vs "Not a file" distinguishes existence) before
+        # the boundary check gets a chance to reject the path outright.
+        if not self._workspace.is_within_workspace(resolved):
+            return ToolResult(success=False, error=f"Outside workspace: {path}")
+
         if not resolved.exists():
             return ToolResult(success=False, error=f"File not found: {path}")
 
         if not resolved.is_file():
             return ToolResult(success=False, error=f"Not a file: {path}")
-
-        if not self._workspace.is_within_workspace(resolved):
-            return ToolResult(success=False, error=f"Outside workspace: {path}")
 
         try:
             text = resolved.read_text(encoding="utf-8", errors="replace")
@@ -178,6 +183,15 @@ class EditTool:
             self._file_context.remember(path, content)
         return None
 
+    def _record_diff(self, path: str, diff: str, old_content: str, new_content: str) -> None:
+        """Record a non-empty diff to the shared DiffStore. Both the
+        old_string="" branch and the main replace branch computed and
+        conditionally recorded a diff identically; this is the common part
+        (each branch still builds its own diff/output text beforehand,
+        since that wording genuinely differs)."""
+        if diff and self._diff_store:
+            self._diff_store.record(path, diff, "edit", old_content=old_content, new_content=new_content)
+
     async def run(
         self,
         path: str,
@@ -243,8 +257,7 @@ class EditTool:
             diff = compute_diff(old_content, new_content, path=path)
             if diff:
                 output_parts.append(diff)
-                if self._diff_store:
-                    self._diff_store.record(path, diff, "edit", old_content=old_content, new_content=new_content)
+                self._record_diff(path, diff, old_content, new_content)
             return ToolResult(output="\n".join(output_parts))
 
         matched_old = old_string
@@ -267,10 +280,15 @@ class EditTool:
                 f"lines {match.start_line}-{match.end_line}).\n"
             )
 
-        count = old_content.count(matched_old)
         if replace_all:
+            count = old_content.count(matched_old)
             new_content = old_content.replace(matched_old, new_string)
         else:
+            # Only one occurrence is actually replaced in this branch --
+            # report 1, not the total occurrence count in the file (that
+            # previously misreported "replaced N occurrences" when only
+            # the first one was touched).
+            count = 1
             new_content = old_content.replace(matched_old, new_string, 1)
 
         error = self._write_and_remember(resolved, path, new_content)
@@ -306,8 +324,7 @@ class EditTool:
 
         if diff:
             output_parts.append(diff)
-            if self._diff_store:
-                self._diff_store.record(path, diff, "edit", old_content=old_content, new_content=new_content)
+            self._record_diff(path, diff, old_content, new_content)
 
         return ToolResult(output="\n".join(output_parts))
 
@@ -449,8 +466,18 @@ class GlobTool:
         if not self._workspace.is_within_workspace(base):
             return ToolResult(success=False, error=f"Outside workspace: {path or str(base)}")
 
+        try:
+            # Path.rglob("") raises ValueError as of Python 3.13 (this
+            # project supports up to 3.13, per pyproject.toml) -- doesn't
+            # reproduce on 3.12, but a bad/empty pattern should be a clean
+            # tool error either way, not an unhandled crash on whichever
+            # interpreter happens to enforce it.
+            entries = sorted(base.rglob(pattern))
+        except ValueError as exc:
+            return ToolResult(success=False, error=f"Invalid glob pattern {pattern!r}: {exc}")
+
         results: list[str] = []
-        for entry in sorted(base.rglob(pattern)):
+        for entry in entries:
             if not entry.is_file() or self._workspace.is_ignored(entry):
                 continue
             # rglob follows symlinks; a symlink inside the workspace can
@@ -492,6 +519,9 @@ class LsTool:
 
         if not self._workspace.is_within_workspace(base):
             return ToolResult(success=False, error=f"Outside workspace: {path or str(base)}")
+
+        if not base.is_dir():
+            return ToolResult(success=False, error=f"Not a directory: {path or str(base)}")
 
         try:
             entries = sorted(base.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))

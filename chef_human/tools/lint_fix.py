@@ -64,7 +64,14 @@ class LintFixTool:
         linter = _detect_linter(str(target))
         if linter is None:
             ext = target.suffix if target.is_file() else "files in " + str(target)
-            return ToolResult(output=f"No supported linter for {ext}.")
+            # success=False, not the default True -- this means "lint_fix
+            # could not run at all", a distinct outcome from "ran and found
+            # nothing to fix" (see the check_only/no-issues branch below).
+            # Reporting it as success would let a step verifier read "no
+            # supported linter" as "lint step complete, nothing wrong".
+            return ToolResult(
+                success=False, error=f"No supported linter for {ext}."
+            )
 
         if linter == "ruff":
             return await self._run_ruff(target, check_only, select)

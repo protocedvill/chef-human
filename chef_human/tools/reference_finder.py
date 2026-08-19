@@ -85,7 +85,11 @@ class ReferenceFinderTool:
                 output_parts.append(f"    {self._workspace.relative_display(f)}")
 
         if all_refs:
-            refs_shown = all_refs[: max_results - len(all_defs)]
+            # max(0, ...) matters when len(all_defs) > max_results: a bare
+            # negative slice stop (e.g. [:-2]) would drop elements from the
+            # *end* of all_refs instead of showing none, which silently
+            # returned wrong references instead of just capping at zero.
+            refs_shown = all_refs[: max(0, max_results - len(all_defs))]
             output_parts.append(
                 f"\n  **References ({len(all_refs)}):**"
             )

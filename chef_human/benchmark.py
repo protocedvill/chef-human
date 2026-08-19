@@ -749,8 +749,19 @@ CASES: tuple[BenchmarkCase, ...] = (
             # failure it was built to catch: did the agent do *anything*
             # beyond reading/exploring the repo? A real git worktree makes
             # this a one-line check: `git status --porcelain` is empty iff
-            # nothing was created or modified.
-            command=("sh", "-c", 'test -n "$(git status --porcelain)"'),
+            # nothing was created or modified. The pathspec exclude is load-
+            # bearing, not cosmetic -- .chef-human/ (this harness's own log/
+            # session directory, seeded into the workspace before the agent
+            # runs) is untracked by the target repo's git, so plain `git
+            # status --porcelain` is *always* non-empty regardless of what
+            # the agent did. Confirmed the hard way: an agent run that
+            # generated zero plan steps still reported PASS under the
+            # unfiltered command.
+            command=(
+                "sh",
+                "-c",
+                'test -n "$(git status --porcelain -- . \':(exclude).chef-human\')"',
+            ),
             timeout_seconds=15,
         ),
         max_steps=40,

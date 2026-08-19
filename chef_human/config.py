@@ -39,6 +39,30 @@ class Settings:
     watch_interval: float = 2.0
     tool_timeout: float = 60.0
 
+    @property
+    def effective_max_response_tokens(self) -> int:
+        """max_response_tokens, scaled up under think mode.
+
+        Every consumer of a response-token budget (ReActConfig's per-turn
+        completion cap, and ContextConfig's own reserved headroom when
+        deciding how much conversation history it can pack into the prompt)
+        must derive this the same way. They used to compute the think-mode
+        multiplier independently -- create_agent() applied it to
+        ReActConfig, but create_context_assembler() built ContextConfig
+        straight from the raw max_response_tokens, so under think mode the
+        context assembler kept trimming to leave only the *unscaled* amount
+        of headroom while the real request asked Ollama for up to 4x that
+        many response tokens. Prompt + response could then together exceed
+        the model's actual context window, truncating a native tool_calls
+        response mid-JSON -- which Ollama's own template parser doesn't
+        handle gracefully (hard 500, "tool call parsing failed error=EOF"),
+        rather than max_tokens simply capping generation early. Observed
+        live: prompt_tokens climbed to 31917 of a 32768-token window,
+        leaving only 851 tokens of real headroom for a response the context
+        budget thought it had reserved 4096 for.
+        """
+        return self.max_response_tokens * (4 if self.ollama_think else 1)
+
 
 _ENV_PREFIX = "CHEF_"
 

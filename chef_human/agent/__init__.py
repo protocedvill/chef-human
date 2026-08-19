@@ -142,7 +142,7 @@ def create_context_assembler(
     workspace = WorkspaceManager(root=root)
     context_config = ContextConfig(
         max_tokens=cfg.max_context_tokens,
-        max_response_tokens=cfg.max_response_tokens,
+        max_response_tokens=cfg.effective_max_response_tokens,
     )
     conversation = ContextManager(config=context_config, tokenizer=tokenizer)
     file_ctx = FileContextManager(
@@ -215,11 +215,14 @@ def create_agent(
     # pattern already hit planning/verification calls (see
     # docs/adr/0001-evidence-carry-forward-across-whole-plan-replan.md's
     # sibling fixes); this covers the main execution loop's own calls.
-    max_tokens = cfg.max_response_tokens * (4 if cfg.ollama_think else 1)
+    # Must use the same effective_max_response_tokens value that
+    # create_context_assembler() above already used for ContextConfig's
+    # reserved headroom -- see that property's docstring for why a second,
+    # independently-computed multiplier here caused a real crash.
     react_config = ReActConfig(
         max_steps=max_steps,
         tool_timeout=cfg.tool_timeout,
-        max_tokens_per_response=max_tokens,
+        max_tokens_per_response=cfg.effective_max_response_tokens,
     )
 
     loop = ReActLoop(

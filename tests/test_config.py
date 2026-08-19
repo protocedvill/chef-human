@@ -31,6 +31,23 @@ class TestSettings:
         assert s.watch_interval == 2.0
         assert s.rag_enabled is False
 
+    def test_effective_max_response_tokens_unscaled_without_think(self):
+        s = Settings(max_response_tokens=4096, ollama_think=False)
+        assert s.effective_max_response_tokens == 4096
+
+    def test_effective_max_response_tokens_scaled_4x_under_think(self):
+        """Every consumer of a response-token budget (ReActConfig's
+        max_tokens_per_response, and ContextConfig's reserved headroom) must
+        derive this identically -- they used to compute the think-mode
+        multiplier independently, and ContextConfig's copy fell out of sync,
+        letting prompt+response together exceed the model's real context
+        window and crash Ollama's own tool-call parser mid-JSON."""
+        s = Settings(max_response_tokens=4096, ollama_think=True)
+        assert s.effective_max_response_tokens == 16384
+
+        s_low = Settings(max_response_tokens=4096, ollama_think="low")
+        assert s_low.effective_max_response_tokens == 16384
+
     def test_frozen(self):
         s = Settings()
         with pytest.raises(AttributeError):

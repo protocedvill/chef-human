@@ -10,7 +10,7 @@ from typing import Any, Literal, cast
 @dataclass(frozen=True)
 class Settings:
     llm_backend: Literal["ollama", "llamacpp"] = "ollama"
-    ollama_model: str = "qwen2.5-coder:7b"
+    ollama_model: str = "qwen3.6:35b-a3b"
     ollama_host: str = "http://localhost:11434"
     ollama_think: bool | Literal["low", "medium", "high"] = False
     llamacpp_model_path: str | None = None

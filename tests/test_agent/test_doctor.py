@@ -12,7 +12,7 @@ def _ok_probes(**overrides) -> DoctorProbes:
         workspace_writable=lambda path: True,
         git_present=lambda path: True,
         module_available=lambda name: True,
-        ollama_list=lambda host: ["qwen2.5-coder:7b"],
+        ollama_list=lambda host: ["qwen3.6:35b-a3b"],
     )
     defaults.update(overrides)
     return DoctorProbes(**defaults)

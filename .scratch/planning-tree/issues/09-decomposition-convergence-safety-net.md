@@ -8,9 +8,9 @@ notion of "failure," it's a distinct phase from execution).
 
 **Blocked by:** 02 (Multi-level decomposition)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Generation tracks expansion depth and/or node count per subtree as it decomposes
-- [ ] A warning is logged when a subtree's decomposition crosses a defined threshold without converging to leaves
-- [ ] No generation behavior changes as a result of crossing the threshold — no forced leaf, no hard stop
-- [ ] This tracking is independent of `RetryManager` — it does not consume or affect any per-node retry/replan counters
+- [x] Generation tracks expansion depth and/or node count per subtree as it decomposes
+- [x] A warning is logged when a subtree's decomposition crosses a defined threshold without converging to leaves
+- [x] No generation behavior changes as a result of crossing the threshold — no forced leaf, no hard stop
+- [x] This tracking is independent of `RetryManager` — it does not consume or affect any per-node retry/replan counters

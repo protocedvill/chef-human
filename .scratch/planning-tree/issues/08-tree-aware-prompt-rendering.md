@@ -14,9 +14,9 @@ today's `format_plan_for_prompt` being called fresh every turn.
 
 **Blocked by:** 02 (Multi-level decomposition)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The main-loop prompt shows the active path (current leaf + ancestors + their siblings) in full detail
-- [ ] Every subtree not on the active path collapses to one line, regardless of completed-vs-pending status
-- [ ] The render is recomputed fresh each turn, reflecting the tree's current mutated state (completions, replans, rollup results)
-- [ ] A deep tree (e.g. produced by the `marathon` benchmark case) produces a bounded-size render rather than growing unbounded with tree size
+- [x] The main-loop prompt shows the active path (current leaf + ancestors + their siblings) in full detail
+- [x] Every subtree not on the active path collapses to one line, regardless of completed-vs-pending status
+- [x] The render is recomputed fresh each turn, reflecting the tree's current mutated state (completions, replans, rollup results)
+- [x] A deep tree (e.g. produced by the `marathon` benchmark case) produces a bounded-size render rather than growing unbounded with tree size

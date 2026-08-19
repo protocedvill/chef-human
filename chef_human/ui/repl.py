@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 from rich.prompt import Prompt
 
-from chef_human.ui.protocol import ask_via_stdin
+from chef_human.ui.protocol import PlanReviewAction, ask_via_stdin, review_plan_via_stdin
 
 if TYPE_CHECKING:
     from chef_human.agent.parser import ParsedToolCall
@@ -95,6 +95,9 @@ class ReplUI:
 
     async def on_approval_request(self, tool_call: ParsedToolCall) -> bool | None:
         return None
+
+    async def on_plan_review(self, plan: Plan) -> PlanReviewAction:
+        return await review_plan_via_stdin(plan)
 
     def display_result(self, result: AgentResult) -> None:
         status = "[bold green]✓ Success[/]" if result.success else "[bold red]✗ Failed[/]"

@@ -47,6 +47,43 @@ class StepVerdict(str, Enum):
     not_complete = "not_complete"
 
 
+class _ConvergenceTracker:
+    """Purely observational per-subtree instrumentation for decomposition
+    that isn't converging to leaves quickly. Tracks max expansion depth and
+    total node count reached while generating one subtree (one
+    `generate_plan`/`replan_subtree` call) and logs a single warning the
+    first time either crosses its threshold -- never stops or alters
+    generation, and is entirely separate from `RetryManager`'s per-node
+    failure/replan counters (decomposition has no notion of "failure")."""
+
+    def __init__(self, subtree_label: str) -> None:
+        self._subtree_label = subtree_label
+        self._max_depth = 0
+        self._node_count = 0
+        self._warned = False
+
+    def record(self, *, depth: int, new_nodes: int) -> None:
+        self._max_depth = max(self._max_depth, depth)
+        self._node_count += new_nodes
+        if self._warned:
+            return
+        if (
+            self._max_depth >= Planner._SLOW_CONVERGENCE_DEPTH
+            or self._node_count >= Planner._SLOW_CONVERGENCE_NODE_COUNT
+        ):
+            self._warned = True
+            logger.warning(
+                "Decomposition of subtree %r has not converged to leaves after "
+                "depth=%d, node_count=%d (thresholds: depth>=%d, nodes>=%d) -- "
+                "generation is continuing unmodified; this is observational only.",
+                self._subtree_label,
+                self._max_depth,
+                self._node_count,
+                Planner._SLOW_CONVERGENCE_DEPTH,
+                Planner._SLOW_CONVERGENCE_NODE_COUNT,
+            )
+
+
 @dataclass
 class PlanNode:
     """A node in a recursive plan tree.
@@ -91,6 +128,12 @@ class PlanNode:
     # each child's verdict/reason as supporting context. Not identity, not
     # persisted.
     last_verdict_reason: str = field(default="", repr=False, compare=False)
+    # Generation-time hint (like `requested_branch`, not identity, not
+    # persisted): the planner marked this node as one it was uncertain how
+    # to decompose. Surfaced inline in the pre-execution whole-tree review
+    # pass (ticket 07) so a human reviewer knows where to look; cleared when
+    # a review action resolves the node (edit, mark-as-leaf, redecompose).
+    flagged: bool = field(default=False, repr=False, compare=False)
 
     @property
     def is_leaf(self) -> bool:
@@ -242,6 +285,16 @@ class Plan:
 class Planner:
     """Generates and updates structured plans for the ReAct loop."""
 
+    # Purely observational: a subtree that keeps requesting further
+    # decomposition past this many expansion levels (or this many
+    # descendant nodes) is logged as slow-converging. Never changes
+    # generation behavior -- no forced leaf, no hard stop -- and is
+    # deliberately independent of RetryManager's per-node failure/replan
+    # counters, since decomposition has no notion of "failure" and is a
+    # distinct phase from execution.
+    _SLOW_CONVERGENCE_DEPTH = 5
+    _SLOW_CONVERGENCE_NODE_COUNT = 25
+
     _STEP_PREFIX_RE = re.compile(r"^step\s+\d+\s*[:.\-]\s*", re.IGNORECASE)
     _FILE_TARGET_RE = re.compile(r"[`'\"]?([\w\-./]+\.\w{1,10})[`'\"]?")
     _ENV_SETUP_RE = re.compile(
@@ -321,6 +374,8 @@ class Planner:
             repo_context=repo_context,
             planning_facts=planning_facts,
             is_root=True,
+            depth=0,
+            convergence=_ConvergenceTracker(subtree_label=task),
         )
         return plan
 
@@ -333,6 +388,8 @@ class Planner:
         repo_context: str,
         planning_facts: dict[str, bool] | None,
         is_root: bool,
+        depth: int,
+        convergence: "_ConvergenceTracker",
     ) -> None:
         """Decompose `node` into its immediate children via one LLM call,
         then recurse into any child the LLM marked as a branch. `ancestors`
@@ -340,7 +397,9 @@ class Planner:
         ancestor to (but not including) `node` itself, so a deeply nested
         expansion call doesn't drift from the overall task. There is no hard
         depth cap here -- convergence relies on the LLM eventually emitting
-        a leaf for every child."""
+        a leaf for every child; `convergence` is purely observational
+        instrumentation logging a warning if that doesn't happen quickly,
+        never a behavior change."""
         messages = self._build_expand_messages(
             task=task,
             repo_context=repo_context,
@@ -358,6 +417,7 @@ class Planner:
             planning_facts=planning_facts,
         )
         node.set_children(children)
+        convergence.record(depth=depth + 1, new_nodes=len(children))
 
         child_ancestors = ancestors if is_root else ancestors + [node.description]
         for child in children:
@@ -369,6 +429,8 @@ class Planner:
                     repo_context=repo_context,
                     planning_facts=planning_facts,
                     is_root=False,
+                    depth=depth + 1,
+                    convergence=convergence,
                 )
 
     @staticmethod
@@ -405,21 +467,33 @@ class Planner:
         return messages
 
     async def replan_subtree(
-        self, plan: Plan, node: PlanNode, failure_context: str
+        self,
+        plan: Plan,
+        node: PlanNode,
+        failure_context: str,
+        *,
+        is_failure: bool = True,
     ) -> None:
-        """Regenerate `node`'s own children in response to a failure --
-        either the leaf itself failing verification, or a branch getting
-        rejected by rollup verification. `node` keeps its own `node_id`
-        (its goal is unchanged, only how to achieve it is reconsidered);
-        only its descendants are discarded and replaced. The replan call
-        only ever sees/produces `node`'s own descendants -- siblings and
-        ancestors elsewhere in the tree are untouched by this call."""
+        """Regenerate `node`'s own children -- either in response to a
+        failure (the leaf itself failing verification, or a branch getting
+        rejected by rollup verification; `is_failure=True`, the default) or
+        proactively, steered by human guidance from the pre-execution
+        whole-tree review pass on a node that was never executed
+        (`is_failure=False`, see `ReActLoop._run_pre_execution_review`'s
+        "redecompose" action) -- the prompt framing differs accordingly so
+        the LLM isn't told a never-run node "failed". `node` keeps its own
+        `node_id` (its goal is unchanged, only how to achieve it is
+        reconsidered); only its descendants are discarded and replaced. The
+        replan call only ever sees/produces `node`'s own descendants --
+        siblings and ancestors elsewhere in the tree are untouched by this
+        call."""
         ancestors = self._ancestor_descriptions(node)
         messages = self._build_replan_messages(
             goal=plan.goal,
             ancestors=ancestors,
             node=node,
             failure_context=failure_context,
+            is_failure=is_failure,
         )
         response = await self._complete(
             CompletionRequest(messages=messages, temperature=0.0, max_tokens=2048),
@@ -429,6 +503,8 @@ class Planner:
             plan.goal, self._parse_steps(response.message.content)
         )
         node.set_children(children)
+        convergence = _ConvergenceTracker(subtree_label=node.description)
+        convergence.record(depth=1, new_nodes=len(children))
 
         child_ancestors = ancestors + [node.description]
         for child in children:
@@ -440,6 +516,8 @@ class Planner:
                     repo_context="",
                     planning_facts=None,
                     is_root=False,
+                    depth=1,
+                    convergence=convergence,
                 )
 
     @staticmethod
@@ -461,14 +539,30 @@ class Planner:
         ancestors: list[str],
         node: PlanNode,
         failure_context: str,
+        is_failure: bool = True,
     ) -> list[Message]:
-        messages = [
-            Message(
-                role=Role.system,
-                content=PLANNER_SYSTEM_PROMPT
-                + "\n\nA part of the plan failed. Revise just this sub-goal's own "
-                "next steps; do not touch anything outside this sub-goal.",
+        if is_failure:
+            system_suffix = (
+                "\n\nA part of the plan failed. Revise just this sub-goal's own "
+                "next steps; do not touch anything outside this sub-goal."
             )
+            situation_line = "This sub-goal needs to be redone (its previous attempt failed):"
+            context_label = "Failure context"
+        else:
+            system_suffix = (
+                "\n\nA human reviewer wants this sub-goal decomposed differently before "
+                "execution starts (it has not been attempted yet -- nothing failed). "
+                "Revise just this sub-goal's own next steps, steered by their guidance; "
+                "do not touch anything outside this sub-goal."
+            )
+            situation_line = (
+                "This sub-goal has not been executed yet; a human reviewer asked for a "
+                "different decomposition before execution starts:"
+            )
+            context_label = "Reviewer guidance"
+
+        messages = [
+            Message(role=Role.system, content=PLANNER_SYSTEM_PROMPT + system_suffix)
         ]
         chain = "\n".join(f"- {d}" for d in ([goal] + ancestors))
         messages.append(
@@ -477,9 +571,9 @@ class Planner:
                 content=(
                     f"Overall goal: {goal}\n\n"
                     f"Ancestor chain (root goal down to this sub-goal):\n{chain}\n\n"
-                    "This sub-goal needs to be redone (its previous attempt failed):\n"
+                    f"{situation_line}\n"
                     f"{node.description}\n\n"
-                    f"Failure context:\n{failure_context}\n\n"
+                    f"{context_label}:\n{failure_context}\n\n"
                     "Break this sub-goal down into fresh immediate next steps "
                     "(do not re-plan anything outside this sub-goal)."
                 ),
@@ -684,6 +778,7 @@ class Planner:
                     description=description,
                     index=len(normalized) + 1,
                     requested_branch=step.requested_branch,
+                    flagged=step.flagged,
                 )
             )
 
@@ -695,6 +790,7 @@ class Planner:
                 description=cls._clean_description(step.description),
                 index=i + 1,
                 requested_branch=step.requested_branch,
+                flagged=step.flagged,
             )
             for i, step in enumerate(steps)
             if cls._clean_description(step.description)
@@ -760,31 +856,92 @@ class Planner:
                 if isinstance(item, dict):
                     description = self._clean_description(item.get("description", str(item)))
                     requested_branch = str(item.get("type", "leaf")).strip().lower() == "branch"
+                    flagged = bool(item.get("uncertain", False))
                 else:
                     description = self._clean_description(item)
                     requested_branch = False
+                    flagged = False
                 steps.append(
                     PlanNode(
                         description=description,
                         index=i + 1,
                         requested_branch=requested_branch,
+                        flagged=flagged,
                     )
                 )
             return steps
         return [PlanNode(description=self._clean_description(str(data)), index=1)]
 
+    _STATUS_MARKERS = {
+        StepStatus.pending: "[ ]",
+        StepStatus.in_progress: "[→]",
+        StepStatus.completed: "[✓]",
+        StepStatus.failed: "[✗]",
+        StepStatus.skipped: "[-]",
+    }
+
     @staticmethod
-    def format_plan_for_prompt(plan: Plan) -> str:
+    def _active_path_ids(plan: Plan) -> set[str]:
+        """Node ids of the current leaf plus every ancestor up to (and
+        including) the root. Empty once the plan has no current leaf (all
+        steps complete)."""
+        current = plan.current_leaf()
+        if current is None:
+            return set()
+        ids: set[str] = set()
+        node: PlanNode | None = current
+        while node is not None:
+            ids.add(node.node_id)
+            node = node.parent
+        return ids
+
+    @classmethod
+    def format_plan_for_prompt(cls, plan: Plan) -> str:
+        """Tree-aware render for the main-loop prompt: the active path
+        (current leaf + its ancestor chain) is expanded, along with the
+        siblings at each level of that path (shown in full one-line detail
+        but not recursed into) -- every other subtree, completed or not yet
+        reached, collapses to a single line with no descendants shown. Only
+        ever recursing into active-path nodes keeps the render bounded by
+        path depth * branching factor rather than growing with total tree
+        size."""
         lines = ["## Plan", ""]
-        for step in plan.steps:
-            marker = {
-                StepStatus.pending: "[ ]",
-                StepStatus.in_progress: "[→]",
-                StepStatus.completed: "[✓]",
-                StepStatus.failed: "[✗]",
-                StepStatus.skipped: "[-]",
-            }[step.status]
-            lines.append(f"{marker} Step {step.index}: {step.description}")
+        active_path = cls._active_path_ids(plan)
+
+        def render(node: PlanNode, depth: int) -> None:
+            indent = "  " * depth
+            for child in node.children:
+                marker = cls._STATUS_MARKERS[child.status]
+                lines.append(f"{indent}{marker} Step {child.index}: {child.description}")
+                if child.node_id in active_path:
+                    render(child, depth + 1)
+
+        render(plan.root, 0)
+        return "\n".join(lines)
+
+    @classmethod
+    def format_full_tree(cls, plan: Plan) -> str:
+        """Renders the entire plan tree, unabridged, with flagged nodes
+        (`PlanNode.flagged` -- ones the planner was uncertain how to
+        decompose) marked inline rather than listed separately, and each
+        node's `node_id` shown so a reviewer can address it. Used for the
+        one-time pre-execution whole-tree human review pass (ticket 07),
+        never for the bounded per-turn prompt render (`format_plan_for_prompt`
+        above) -- this is only ever called once, before any execution, on a
+        tree that hasn't grown from replans yet."""
+        lines = [f"## Plan: {plan.goal}", ""]
+
+        def render(node: PlanNode, depth: int) -> None:
+            indent = "  " * depth
+            for child in node.children:
+                marker = cls._STATUS_MARKERS[child.status]
+                flag = " ⚑" if child.flagged else ""
+                lines.append(
+                    f"{indent}{marker} [{child.node_id}] {child.description}{flag}"
+                )
+                render(child, depth + 1)
+
+        render(plan.root, 0)
         return "\n".join(lines)
 
     @staticmethod

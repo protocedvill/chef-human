@@ -13,8 +13,13 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DirectoryTree, Footer, Header, Input, Label, RichLog, Static
 
-from chef_human.agent.planner import StepStatus
+from chef_human.agent.planner import Planner, StepStatus
 from chef_human.agent.react_loop import FILE_MUTATING_TOOLS
+from chef_human.ui.protocol import (
+    PLAN_REVIEW_HELP_TEXT,
+    PlanReviewAction,
+    parse_plan_review_command,
+)
 
 if TYPE_CHECKING:
     from chef_human.agent.parser import ParsedToolCall
@@ -258,6 +263,19 @@ class TuiUI:
         answer = await self._app.ask_inline(question)
         self._chat().write(f"[bold cyan]You:[/] {escape(answer)}")
         return answer
+
+    async def on_plan_review(self, plan: "Plan") -> PlanReviewAction:
+        self._chat().write("[bold]Plan review (before execution starts):[/]")
+        for line in Planner.format_full_tree(plan).splitlines():
+            self._chat().write(escape(line))
+        self._chat().write(f"[dim]{escape(PLAN_REVIEW_HELP_TEXT)}[/]")
+        line = (await self._app.ask_inline("Plan review action")).strip()
+        self._chat().write(f"[bold cyan]You:[/] {escape(line) or '(approve)'}")
+
+        action = parse_plan_review_command(line)
+        if action.kind == "noop":
+            self._chat().write(f"[dim]Unrecognized command: {line!r}; leaving the plan unchanged.[/]")
+        return action
 
     def display_result(self, result: "AgentResult") -> None:
         status = "[bold green]✓ Success[/]" if result.success else "[bold red]✗ Failed[/]"

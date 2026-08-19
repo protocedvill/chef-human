@@ -462,6 +462,46 @@ class TestFormatPlanForPrompt:
         assert "[-]" in result
 
 
+class TestFormatPlanForPromptTreeAware:
+    def test_collapses_non_active_siblings_to_one_line(self):
+        root = PlanNode(description="root")
+        leaf_a = PlanNode(index=1, description="Leaf A", status=StepStatus.completed)
+        branch_b = PlanNode(index=2, description="Branch B")
+        leaf_c = PlanNode(index=3, description="Leaf C")
+        root.set_children([leaf_a, branch_b, leaf_c])
+        grandchild_1 = PlanNode(index=1, description="Grandchild 1", status=StepStatus.completed)
+        grandchild_2 = PlanNode(index=2, description="Grandchild 2")
+        branch_b.set_children([grandchild_1, grandchild_2])
+
+        plan = Plan(goal="test", root=root)
+        result = Planner.format_plan_for_prompt(plan)
+
+        # Active path: root -> branch_b -> grandchild_2 (current leaf).
+        assert "Step 2: Branch B" in result
+        assert "Grandchild 1" in result
+        assert "Grandchild 2" in result
+        # Siblings of active-path nodes still get a full one-line entry.
+        assert "Leaf A" in result
+        assert "Leaf C" in result
+
+    def test_deep_subtree_off_path_collapses_without_descendants(self):
+        root = PlanNode(description="root")
+        branch_active = PlanNode(index=1, description="Active branch")
+        branch_other = PlanNode(index=2, description="Other branch")
+        root.set_children([branch_active, branch_other])
+        branch_active.set_children([PlanNode(index=1, description="Pending leaf")])
+        deep_child = PlanNode(index=1, description="Deep hidden leaf")
+        branch_other.set_children([deep_child])
+        deep_child.set_children([PlanNode(index=1, description="Deeper hidden leaf")])
+
+        plan = Plan(goal="test", root=root)
+        result = Planner.format_plan_for_prompt(plan)
+
+        assert "Other branch" in result
+        assert "Deep hidden leaf" not in result
+        assert "Deeper hidden leaf" not in result
+
+
 class TestGeneratePlan:
     @pytest.mark.asyncio
     async def test_basic_generation(self):
@@ -646,6 +686,52 @@ class TestGeneratePlan:
         assert level3_node.description == "Level 3 leaf"
         assert level3_node.is_leaf
         assert plan.current_leaf() is level3_node
+
+    @pytest.mark.asyncio
+    async def test_slow_convergence_logs_warning_without_changing_behavior(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(Planner, "_SLOW_CONVERGENCE_DEPTH", 2)
+        monkeypatch.setattr(Planner, "_SLOW_CONVERGENCE_NODE_COUNT", 999)
+
+        level1 = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps([{"description": "Level 1", "type": "branch"}]),
+            )
+        )
+        level2 = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps([{"description": "Level 2", "type": "branch"}]),
+            )
+        )
+        level3 = CompletionResponse(
+            message=Message(role=Role.assistant, content='["Level 3 leaf"]'),
+        )
+        mock_complete = AsyncMock(side_effect=[level1, level2, level3])
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        with caplog.at_level("WARNING", logger="chef_human.agent.planner"):
+            plan = await planner.generate_plan("Deeply nested task")
+
+        # No behavior change: generation still recursed all the way to a leaf.
+        assert mock_complete.await_count == 3
+        assert plan.steps[0].children[0].children[0].is_leaf
+        assert any("not converged" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_fast_convergence_does_not_warn(self, caplog):
+        mock_llm = _make_mock_backend(
+            [PlanNode(index=1, description="Read"), PlanNode(index=2, description="Write")]
+        )
+        planner = Planner(mock_llm)
+        with caplog.at_level("WARNING", logger="chef_human.agent.planner"):
+            await planner.generate_plan("Fix the bug")
+
+        assert not any("not converged" in record.message for record in caplog.records)
 
     @pytest.mark.asyncio
     async def test_cleanup_filters_apply_per_expansion_call(self):

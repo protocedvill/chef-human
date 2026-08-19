@@ -17,13 +17,13 @@ it.
 
 **Blocked by:** 02 (Multi-level decomposition)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] After generation, interactive mode shows the human the full tree once, before any execution begins
-- [ ] Flagged nodes are marked inline within the full tree view, not shown as an isolated list
-- [ ] The human can approve the tree as-is
-- [ ] The human can edit any node's description before execution starts
-- [ ] The human can mark a flagged (or any) node as a leaf, discarding its children
-- [ ] The human can trigger a guided redecomposition of any branch before execution starts
-- [ ] The human can reject, abandoning the task before any execution happens
-- [ ] Headless/benchmark runs skip this review pass entirely — no blocking on a human that isn't there
+- [x] After generation, interactive mode shows the human the full tree once, before any execution begins
+- [x] Flagged nodes are marked inline within the full tree view, not shown as an isolated list
+- [x] The human can approve the tree as-is
+- [x] The human can edit any node's description before execution starts
+- [x] The human can mark a flagged (or any) node as a leaf, discarding its children
+- [x] The human can trigger a guided redecomposition of any branch before execution starts
+- [x] The human can reject, abandoning the task before any execution happens
+- [x] Headless/benchmark runs skip this review pass entirely — no blocking on a human that isn't there

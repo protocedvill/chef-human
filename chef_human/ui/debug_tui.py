@@ -14,7 +14,12 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.tree import Tree
 
-from chef_human.agent.planner import StepStatus
+from chef_human.agent.planner import Planner, StepStatus
+from chef_human.ui.protocol import (
+    PLAN_REVIEW_HELP_TEXT,
+    PlanReviewAction,
+    parse_plan_review_command,
+)
 
 if TYPE_CHECKING:
     from chef_human.agent.parser import ParsedToolCall
@@ -271,6 +276,21 @@ class DebugTUI:
         self._ensure_live()
         self._check_keys()
         self._log(f"[red]Error: {message}[/]")
+
+    async def on_plan_review(self, plan: Plan) -> PlanReviewAction:
+        self._stop_live()
+        if not sys.stdin.isatty():
+            self._ensure_live()
+            return PlanReviewAction(kind="approve")
+        self.console.print("\n" + Planner.format_full_tree(plan))
+        self.console.print(f"\n[bold]Review the plan above before execution starts.[/] {PLAN_REVIEW_HELP_TEXT}")
+        line = Prompt.ask("> ", default="a")
+        self._ensure_live()
+
+        action = parse_plan_review_command(line)
+        if action.kind == "noop":
+            self.console.print(f"[dim]Unrecognized command: {line!r}; leaving the plan unchanged.[/]")
+        return action
 
     async def on_approval_request(self, tool_call: ParsedToolCall) -> bool:
         self._stop_live()

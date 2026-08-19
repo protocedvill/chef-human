@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -548,6 +549,11 @@ class ReActConfig:
 
 
 class ReActLoop:
+    # Safety cap on `_run_pre_execution_review`'s loop -- see that method's
+    # docstring. A real human reviewer will never hit this; it only bounds
+    # a misbehaving/un-stubbed UI double.
+    _MAX_PLAN_REVIEW_ITERATIONS = 25
+
     def __init__(
         self,
         llm_backend: LLMBackend,
@@ -758,7 +764,76 @@ class ReActLoop:
             len(plan.steps),
             [s.description for s in plan.steps],
         )
+        review_result = await self._run_pre_execution_review(plan)
+        if review_result is not None:
+            return review_result
         return await self._execute(plan, task)
+
+    async def _run_pre_execution_review(self, plan: Plan) -> AgentResult | None:
+        """One-time whole-tree human approval pass, run once after generation
+        and before any execution begins -- distinct from `resolve_escalation`
+        (ticket 06), which acts retroactively on a node mid/post-execution.
+        `self._ui.on_plan_review` defaults (via `review_plan_via_stdin`) to
+        immediate approval whenever stdin isn't a tty, so headless/benchmark
+        runs never block here. Loops so a reviewer can apply several actions
+        (edit/mark-as-leaf/redecompose) before finally approving or
+        rejecting; each loop re-shows the tree reflecting prior edits. Capped
+        at `_MAX_PLAN_REVIEW_ITERATIONS` iterations so a UI double that
+        returns something other than a real `PlanReviewAction` (e.g. an
+        un-stubbed `MagicMock(spec=NoopUI)` in a test, whose `.kind`
+        auto-generates a mock attribute matching nothing below) can't spin
+        this loop forever -- falls back to auto-approve past the cap."""
+        for _ in range(self._MAX_PLAN_REVIEW_ITERATIONS):
+            # Not a bare `await self._ui.on_plan_review(plan)`: many existing
+            # UI test doubles are plain `MagicMock()`/`MagicMock(spec=NoopUI)`
+            # instances that predate this method and return a non-awaitable
+            # `MagicMock` from it -- `isawaitable` lets a real async UI
+            # implementation await normally while a mock double degrades to
+            # treating the call's return value directly as the action (which
+            # the iteration cap above still bounds even when that's nonsense).
+            call_result = self._ui.on_plan_review(plan)
+            action = await call_result if inspect.isawaitable(call_result) else call_result
+            kind = getattr(action, "kind", None) if action is not None else "approve"
+            if kind == "approve":
+                return None
+            if kind == "reject":
+                return self._make_result(
+                    plan=plan,
+                    steps_taken=0,
+                    message="Plan rejected by user before execution began.",
+                    success=False,
+                )
+            if kind not in {"edit", "mark_leaf", "redecompose"}:
+                self._ui.on_error(f"Plan review: unrecognized action {kind!r}")
+                continue
+
+            node_id = getattr(action, "node_id", None)
+            target = plan.find_node(node_id) if node_id else None
+            if target is None:
+                self._ui.on_error(f"Plan review: no node with id {node_id!r} in this plan")
+                continue
+
+            if kind == "edit":
+                description = getattr(action, "description", None)
+                if description:
+                    target.description = description
+                target.flagged = False
+            elif kind == "mark_leaf":
+                target.set_children([])
+                target.flagged = False
+            elif kind == "redecompose":
+                guidance = getattr(action, "guidance", None) or ""
+                await self._planner.replan_subtree(
+                    plan, target, guidance, is_failure=False
+                )
+                target.flagged = False
+
+        logger.warning(
+            "Pre-execution plan review did not resolve to approve/reject after "
+            "%d iterations; auto-approving.",
+            self._MAX_PLAN_REVIEW_ITERATIONS,
+        )
+        return None
 
     async def resolve_escalation(
         self,

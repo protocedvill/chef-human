@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 
 from chef_human.agent.planner import StepStatus
-from chef_human.ui.protocol import ask_via_stdin
+from chef_human.ui.protocol import PlanReviewAction, ask_via_stdin, review_plan_via_stdin
 
 if TYPE_CHECKING:
     from chef_human.agent.parser import ParsedToolCall
@@ -114,3 +114,6 @@ class StreamingUI:
         self, tool_call: ParsedToolCall
     ) -> bool | None:
         return None
+
+    async def on_plan_review(self, plan: Plan) -> PlanReviewAction:
+        return await review_plan_via_stdin(plan)

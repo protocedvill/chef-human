@@ -26,7 +26,7 @@ from chef_human.llm.backend import (
     ToolDefinition,
 )
 from chef_human.tools.registry import ToolRegistry
-from chef_human.ui.protocol import NoopUI
+from chef_human.ui.protocol import NoopUI, PlanReviewAction
 
 
 def _make_mock_backend() -> MagicMock:
@@ -5500,3 +5500,239 @@ class TestResolveEscalationPreservesState:
         )
 
         assert task_message_count() == 1
+
+
+def _make_finishing_tool_registry() -> MagicMock:
+    """A tool registry whose `finish` tool actually succeeds, for review-pass
+    tests that only care about getting past execution, not tool dispatch."""
+    registry = _make_mock_tool_registry()
+    finish_tool = MagicMock()
+    finish_tool.name = "finish"
+    finish_tool.parameters = {"type": "object", "properties": {"summary": {"type": "string"}}}
+    finish_tool.run = AsyncMock(
+        return_value=MagicMock(output="Task complete: done", success=True, error=None)
+    )
+    registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+    return registry
+
+
+class _ScriptedReviewUI(NoopUI):
+    """Test double returning a fixed sequence of `PlanReviewAction`s from
+    `on_plan_review`, one per call -- lets a test script a multi-step
+    pre-execution review (edit, then approve) without touching stdin."""
+
+    def __init__(self, actions: list[PlanReviewAction]) -> None:
+        self._actions = list(actions)
+        self.seen_plans: list[Plan] = []
+
+    async def on_plan_review(self, plan: Plan) -> PlanReviewAction:
+        self.seen_plans.append(plan)
+        return self._actions.pop(0)
+
+
+class TestPreExecutionPlanReview:
+    """Ticket 07: a one-time whole-tree human approval pass after generation,
+    before any execution starts -- distinct from ticket 06's retroactive
+    mid-execution escalation handling."""
+
+    @pytest.mark.asyncio
+    async def test_headless_noop_ui_skips_review_without_blocking(self):
+        finish_call = '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(
+            return_value=CompletionResponse(
+                message=Message(role=Role.assistant, content=finish_call)
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = Plan(goal="Test task", steps=[])
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=_make_finishing_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=4),
+        )
+        result = await loop.run("do something")
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_approve_proceeds_to_execution(self):
+        finish_call = '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(
+            return_value=CompletionResponse(
+                message=Message(role=Role.assistant, content=finish_call)
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = Plan(goal="Test task", steps=[])
+        ui = _ScriptedReviewUI([PlanReviewAction(kind="approve")])
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=_make_finishing_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=4),
+            ui=ui,
+        )
+        result = await loop.run("do something")
+        assert result.success is True
+        assert len(ui.seen_plans) == 1
+
+    @pytest.mark.asyncio
+    async def test_reject_aborts_before_any_execution(self):
+        planner = _make_mock_planner()
+        step_one = PlanNode(index=1, description="Step one")
+        planner.generate_plan.return_value = Plan(goal="Test task", steps=[step_one])
+        backend = _make_mock_backend()
+        ui = _ScriptedReviewUI([PlanReviewAction(kind="reject")])
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=_make_finishing_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=4),
+            ui=ui,
+        )
+        result = await loop.run("do something")
+
+        assert result.success is False
+        assert step_one.status == StepStatus.pending
+        backend.complete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_edit_changes_description_before_execution(self):
+        finish_call = '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(
+            return_value=CompletionResponse(
+                message=Message(role=Role.assistant, content=finish_call)
+            )
+        )
+        planner = _make_mock_planner()
+        step_one = PlanNode(index=1, description="Original description")
+        planner.generate_plan.return_value = Plan(goal="Test task", steps=[step_one])
+        ui = _ScriptedReviewUI(
+            [
+                PlanReviewAction(
+                    kind="edit", node_id=step_one.node_id, description="Edited description"
+                ),
+                PlanReviewAction(kind="approve"),
+            ]
+        )
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=_make_finishing_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=4),
+            ui=ui,
+        )
+        result = await loop.run("do something")
+
+        assert result.success is True
+        assert step_one.description == "Edited description"
+        assert len(ui.seen_plans) == 2
+
+    @pytest.mark.asyncio
+    async def test_mark_leaf_discards_children(self):
+        finish_call = '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(
+            return_value=CompletionResponse(
+                message=Message(role=Role.assistant, content=finish_call)
+            )
+        )
+        planner = _make_mock_planner()
+        branch = PlanNode(index=1, description="Branch goal")
+        branch.set_children([PlanNode(index=1, description="Child")])
+        plan = Plan(goal="Test task", steps=[branch])
+        planner.generate_plan.return_value = plan
+        ui = _ScriptedReviewUI(
+            [
+                PlanReviewAction(kind="mark_leaf", node_id=branch.node_id),
+                PlanReviewAction(kind="approve"),
+            ]
+        )
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=_make_finishing_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=4),
+            ui=ui,
+        )
+        result = await loop.run("do something")
+
+        assert result.success is True
+        assert branch.is_leaf
+
+    @pytest.mark.asyncio
+    async def test_redecompose_calls_planner_replan_subtree(self):
+        finish_call = '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(
+            return_value=CompletionResponse(
+                message=Message(role=Role.assistant, content=finish_call)
+            )
+        )
+        planner = _make_mock_planner()
+        node = PlanNode(index=1, description="Unclear step")
+        plan = Plan(goal="Test task", steps=[node])
+        planner.generate_plan.return_value = plan
+        ui = _ScriptedReviewUI(
+            [
+                PlanReviewAction(kind="redecompose", node_id=node.node_id, guidance="be specific"),
+                PlanReviewAction(kind="approve"),
+            ]
+        )
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=_make_finishing_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=4),
+            ui=ui,
+        )
+        result = await loop.run("do something")
+
+        assert result.success is True
+        planner.replan_subtree.assert_awaited_once_with(
+            plan, node, "be specific", is_failure=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_unresolved_uninterpretable_action_does_not_hang(self):
+        """A UI double that returns something other than a recognized
+        PlanReviewAction kind must not spin the review loop forever --
+        bounded by ReActLoop._MAX_PLAN_REVIEW_ITERATIONS, falling back to
+        auto-approve."""
+        finish_call = '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(
+            return_value=CompletionResponse(
+                message=Message(role=Role.assistant, content=finish_call)
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = Plan(goal="Test task", steps=[])
+        ui = MagicMock(spec=NoopUI)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=_make_finishing_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=4),
+            ui=ui,
+        )
+        result = await loop.run("do something")
+        assert result.success is True
+        assert ui.on_plan_review.await_count == ReActLoop._MAX_PLAN_REVIEW_ITERATIONS

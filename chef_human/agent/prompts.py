@@ -35,6 +35,10 @@ Rules:
   one concrete tool call. Most steps should be leaves; reach for "branch" only for a step whose
   scope clearly doesn't fit in one action, e.g. ["Explore the existing code", {"description":
   "Implement the scheduler module", "type": "branch"}, "Run the tests"]
+- If you are genuinely unsure how a step should be decomposed or approached, add "uncertain": true
+  to that step's object, e.g. {"description": "Decide how limits vary per client", "type": "branch",
+  "uncertain": true} — this surfaces the step for human review before execution starts. Use this
+  sparingly, only for real ambiguity, not as a default.
 - Do NOT include any explanation or markdown — just the JSON array"""
 
 

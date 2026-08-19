@@ -133,6 +133,27 @@ chef-human show-config
 chef-human show-config --config other-config.toml
 ```
 
+### `chef-human doctor`
+
+Preflight check: confirms Python version, config validity, backend reachability, model
+availability, and workspace sanity before you try to run a real task. Prints one `OK`/`WARN`/`FAIL`
+line per check (with a remedy for anything not `OK`) and exits non-zero if not ready.
+
+```bash
+chef-human doctor
+chef-human doctor --workspace ../other-repo
+chef-human doctor --json   # machine-readable report
+```
+
+### `chef-human recommend-model`
+
+Detects local RAM/VRAM and suggests a better-fitting model than your current configuration, if one
+exists, without downloading or switching anything automatically:
+
+```bash
+chef-human recommend-model
+```
+
 ## Programmatic Usage
 
 ### Basic chat

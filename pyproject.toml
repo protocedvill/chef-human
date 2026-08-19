@@ -6,12 +6,28 @@ readme = "README.md"
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.14"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+]
 dependencies = [
     "ollama>=0.3.0",
     "rich>=13.0",
     "click>=8.0",
     "textual>=0.60",
 ]
+
+[project.urls]
+Homepage = "https://github.com/protocedvill/chef-human"
+Repository = "https://github.com/protocedvill/chef-human"
+Changelog = "https://github.com/protocedvill/chef-human/blob/main/CHANGELOG.md"
+Issues = "https://github.com/protocedvill/chef-human/issues"
 
 [project.optional-dependencies]
 llamacpp = [

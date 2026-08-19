@@ -11,11 +11,17 @@ processes. Run it only in a disposable checkout or another sandbox you control.
 
 ```bash
 bash scripts/setup.sh
+chef-human doctor   # confirms Python/config/backend/model/workspace are ready
 ```
 
 ## Documentation
 
 - [Installation](docs/INSTALL.md) — setup, dependencies, troubleshooting
-- [Usage](docs/USAGE.md) — API examples, configuration, testing
+- [Usage](docs/USAGE.md) — CLI commands, API examples, configuration, testing
+- [Architecture](docs/ARCHITECTURE.md) — component boundaries, request sequence, design decisions
+- [Safety](docs/SAFETY.md) — threat model, guardrails, and what they don't cover
+- [Development](docs/DEVELOPMENT.md) — environment setup and everyday dev workflow
+- [Contributing](CONTRIBUTING.md) — scope, PR checklist, what not to do
 - [Testing](docs/TESTING.md) — test taxonomy, optional extras, live-backend checks
 - [Capability benchmark](docs/BENCHMARKS.md) — tiered real-agent tasks with external verification
+- [Changelog](CHANGELOG.md) — release history

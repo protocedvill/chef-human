@@ -8,6 +8,16 @@ chef-human is a local AI software development tool: a ReAct-style coding agent t
 against local LLMs (Ollama or llama.cpp), with its own file tools, symbol index, and RAG retrieval.
 There is no cloud LLM dependency — everything is designed to run on consumer hardware.
 
+## Agent skills
+
+### Issue tracker
+
+Local markdown under `.scratch/<feature>/` (no GitHub remote configured). See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
 Note: `docs/INSTALL.md` and `docs/USAGE.md` are stale (they describe a pre-agent-loop state where
 "the CLI entry point is not yet wired" and tools/agent are "future"). The CLI, agent loop, and tools
 are all implemented — trust the code in `chef_human/` over those docs.

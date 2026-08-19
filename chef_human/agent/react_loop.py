@@ -28,7 +28,7 @@ from chef_human.agent.parser import (
     strip_tool_calls,
     validate_arguments,
 )
-from chef_human.agent.planner import Plan, PlanStep, Planner, StepStatus, StepVerdict
+from chef_human.agent.planner import Plan, PlanNode, Planner, StepStatus, StepVerdict
 from chef_human.agent.prompts import build_agent_prompt
 from chef_human.agent.retry import RetryAction, RetryManager
 from chef_human.agent.scratchpad import Scratchpad
@@ -280,7 +280,7 @@ def _looks_like_execution_step(description: str) -> bool:
     return any(keyword in lowered for keyword in _EXECUTION_STEP_KEYWORDS)
 
 
-def _execution_step_feedback(step: PlanStep) -> str:
+def _execution_step_feedback(step: PlanNode) -> str:
     named_files = _named_step_files(step.description)
     lowered = step.description.lower()
     if named_files and "python" in lowered:
@@ -304,7 +304,7 @@ def _execution_step_feedback(step: PlanStep) -> str:
     )
 
 
-def _file_mutation_step_feedback(step: PlanStep, target_names: set[str]) -> str:
+def _file_mutation_step_feedback(step: PlanNode, target_names: set[str]) -> str:
     targets = ", ".join(f"`{name}`" for name in sorted(target_names))
     return (
         f"Step {step.index} ('{step.description}') still needs real file-change evidence. "
@@ -313,7 +313,7 @@ def _file_mutation_step_feedback(step: PlanStep, target_names: set[str]) -> str:
     )
 
 
-def _primary_mutation_target(step: PlanStep, target_names: set[str]) -> str:
+def _primary_mutation_target(step: PlanNode, target_names: set[str]) -> str:
     ordered = [name for name in _named_step_files(step.description) if name in target_names]
     for name in ordered:
         if not name.lower().endswith(_DOC_LIKE_SUFFIXES):
@@ -324,7 +324,7 @@ def _primary_mutation_target(step: PlanStep, target_names: set[str]) -> str:
 
 
 def _file_mutation_no_tool_feedback(
-    step: PlanStep,
+    step: PlanNode,
     target_names: set[str],
     *,
     consecutive_stalls: int,
@@ -581,10 +581,10 @@ class ReActLoop:
         return False
 
     @staticmethod
-    def _step_evidence_key(step: PlanStep) -> str:
-        return step.description.strip().casefold()
+    def _step_evidence_key(step: PlanNode) -> str:
+        return step.node_id
 
-    def _step_evidence_for(self, step: PlanStep) -> StepEvidence:
+    def _step_evidence_for(self, step: PlanNode) -> StepEvidence:
         key = self._step_evidence_key(step)
         evidence = self._step_evidence.get(key)
         if evidence is None:
@@ -592,13 +592,13 @@ class ReActLoop:
             self._step_evidence[key] = evidence
         return evidence
 
-    def _note_mutation_no_tool_stall(self, step: PlanStep) -> int:
+    def _note_mutation_no_tool_stall(self, step: PlanNode) -> int:
         key = self._step_evidence_key(step)
         next_count = self._mutation_no_tool_stalls.get(key, 0) + 1
         self._mutation_no_tool_stalls[key] = next_count
         return next_count
 
-    def _clear_mutation_no_tool_stall(self, step: PlanStep) -> None:
+    def _clear_mutation_no_tool_stall(self, step: PlanNode) -> None:
         self._mutation_no_tool_stalls.pop(self._step_evidence_key(step), None)
 
     async def run(self, task: str) -> AgentResult:
@@ -626,7 +626,7 @@ class ReActLoop:
             max_replans=self._config.max_replans,
         )
         # Counts consecutive turns that started with the plan already fully
-        # complete (current_step() is None) where the model still didn't
+        # complete (current_leaf() is None) where the model still didn't
         # call `finish`. The prompt already tells it to ("All steps are
         # complete -- call `finish`.") but a weak local model routinely
         # ignores that and just keeps calling arbitrary tools instead --
@@ -642,7 +642,7 @@ class ReActLoop:
 
         try:
             while steps_taken < self._config.max_steps:
-                current = plan.current_step()
+                current = plan.current_leaf()
                 plan_was_complete_at_turn_start = plan.is_complete()
                 logger.debug(
                     "Turn starting: steps_taken=%d/%d, current step=%r",
@@ -747,7 +747,7 @@ class ReActLoop:
                         )
                     else:
                         logger.debug("No tool calls this turn (plain reasoning only)")
-                        current = plan.current_step()
+                        current = plan.current_leaf()
                         # Investigative steps are excluded from the
                         # reasoning-only mutation stall guard: a step like
                         # "explore ... the current implementation of
@@ -926,7 +926,7 @@ class ReActLoop:
                 finish_call: tuple[ParsedToolCall, Tool] | None = None
                 deferred_finish_call: tuple[ParsedToolCall, Tool] | None = None
                 parallel_candidates: list[tuple[ParsedToolCall, Tool]] = []
-                current = plan.current_step()
+                current = plan.current_leaf()
                 if current is not None and _looks_like_file_mutation_step(current.description):
                     self._clear_mutation_no_tool_stall(current)
 
@@ -982,7 +982,7 @@ class ReActLoop:
                         continue
 
                     if tc.name == "ask_user":
-                        current = plan.current_step()
+                        current = plan.current_leaf()
                         question = tc.arguments.get("question", "")
 
                         if self._config.disable_ask_user:
@@ -1567,7 +1567,7 @@ class ReActLoop:
         files_written_this_turn: dict[str, bool] | None = None,
         successful_commands_this_turn: list[str] | None = None,
         finish_summary: str = "",
-        step_override: PlanStep | None = None,
+        step_override: PlanNode | None = None,
         files_read: set[str] | None = None,
         rolled_back_content: dict[str, str] | None = None,
     ) -> str | None:
@@ -1575,7 +1575,7 @@ class ReActLoop:
         done before advancing it, instead of assuming any non-failing turn
         finished it. Returns feedback to show the model if the step isn't
         really finished yet, or None if it was marked complete."""
-        step = step_override or plan.current_step()
+        step = step_override or plan.current_leaf()
         if step is None:
             return None
 
@@ -1833,7 +1833,7 @@ class ReActLoop:
             # not a crash), this LLM call had no such guard -- a transient
             # error here used to propagate uncaught out of run(), aborting
             # the whole task, while also leaving the step stuck
-            # `in_progress` (current_step() only matches `pending`, so it'd
+            # `in_progress` (current_leaf() only matches `pending`, so it'd
             # be silently skipped by any future call). Treat it like a
             # failed verification instead: give the model feedback and let
             # the normal retry/replan machinery handle it.

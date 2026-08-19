@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from chef_human.agent.planner import Plan, PlanStep, StepStatus
+from chef_human.agent.planner import Plan, PlanNode, StepStatus
 from chef_human.agent.react_loop import AgentResult
 
 
@@ -602,8 +602,8 @@ class TestToDict:
         plan = Plan(
             goal="test goal",
             steps=[
-                PlanStep(index=1, description="step one", status=StepStatus.completed),
-                PlanStep(index=2, description="step two", status=StepStatus.pending),
+                PlanNode(index=1, description="step one", status=StepStatus.completed),
+                PlanNode(index=2, description="step two", status=StepStatus.pending),
             ],
         )
         result = AgentResult(
@@ -632,8 +632,8 @@ class TestToDict:
         plan = Plan(
             goal="my goal",
             steps=[
-                PlanStep(index=1, description="first", status=StepStatus.completed),
-                PlanStep(index=2, description="second", status=StepStatus.pending),
+                PlanNode(index=1, description="first", status=StepStatus.completed),
+                PlanNode(index=2, description="second", status=StepStatus.pending),
             ],
         )
         d = plan.to_dict()
@@ -646,7 +646,7 @@ class TestToDict:
         }
 
     def test_plan_step_to_dict(self):
-        step = PlanStep(index=1, description="do something", status=StepStatus.in_progress)
+        step = PlanNode(index=1, description="do something", status=StepStatus.in_progress)
         d = step.to_dict()
         assert d == {
             "index": 1,

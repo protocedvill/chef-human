@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from chef_human.agent.parser import ParsedToolCall
-from chef_human.agent.planner import Plan, PlanStep, StepStatus
+from chef_human.agent.planner import Plan, PlanNode, StepStatus
 
 
 @pytest.fixture
@@ -73,8 +73,8 @@ class TestStreamingUIOutput:
         plan = Plan(
             goal="Test task",
             steps=[
-                PlanStep(index=1, description="Read file"),
-                PlanStep(index=2, description="Write fix", status=StepStatus.completed),
+                PlanNode(index=1, description="Read file"),
+                PlanNode(index=2, description="Write fix", status=StepStatus.completed),
             ],
         )
         with patch.object(ui._console, "print") as mock_print:

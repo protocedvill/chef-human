@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from chef_human.agent.planner import Plan, PlanStep, StepStatus
+from chef_human.agent.planner import Plan, PlanNode, StepStatus
 from chef_human.agent.prompts import (
     AGENT_FINISH_PROMPT,
     AGENT_SYSTEM_PROMPT,
@@ -56,14 +56,14 @@ class TestBuildAgentPrompt:
         assert "read" in prompt
 
     def test_includes_plan(self):
-        plan = Plan(goal="Test", steps=[PlanStep(index=1, description="Do something")])
+        plan = Plan(goal="Test", steps=[PlanNode(index=1, description="Do something")])
         tool_defs: list[ToolDefinition] = []
         prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
         assert "Step 1" in prompt
         assert "Do something" in prompt
 
     def test_with_both(self):
-        plan = Plan(goal="Test", steps=[PlanStep(index=1, description="Do something")])
+        plan = Plan(goal="Test", steps=[PlanNode(index=1, description="Do something")])
         tool_defs = [
             ToolDefinition(name="read", description="Read", parameters={"type": "object"})
         ]
@@ -116,9 +116,9 @@ class TestBuildAgentPrompt:
 
     def test_current_step_shows_first_pending_step(self):
         plan = Plan(goal="Test", steps=[
-            PlanStep(index=1, description="Already done", status=StepStatus.completed),
-            PlanStep(index=2, description="Work on this now", status=StepStatus.pending),
-            PlanStep(index=3, description="Later step", status=StepStatus.pending),
+            PlanNode(index=1, description="Already done", status=StepStatus.completed),
+            PlanNode(index=2, description="Work on this now", status=StepStatus.pending),
+            PlanNode(index=3, description="Later step", status=StepStatus.pending),
         ])
         tool_defs: list[ToolDefinition] = []
         prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
@@ -129,7 +129,7 @@ class TestBuildAgentPrompt:
 
     def test_current_step_none_when_all_complete(self):
         plan = Plan(goal="Test", steps=[
-            PlanStep(index=1, description="Done", status=StepStatus.completed),
+            PlanNode(index=1, description="Done", status=StepStatus.completed),
         ])
         tool_defs: list[ToolDefinition] = []
         prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)

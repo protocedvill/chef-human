@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from chef_human.agent.parser import ParsedToolCall
-from chef_human.agent.planner import Plan, PlanStep, StepStatus
+from chef_human.agent.planner import Plan, PlanNode, StepStatus
 from chef_human.agent.react_loop import AgentResult
 
 
@@ -192,8 +192,8 @@ class TestReplUIEvents:
         plan = Plan(
             goal="test goal",
             steps=[
-                PlanStep(index=1, description="step A"),
-                PlanStep(index=2, description="step B", status=StepStatus.completed),
+                PlanNode(index=1, description="step A"),
+                PlanNode(index=2, description="step B", status=StepStatus.completed),
             ],
         )
         with patch.object(ui._console, "print") as mock_print:

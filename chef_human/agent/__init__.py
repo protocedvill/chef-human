@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from chef_human.agent.context import ContextAssembler, ContextConfig, ContextManager
 from chef_human.agent.file_context import FileContextManager
-from chef_human.agent.planner import Plan, PlanStep, Planner, StepStatus
+from chef_human.agent.planner import Plan, PlanNode, Planner, StepStatus
 from chef_human.agent.repo_map import RepoMap
 from chef_human.agent.symbols.extractor import CompositeExtractor
 from chef_human.agent.workspace import WorkspaceManager
@@ -230,7 +230,7 @@ __all__ = [
     "ContextManager",
     "FileContextManager",
     "Plan",
-    "PlanStep",
+    "PlanNode",
     "Planner",
     "RepoMap",
     "StepStatus",

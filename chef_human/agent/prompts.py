@@ -156,7 +156,7 @@ def build_agent_prompt(
     plan_text = Planner.format_plan_for_prompt(plan)
     tool_text = format_tool_definitions(tool_defs)
 
-    step = plan.current_step()
+    step = plan.current_leaf()
     current_step_text = (
         f"Step {step.index}: {step.description}"
         if step is not None

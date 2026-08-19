@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from chef_human.agent.planner import Plan, PlanStep, Planner, StepStatus, StepVerdict
+from chef_human.agent.planner import Plan, PlanNode, Planner, StepStatus, StepVerdict
 from chef_human.agent.prompts import build_agent_prompt
 from chef_human.agent.react_loop import (
     AgentResult,
@@ -122,7 +122,7 @@ def _make_mock_planner() -> MagicMock:
     # Default to an empty replanned Plan (a real Plan instance, not an
     # unconfigured mock) so tests that trigger REPLAN without explicitly
     # setting update_plan.return_value still get something build_agent_prompt
-    # can safely call plan.current_step() / iterate plan.steps on.
+    # can safely call plan.current_leaf() / iterate plan.steps on.
     planner.update_plan = AsyncMock(return_value=Plan(goal="Replanned", steps=[]))
     # Default to "complete" so existing tests that don't care about step
     # verification keep their old behavior (any non-failing turn advances
@@ -138,7 +138,7 @@ def _make_default_plan() -> Plan:
     return Plan(
         goal="Test task",
         steps=[
-            PlanStep(index=1, description="Step one", status=StepStatus.pending),
+            PlanNode(index=1, description="Step one", status=StepStatus.pending),
         ],
     )
 
@@ -170,14 +170,14 @@ class TestBuildAgentPrompt:
         assert "read" in prompt
 
     def test_includes_plan(self):
-        plan = Plan(goal="Test", steps=[PlanStep(index=1, description="Do something")])
+        plan = Plan(goal="Test", steps=[PlanNode(index=1, description="Do something")])
         tool_defs: list[ToolDefinition] = []
         prompt = build_agent_prompt(plan=plan, tool_defs=tool_defs)
         assert "Step 1" in prompt
         assert "Do something" in prompt
 
     def test_with_both(self):
-        plan = Plan(goal="Test", steps=[PlanStep(index=1, description="Do something")])
+        plan = Plan(goal="Test", steps=[PlanNode(index=1, description="Do something")])
         tool_defs = [
             ToolDefinition(name="read", description="Read", parameters={"type": "object"})
         ]
@@ -1539,7 +1539,7 @@ class TestStepVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(
+            PlanNode(
                 index=1,
                 description="Run hello.py using Python and verify the output",
                 status=StepStatus.pending,
@@ -1583,7 +1583,7 @@ class TestStepVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(
-            goal="g", steps=[PlanStep(index=1, description="s", status=StepStatus.completed)]
+            goal="g", steps=[PlanNode(index=1, description="s", status=StepStatus.completed)]
         )
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -1680,7 +1680,7 @@ class TestObjectiveFileVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Create a new file named 'hello_world.py'", status=StepStatus.pending),
+            PlanNode(index=1, description="Create a new file named 'hello_world.py'", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = self._context_rooted_at(tmp_path)
@@ -1716,7 +1716,7 @@ class TestObjectiveFileVerification:
     async def test_creation_step_completes_from_plan_time_missing_to_now_existing(self, tmp_path):
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Create a new file named slugify.py", status=StepStatus.pending),
+            PlanNode(index=1, description="Create a new file named slugify.py", status=StepStatus.pending),
         ])
         context = self._context_rooted_at(tmp_path)
         loop = ReActLoop(
@@ -1747,7 +1747,7 @@ class TestObjectiveFileVerification:
             (StepVerdict.complete, "implementation verified"),
         ])
         plan = Plan(goal="g", steps=[
-            PlanStep(
+            PlanNode(
                 index=1,
                 description="Implement the slugify function in slugify.py according to the specifications.",
                 status=StepStatus.pending,
@@ -1797,7 +1797,7 @@ class TestObjectiveFileVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Create a new file named 'hello_world.py'", status=StepStatus.pending),
+            PlanNode(index=1, description="Create a new file named 'hello_world.py'", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = self._context_rooted_at(tmp_path)
@@ -1843,7 +1843,7 @@ class TestObjectiveFileVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Test that hello_world.py runs correctly", status=StepStatus.pending),
+            PlanNode(index=1, description="Test that hello_world.py runs correctly", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = self._context_rooted_at(tmp_path)
@@ -1895,7 +1895,7 @@ class TestObjectiveFileVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Implement proper error handling", status=StepStatus.pending),
+            PlanNode(index=1, description="Implement proper error handling", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = self._context_rooted_at(tmp_path)
@@ -1956,7 +1956,7 @@ class TestVerifierSeesFileContents:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Fix the duplicated return line in report.py", status=StepStatus.pending),
+            PlanNode(index=1, description="Fix the duplicated return line in report.py", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -2017,7 +2017,7 @@ class TestVerifierSyntaxGuard:
         # Default verify_step mock returns complete -- the regression this
         # guards against.
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Implement the remove method in inventory.py", status=StepStatus.pending),
+            PlanNode(index=1, description="Implement the remove method in inventory.py", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -2144,7 +2144,7 @@ class TestInvestigativeStepBypassesVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Read the content of plan.md", status=StepStatus.pending),
+            PlanNode(index=1, description="Read the content of plan.md", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -2188,7 +2188,7 @@ class TestInvestigativeStepBypassesVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(
+            PlanNode(
                 index=1,
                 description=(
                     "Explore the existing codebase to understand the current "
@@ -2252,7 +2252,7 @@ class TestInvestigativeStepBypassesVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Write the implementation code", status=StepStatus.pending),
+            PlanNode(index=1, description="Write the implementation code", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -2291,7 +2291,7 @@ class TestInvestigativeStepBypassesVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Read the content of plan.md", status=StepStatus.pending),
+            PlanNode(index=1, description="Read the content of plan.md", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -2326,7 +2326,7 @@ class TestInvestigativeStepBypassesVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(
+            PlanNode(
                 index=1,
                 description="Run hello.py using Python and verify the output",
                 status=StepStatus.pending,
@@ -2363,7 +2363,7 @@ class TestInvestigativeStepBypassesVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Read the contents of test_slugify.py", status=StepStatus.pending),
+            PlanNode(index=1, description="Read the contents of test_slugify.py", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -2401,7 +2401,7 @@ class TestInvestigativeStepBypassesVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(
+            PlanNode(
                 index=1,
                 description="Create a new file named slugify.py",
                 status=StepStatus.pending,
@@ -2438,7 +2438,7 @@ class TestInvestigativeStepBypassesVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(
+            PlanNode(
                 index=1,
                 description="Implement the slugify function in slugify.py according to SPEC.md",
                 status=StepStatus.pending,
@@ -2480,7 +2480,7 @@ class TestInvestigativeStepBypassesVerification:
         ])
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(
+            PlanNode(
                 index=1,
                 description="Create a new file named slugify.py",
                 status=StepStatus.pending,
@@ -2525,7 +2525,7 @@ class TestInvestigativeStepBypassesVerification:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(
+            PlanNode(
                 index=1,
                 description="Read the existing codebase to understand the project",
                 status=StepStatus.pending,
@@ -2768,7 +2768,7 @@ class TestAskUserVagueQuestionGuard:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Done already", status=StepStatus.completed),
+            PlanNode(index=1, description="Done already", status=StepStatus.completed),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -2861,7 +2861,7 @@ class TestPrematureFinishGuard:
         planner = _make_mock_planner()
         plan = Plan(
             goal="g",
-            steps=[PlanStep(index=1, description="Create hello.py")],
+            steps=[PlanNode(index=1, description="Create hello.py")],
         )
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -2931,8 +2931,8 @@ class TestPrematureFinishGuard:
         plan = Plan(
             goal="g",
             steps=[
-                PlanStep(index=1, description="Create hello.py"),
-                PlanStep(index=2, description="Run hello.py and verify its output"),
+                PlanNode(index=1, description="Create hello.py"),
+                PlanNode(index=2, description="Run hello.py and verify its output"),
             ],
         )
         planner.generate_plan.return_value = plan
@@ -3019,8 +3019,8 @@ class TestPrematureFinishGuard:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Read plan.md", status=StepStatus.completed),
-            PlanStep(
+            PlanNode(index=1, description="Read plan.md", status=StepStatus.completed),
+            PlanNode(
                 index=2,
                 description="Implement the feature",
                 status=unresolved_status,
@@ -3070,8 +3070,8 @@ class TestPrematureFinishGuard:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Read plan.md", status=StepStatus.completed),
-            PlanStep(index=2, description="Implement the feature", status=StepStatus.completed),
+            PlanNode(index=1, description="Read plan.md", status=StepStatus.completed),
+            PlanNode(index=2, description="Implement the feature", status=StepStatus.completed),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -3147,7 +3147,7 @@ class TestPrematureFinishGuard:
         )
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Implement the feature", status=StepStatus.pending),
+            PlanNode(index=1, description="Implement the feature", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -3196,7 +3196,7 @@ class TestPrematureFinishGuard:
         ]
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Implement the feature", status=StepStatus.pending),
+            PlanNode(index=1, description="Implement the feature", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()
@@ -4625,7 +4625,7 @@ class TestRepeatedToolCallDetection:
 class TestAutoFinishWhenPlanComplete:
     @pytest.mark.asyncio
     async def test_finishes_after_two_pointless_turns_post_completion(self):
-        """Regression test: once plan.current_step() is None, the prompt
+        """Regression test: once plan.current_leaf() is None, the prompt
         tells the model to call `finish`, but a weak local model can just
         keep calling arbitrary (successful, non-repeating -- so the
         repeat-guard doesn't catch it) tools instead of finishing. After
@@ -4654,7 +4654,7 @@ class TestAutoFinishWhenPlanComplete:
         ]
         planner = _make_mock_planner()
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="Explore the project tree", status=StepStatus.pending),
+            PlanNode(index=1, description="Explore the project tree", status=StepStatus.pending),
         ])
         planner.generate_plan.return_value = plan
         context = _make_mock_context()

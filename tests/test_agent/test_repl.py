@@ -6,7 +6,7 @@ import pytest
 from click.testing import CliRunner
 
 from chef_human.agent.parser import ParsedToolCall
-from chef_human.agent.planner import Plan, PlanStep
+from chef_human.agent.planner import Plan, PlanNode
 from chef_human.agent.react_loop import AgentResult
 
 
@@ -149,8 +149,8 @@ class TestReplUICallbacks:
         plan = Plan(
             goal="Test task",
             steps=[
-                PlanStep(index=1, description="Read file"),
-                PlanStep(index=2, description="Write fix"),
+                PlanNode(index=1, description="Read file"),
+                PlanNode(index=2, description="Write fix"),
             ],
         )
         with patch.object(repl_ui._console, "print") as mock_print:

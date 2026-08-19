@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from chef_human.agent.parser import ParsedToolCall
-from chef_human.agent.planner import Plan, PlanStep, StepStatus
+from chef_human.agent.planner import Plan, PlanNode, StepStatus
 from chef_human.agent.react_loop import AgentResult
 from chef_human.ui.protocol import NoopUI
 from rich.tree import Tree
@@ -73,8 +73,8 @@ class TestDebugTUICallbacks:
         plan = Plan(
             goal="Test task",
             steps=[
-                PlanStep(index=1, description="Read file"),
-                PlanStep(index=2, description="Write fix"),
+                PlanNode(index=1, description="Read file"),
+                PlanNode(index=2, description="Write fix"),
             ],
         )
         tui.on_plan(plan)
@@ -235,9 +235,9 @@ class TestPlanColoring:
         plan = Plan(
             goal="Test",
             steps=[
-                PlanStep(index=1, description="Step A", status=StepStatus.completed),
-                PlanStep(index=2, description="Step B", status=StepStatus.in_progress),
-                PlanStep(index=3, description="Step C", status=StepStatus.pending),
+                PlanNode(index=1, description="Step A", status=StepStatus.completed),
+                PlanNode(index=2, description="Step B", status=StepStatus.in_progress),
+                PlanNode(index=3, description="Step C", status=StepStatus.pending),
             ],
         )
         tui.on_plan(plan)

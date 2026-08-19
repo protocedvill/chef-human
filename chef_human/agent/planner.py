@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
@@ -43,10 +44,35 @@ class StepVerdict(str, Enum):
 
 
 @dataclass
-class PlanStep:
-    index: int
+class PlanNode:
+    """A node in a recursive plan tree.
+
+    Identity is a stable `node_id` (assigned once) rather than description
+    text or position -- evidence in `ReActLoop` is now keyed by `node_id`,
+    not by description string (see CLAUDE.md for the bug that keying used to
+    cause). `update_plan()` still only carries a node forward across a
+    replan for steps already `StepStatus.completed`; a replan that reworks
+    the wording of a still-pending/in-progress step gets a fresh `node_id`
+    and an empty evidence bucket exactly as before this change -- fixing
+    that is out of scope for this ticket (see the "Known, not-yet-fixed
+    follow-up" note in CLAUDE.md and the per-node-evidence-and-replan-scope
+    ticket in `.scratch/planning-tree-adr/`).
+    `index` is purely a cosmetic display ordinal, not an identity.
+
+    A node with no children is a leaf and must correspond to exactly one
+    tool call; a node with children is a branch. Only depth-1 trees (a root
+    with only leaf children) are produced today.
+    """
+
     description: str
     status: StepStatus = StepStatus.pending
+    node_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    index: int = 0
+    children: list["PlanNode"] = field(default_factory=list)
+
+    @property
+    def is_leaf(self) -> bool:
+        return not self.children
 
     def to_dict(self) -> dict:
         return {
@@ -56,26 +82,77 @@ class PlanStep:
         }
 
 
-@dataclass
 class Plan:
-    goal: str
-    steps: list[PlanStep] = field(default_factory=list)
+    """The outer container: a goal plus a root `PlanNode`.
+
+    `steps` is kept as a property (not a plain field) over the root's
+    children, both so `Plan(goal=..., steps=[...])` construction still works
+    the way flat-plan callers expect, and so `plan.steps` stays valid --
+    today's trees are always depth-1 (a root with only leaf children), and
+    that coincidence is what makes `steps` and `root.children` the same
+    list."""
+
+    def __init__(
+        self,
+        goal: str,
+        steps: list[PlanNode] | None = None,
+        root: PlanNode | None = None,
+    ) -> None:
+        self.goal = goal
+        self.root = root if root is not None else PlanNode(description="root")
+        if steps is not None:
+            self.root.children = steps
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Plan):
+            return NotImplemented
+        return self.goal == other.goal and self.root == other.root
 
     def to_dict(self) -> dict:
+        """Serializes as the same {goal, steps} shape flat plans used --
+        preserves the `chef-human run --headless --json` output contract.
+        Only depth-1 trees are produced today, so this is lossless; a real
+        decomposition ticket will need to widen this shape."""
         return {
             "goal": self.goal,
             "steps": [s.to_dict() for s in self.steps],
         }
 
-    def current_step(self) -> PlanStep | None:
-        """The step that should be worked on right now: the first step (in
-        order) that isn't yet completed. Returns None once every step is
-        completed."""
-        return next((s for s in self.steps if s.status == StepStatus.pending), None)
+    @property
+    def steps(self) -> list[PlanNode]:
+        """The root's immediate children. Only depth-1 trees are produced
+        today, so this coincides with the flat leaf list; a future
+        real-decomposition ticket will need to stop relying on that."""
+        return self.root.children
 
-    def unresolved_steps(self) -> list[PlanStep]:
-        """Steps that prevent a plan from being reported as complete."""
-        return [s for s in self.steps if s.status != StepStatus.completed]
+    @steps.setter
+    def steps(self, value: list[PlanNode]) -> None:
+        self.root.children = value
+
+    def _leaves(self) -> list[PlanNode]:
+        """Every leaf node, in DFS pre-order."""
+        leaves: list[PlanNode] = []
+
+        def walk(node: PlanNode) -> None:
+            if node.is_leaf:
+                if node is not self.root:
+                    leaves.append(node)
+                return
+            for child in node.children:
+                walk(child)
+
+        walk(self.root)
+        return leaves
+
+    def current_leaf(self) -> PlanNode | None:
+        """The leaf that should be worked on right now: the first leaf (DFS
+        pre-order) that isn't yet completed. Returns None once every leaf is
+        completed."""
+        return next((n for n in self._leaves() if n.status == StepStatus.pending), None)
+
+    def unresolved_steps(self) -> list[PlanNode]:
+        """Leaves that prevent a plan from being reported as complete."""
+        return [n for n in self._leaves() if n.status != StepStatus.completed]
 
     def is_complete(self) -> bool:
         return not self.unresolved_steps()
@@ -174,12 +251,14 @@ class Planner:
             self._parse_steps(response.message.content),
             planning_facts=planning_facts,
         )
-        return Plan(goal=task, steps=steps)
+        plan = Plan(goal=task)
+        plan.steps = steps
+        return plan
 
     async def verify_step(
         self,
         plan: Plan,
-        step: PlanStep,
+        step: PlanNode,
         evidence: str,
         *,
         recent_history: str = "",
@@ -283,16 +362,18 @@ class Planner:
         steps = self._normalize_steps(plan.goal, self._parse_steps(response.message.content))
 
         revised = Plan(goal=plan.goal)
+        revised_steps: list[PlanNode] = []
         for s in plan.steps:
             if s.status == StepStatus.completed:
-                revised.steps.append(s)
+                revised_steps.append(s)
         for s in steps:
             if not any(
                 existing.description == s.description
-                for existing in revised.steps
+                for existing in revised_steps
             ):
-                s.index = len(revised.steps) + 1
-                revised.steps.append(s)
+                s.index = len(revised_steps) + 1
+                revised_steps.append(s)
+        revised.steps = revised_steps
         return revised
 
     @classmethod
@@ -303,10 +384,10 @@ class Planner:
     def _normalize_steps(
         cls,
         task: str,
-        steps: list[PlanStep],
+        steps: list[PlanNode],
         *,
         planning_facts: dict[str, bool] | None = None,
-    ) -> list[PlanStep]:
+    ) -> list[PlanNode]:
         """Remove low-value plan noise that traps smaller local models.
 
         This is deliberately conservative: if normalization would erase every
@@ -316,7 +397,7 @@ class Planner:
         planning_facts = {
             path.casefold(): exists for path, exists in (planning_facts or {}).items()
         }
-        normalized: list[PlanStep] = []
+        normalized: list[PlanNode] = []
         seen_descriptions: set[str] = set()
 
         for step in steps:
@@ -338,14 +419,14 @@ class Planner:
                 continue
             seen_descriptions.add(key)
             normalized.append(
-                PlanStep(index=len(normalized) + 1, description=description)
+                PlanNode(description=description, index=len(normalized) + 1)
             )
 
         if normalized:
             return normalized
 
         return [
-            PlanStep(index=i + 1, description=cls._clean_description(step.description))
+            PlanNode(description=cls._clean_description(step.description), index=i + 1)
             for i, step in enumerate(steps)
             if cls._clean_description(step.description)
         ]
@@ -383,14 +464,14 @@ class Planner:
 
         return description
 
-    def _parse_steps(self, content: str) -> list[PlanStep]:
+    def _parse_steps(self, content: str) -> list[PlanNode]:
         array_match = re.search(r"\[.*\]", content, re.DOTALL)
         if array_match:
             try:
                 data = json.loads(array_match.group(0))
             except json.JSONDecodeError:
                 return [
-                    PlanStep(index=i + 1, description=self._clean_description(s))
+                    PlanNode(description=self._clean_description(s), index=i + 1)
                     for i, s in enumerate(content.strip().split("\n"))
                     if s.strip()
                 ]
@@ -399,7 +480,7 @@ class Planner:
                 data = json.loads(content)
             except json.JSONDecodeError:
                 return [
-                    PlanStep(index=i + 1, description=self._clean_description(s))
+                    PlanNode(description=self._clean_description(s), index=i + 1)
                     for i, s in enumerate(content.strip().split("\n"))
                     if s.strip()
                 ]
@@ -407,18 +488,18 @@ class Planner:
         if isinstance(data, list):
             if all(isinstance(item, str) for item in data):
                 return [
-                    PlanStep(index=i + 1, description=self._clean_description(item))
+                    PlanNode(description=self._clean_description(item), index=i + 1)
                     for i, item in enumerate(data)
                 ]
             elif all(isinstance(item, dict) for item in data):
                 return [
-                    PlanStep(
-                        index=i + 1,
+                    PlanNode(
                         description=self._clean_description(item.get("description", str(item))),
+                        index=i + 1,
                     )
                     for i, item in enumerate(data)
                 ]
-        return [PlanStep(index=1, description=self._clean_description(str(data)))]
+        return [PlanNode(description=self._clean_description(str(data)), index=1)]
 
     @staticmethod
     def format_plan_for_prompt(plan: Plan) -> str:

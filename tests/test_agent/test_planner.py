@@ -7,7 +7,7 @@ import pytest
 
 from chef_human.agent.planner import (
     Plan,
-    PlanStep,
+    PlanNode,
     Planner,
     StepStatus,
     StepVerdict,
@@ -27,23 +27,36 @@ class TestStepStatus:
         assert isinstance(StepStatus.pending, str)
 
 
-class TestPlanStep:
+class TestPlanNode:
     def test_default_status(self):
-        step = PlanStep(index=1, description="Do something")
+        step = PlanNode(index=1, description="Do something")
         assert step.index == 1
         assert step.description == "Do something"
         assert step.status == StepStatus.pending
 
     def test_custom_status(self):
-        step = PlanStep(index=2, description="Done", status=StepStatus.completed)
+        step = PlanNode(index=2, description="Done", status=StepStatus.completed)
         assert step.status == StepStatus.completed
 
-    def test_equality(self):
-        a = PlanStep(index=1, description="Task")
-        b = PlanStep(index=1, description="Task")
-        c = PlanStep(index=2, description="Other")
-        assert a == b
-        assert a != c
+    def test_identity_is_node_id_not_description(self):
+        """Two separately-created nodes are distinct even with identical
+        description/index/status -- identity is the node_id, assigned once
+        and carried forward across replans, not the descriptive fields."""
+        a = PlanNode(index=1, description="Task")
+        b = PlanNode(index=1, description="Task")
+        assert a != b
+        assert a.node_id != b.node_id
+
+    def test_same_object_is_equal_to_itself(self):
+        a = PlanNode(index=1, description="Task")
+        assert a == a
+
+    def test_is_leaf_true_with_no_children(self):
+        assert PlanNode(description="leaf").is_leaf
+
+    def test_is_leaf_false_with_children(self):
+        branch = PlanNode(description="branch", children=[PlanNode(description="child")])
+        assert not branch.is_leaf
 
 
 class TestPlan:
@@ -54,8 +67,8 @@ class TestPlan:
 
     def test_with_steps(self):
         steps = [
-            PlanStep(index=1, description="Find the bug"),
-            PlanStep(index=2, description="Fix it"),
+            PlanNode(index=1, description="Find the bug"),
+            PlanNode(index=2, description="Fix it"),
         ]
         plan = Plan(goal="Fix the bug", steps=steps)
         assert len(plan.steps) == 2
@@ -65,30 +78,30 @@ class TestPlan:
 class TestCurrentStep:
     def test_returns_first_pending_step(self):
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="a", status=StepStatus.completed),
-            PlanStep(index=2, description="b", status=StepStatus.pending),
-            PlanStep(index=3, description="c", status=StepStatus.pending),
+            PlanNode(index=1, description="a", status=StepStatus.completed),
+            PlanNode(index=2, description="b", status=StepStatus.pending),
+            PlanNode(index=3, description="c", status=StepStatus.pending),
         ])
-        step = plan.current_step()
+        step = plan.current_leaf()
         assert step is not None
         assert step.description == "b"
 
     def test_returns_none_when_all_completed(self):
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="a", status=StepStatus.completed),
+            PlanNode(index=1, description="a", status=StepStatus.completed),
         ])
-        assert plan.current_step() is None
+        assert plan.current_leaf() is None
 
     def test_returns_none_for_empty_plan(self):
         plan = Plan(goal="g", steps=[])
-        assert plan.current_step() is None
+        assert plan.current_leaf() is None
 
     def test_failed_and_skipped_steps_keep_plan_incomplete(self):
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="failed", status=StepStatus.failed),
-            PlanStep(index=2, description="skipped", status=StepStatus.skipped),
+            PlanNode(index=1, description="failed", status=StepStatus.failed),
+            PlanNode(index=2, description="skipped", status=StepStatus.skipped),
         ])
-        assert plan.current_step() is None
+        assert plan.current_leaf() is None
         assert not plan.is_complete()
         assert [step.description for step in plan.unresolved_steps()] == [
             "failed",
@@ -100,11 +113,11 @@ class TestCurrentStep:
         transient marker set during verification, and failed/skipped steps
         are done being worked on."""
         plan = Plan(goal="g", steps=[
-            PlanStep(index=1, description="a", status=StepStatus.failed),
-            PlanStep(index=2, description="b", status=StepStatus.in_progress),
-            PlanStep(index=3, description="c", status=StepStatus.pending),
+            PlanNode(index=1, description="a", status=StepStatus.failed),
+            PlanNode(index=2, description="b", status=StepStatus.in_progress),
+            PlanNode(index=3, description="c", status=StepStatus.pending),
         ])
-        step = plan.current_step()
+        step = plan.current_leaf()
         assert step is not None
         assert step.description == "c"
 
@@ -198,9 +211,9 @@ class TestParseSteps:
 class TestNormalizeSteps:
     def test_drops_environment_setup_hallucination_when_task_does_not_request_it(self):
         steps = [
-            PlanStep(index=1, description="Install Python if it is not already installed"),
-            PlanStep(index=2, description="Write hello.py with the required content"),
-            PlanStep(index=3, description="Run hello.py and verify the output"),
+            PlanNode(index=1, description="Install Python if it is not already installed"),
+            PlanNode(index=2, description="Write hello.py with the required content"),
+            PlanNode(index=3, description="Run hello.py and verify the output"),
         ]
         normalized = Planner._normalize_steps(
             "Create hello.py that prints Hello, world!",
@@ -214,8 +227,8 @@ class TestNormalizeSteps:
 
     def test_keeps_environment_setup_steps_when_task_explicitly_requests_setup(self):
         steps = [
-            PlanStep(index=1, description="Create a virtual environment"),
-            PlanStep(index=2, description="Install dependencies from requirements.txt"),
+            PlanNode(index=1, description="Create a virtual environment"),
+            PlanNode(index=2, description="Install dependencies from requirements.txt"),
         ]
         normalized = Planner._normalize_steps(
             "Set up a Python virtualenv and install the project requirements",
@@ -229,9 +242,9 @@ class TestNormalizeSteps:
 
     def test_drops_editor_mechanics_steps(self):
         steps = [
-            PlanStep(index=1, description="Open hello.py for editing using nano"),
-            PlanStep(index=2, description="Save and close the file"),
-            PlanStep(index=3, description="Write the required content to hello.py"),
+            PlanNode(index=1, description="Open hello.py for editing using nano"),
+            PlanNode(index=2, description="Save and close the file"),
+            PlanNode(index=3, description="Write the required content to hello.py"),
         ]
         normalized = Planner._normalize_steps(
             "Create hello.py that prints Hello, world!",
@@ -244,8 +257,8 @@ class TestNormalizeSteps:
 
     def test_resolves_conditional_create_for_missing_file(self):
         steps = [
-            PlanStep(index=1, description="Create slugify.py if it does not exist"),
-            PlanStep(index=2, description="Implement slugify.py"),
+            PlanNode(index=1, description="Create slugify.py if it does not exist"),
+            PlanNode(index=2, description="Implement slugify.py"),
         ]
         normalized = Planner._normalize_steps(
             "Implement slugify.py without modifying tests",
@@ -260,9 +273,9 @@ class TestNormalizeSteps:
 
     def test_drops_conditional_create_and_optional_explore_for_existing_or_missing_fact(self):
         steps = [
-            PlanStep(index=1, description="Create slugify.py if it does not exist"),
-            PlanStep(index=2, description="Explore the existing code in slugify.py to understand its current state (if any)"),
-            PlanStep(index=3, description="Implement slugify.py"),
+            PlanNode(index=1, description="Create slugify.py if it does not exist"),
+            PlanNode(index=2, description="Explore the existing code in slugify.py to understand its current state (if any)"),
+            PlanNode(index=3, description="Implement slugify.py"),
         ]
         normalized = Planner._normalize_steps(
             "Implement slugify.py without modifying tests",
@@ -288,9 +301,9 @@ class TestNormalizeSteps:
 
     def test_drops_write_tests_when_task_forbids_modifying_tests(self):
         steps = [
-            PlanStep(index=1, description="Implement slugify.py"),
-            PlanStep(index=2, description="Write unit tests for slugify in test_slugify.py"),
-            PlanStep(index=3, description="Run the tests"),
+            PlanNode(index=1, description="Implement slugify.py"),
+            PlanNode(index=2, description="Write unit tests for slugify in test_slugify.py"),
+            PlanNode(index=3, description="Run the tests"),
         ]
         normalized = Planner._normalize_steps(
             "Implement slugify.py. Do not modify the specification or tests.",
@@ -310,16 +323,16 @@ class TestFormatPlanForPrompt:
         assert result == "## Plan\n"
 
     def test_single_pending_step(self):
-        plan = Plan(goal="test", steps=[PlanStep(index=1, description="Do it")])
+        plan = Plan(goal="test", steps=[PlanNode(index=1, description="Do it")])
         result = Planner.format_plan_for_prompt(plan)
         assert "[ ] Step 1: Do it" in result
         assert "## Plan" in result
 
     def test_mixed_statuses(self):
         steps = [
-            PlanStep(index=1, description="Done", status=StepStatus.completed),
-            PlanStep(index=2, description="In progress", status=StepStatus.in_progress),
-            PlanStep(index=3, description="Pending"),
+            PlanNode(index=1, description="Done", status=StepStatus.completed),
+            PlanNode(index=2, description="In progress", status=StepStatus.in_progress),
+            PlanNode(index=3, description="Pending"),
         ]
         plan = Plan(goal="test", steps=steps)
         result = Planner.format_plan_for_prompt(plan)
@@ -329,11 +342,11 @@ class TestFormatPlanForPrompt:
 
     def test_all_status_markers_present(self):
         steps = [
-            PlanStep(index=1, description="P", status=StepStatus.pending),
-            PlanStep(index=2, description="I", status=StepStatus.in_progress),
-            PlanStep(index=3, description="C", status=StepStatus.completed),
-            PlanStep(index=4, description="F", status=StepStatus.failed),
-            PlanStep(index=5, description="S", status=StepStatus.skipped),
+            PlanNode(index=1, description="P", status=StepStatus.pending),
+            PlanNode(index=2, description="I", status=StepStatus.in_progress),
+            PlanNode(index=3, description="C", status=StepStatus.completed),
+            PlanNode(index=4, description="F", status=StepStatus.failed),
+            PlanNode(index=5, description="S", status=StepStatus.skipped),
         ]
         plan = Plan(goal="test", steps=steps)
         result = Planner.format_plan_for_prompt(plan)
@@ -348,7 +361,7 @@ class TestGeneratePlan:
     @pytest.mark.asyncio
     async def test_basic_generation(self):
         mock_llm = _make_mock_backend(
-            [PlanStep(index=1, description="Read"), PlanStep(index=2, description="Write")]
+            [PlanNode(index=1, description="Read"), PlanNode(index=2, description="Write")]
         )
         planner = Planner(mock_llm)
         plan = await planner.generate_plan("Fix the bug")
@@ -360,7 +373,7 @@ class TestGeneratePlan:
 
     @pytest.mark.asyncio
     async def test_with_repo_context(self):
-        mock_llm = _make_mock_backend([PlanStep(index=1, description="Do it")])
+        mock_llm = _make_mock_backend([PlanNode(index=1, description="Do it")])
         planner = Planner(mock_llm)
         plan = await planner.generate_plan("Fix the bug", repo_context="src/main.py")
 
@@ -432,15 +445,15 @@ class TestUpdatePlan:
     @pytest.mark.asyncio
     async def test_merges_completed_steps(self):
         original_steps = [
-            PlanStep(index=1, description="Read", status=StepStatus.completed),
-            PlanStep(index=2, description="Fix", status=StepStatus.failed),
+            PlanNode(index=1, description="Read", status=StepStatus.completed),
+            PlanNode(index=2, description="Fix", status=StepStatus.failed),
         ]
         plan = Plan(goal="Fix bug", steps=original_steps)
 
         # LLM returns revised remaining steps (without the completed one)
         mock_llm = _make_mock_backend([
-            PlanStep(index=1, description="Fix properly"),
-            PlanStep(index=2, description="Test"),
+            PlanNode(index=1, description="Fix properly"),
+            PlanNode(index=2, description="Test"),
         ])
         planner = Planner(mock_llm)
         revised = await planner.update_plan(plan, failure_context="Could not find the bug")
@@ -458,13 +471,13 @@ class TestUpdatePlan:
     async def test_skips_duplicates(self):
         """If LLM returns a step matching an already-completed step, skip it."""
         original_steps = [
-            PlanStep(index=1, description="Read", status=StepStatus.completed),
+            PlanNode(index=1, description="Read", status=StepStatus.completed),
         ]
         plan = Plan(goal="Fix bug", steps=original_steps)
 
         mock_llm = _make_mock_backend([
-            PlanStep(index=1, description="Read"),  # duplicate
-            PlanStep(index=2, description="Write"),
+            PlanNode(index=1, description="Read"),  # duplicate
+            PlanNode(index=2, description="Write"),
         ])
         planner = Planner(mock_llm)
         revised = await planner.update_plan(plan, failure_context="")
@@ -476,10 +489,10 @@ class TestUpdatePlan:
     @pytest.mark.asyncio
     async def test_no_completed_steps(self):
         plan = Plan(goal="Fix bug", steps=[
-            PlanStep(index=1, description="Read", status=StepStatus.failed),
+            PlanNode(index=1, description="Read", status=StepStatus.failed),
         ])
         mock_llm = _make_mock_backend([
-            PlanStep(index=1, description="Try again"),
+            PlanNode(index=1, description="Try again"),
         ])
         planner = Planner(mock_llm)
         revised = await planner.update_plan(plan, failure_context="Error")
@@ -497,7 +510,7 @@ class TestUpdatePlan:
         mock_llm.complete = mock_complete
 
         plan = Plan(goal="Fix", steps=[
-            PlanStep(index=1, description="Do it", status=StepStatus.failed),
+            PlanNode(index=1, description="Do it", status=StepStatus.failed),
         ])
         planner = Planner(mock_llm)
         await planner.update_plan(plan, failure_context="Permission denied")
@@ -573,7 +586,7 @@ class TestVerifyStep:
 
         planner = Planner(mock_llm)
         plan = Plan(goal="Add a function", steps=[])
-        step = PlanStep(index=1, description="Write the function")
+        step = PlanNode(index=1, description="Write the function")
         verdict, reason = await planner.verify_step(plan, step, "wrote function foo() in utils.py")
 
         assert verdict == StepVerdict.complete
@@ -589,7 +602,7 @@ class TestVerifyStep:
 
         planner = Planner(mock_llm)
         plan = Plan(goal="Add a function", steps=[])
-        step = PlanStep(index=1, description="Write the function")
+        step = PlanNode(index=1, description="Write the function")
         await planner.verify_step(plan, step, "created empty utils.py")
 
         call_args = mock_complete.await_args
@@ -620,7 +633,7 @@ class TestVerifyStep:
 
         planner = Planner(mock_llm)
         plan = Plan(goal="Add a function", steps=[])
-        step = PlanStep(index=1, description="Write the function")
+        step = PlanNode(index=1, description="Write the function")
 
         verdict, reason = await planner.verify_step(plan, step, "created empty utils.py")
 
@@ -652,7 +665,7 @@ class TestVerifyStep:
 
         planner = Planner(mock_llm)
         plan = Plan(goal="Add a function", steps=[])
-        step = PlanStep(index=1, description="Write the function")
+        step = PlanNode(index=1, description="Write the function")
 
         with caplog.at_level("DEBUG", logger="chef_human.agent.planner"):
             verdict, reason = await planner.verify_step(plan, step, "created empty utils.py")
@@ -707,7 +720,7 @@ class TestUsageCallback:
         planner.on_usage = lambda p, c: received.append((p, c))
 
         plan = Plan(goal="g", steps=[])
-        step = PlanStep(index=1, description="step")
+        step = PlanNode(index=1, description="step")
         await planner.verify_step(plan, step, "evidence")
 
         assert received == [(12, 3)]
@@ -761,7 +774,7 @@ class TestUsageCallback:
         assert received == []
 
 
-def _make_mock_backend(steps: list[PlanStep]) -> MagicMock:
+def _make_mock_backend(steps: list[PlanNode]) -> MagicMock:
     """Create a mock LLMBackend that returns parsed steps."""
     descriptions = [s.description for s in steps]
     content = json.dumps(descriptions)

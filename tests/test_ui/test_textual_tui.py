@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 from chef_human.agent.parser import ParsedToolCall
-from chef_human.agent.planner import Plan, PlanStep, StepStatus
+from chef_human.agent.planner import Plan, PlanNode, StepStatus
 from chef_human.agent.react_loop import AgentResult
 from chef_human.ui.textual_tui import (
     ApprovalModal,
@@ -336,8 +336,8 @@ class TestTuiUIProtocol:
             log = app.query_one("#chat-log", RichLog)
             before = len(log.lines)
             plan = Plan(goal="do a thing", steps=[
-                PlanStep(index=1, description="step one", status=StepStatus.pending),
-                PlanStep(index=2, description="step two", status=StepStatus.pending),
+                PlanNode(index=1, description="step one", status=StepStatus.pending),
+                PlanNode(index=2, description="step two", status=StepStatus.pending),
             ])
             ui.on_plan(plan)
             assert len(log.lines) >= before + 3  # goal + 2 steps
@@ -594,9 +594,9 @@ class TestStatsPanelUpdates:
         app, ui = await self._ui(tmp_path)
         async with app.run_test():
             plan = Plan(goal="g", steps=[
-                PlanStep(index=1, description="done step", status=StepStatus.completed),
-                PlanStep(index=2, description="active step", status=StepStatus.pending),
-                PlanStep(index=3, description="later step", status=StepStatus.pending),
+                PlanNode(index=1, description="done step", status=StepStatus.completed),
+                PlanNode(index=2, description="active step", status=StepStatus.pending),
+                PlanNode(index=3, description="later step", status=StepStatus.pending),
             ])
             ui.on_plan(plan)
             assert ui.stats.current_step == "active step"
@@ -614,8 +614,8 @@ class TestStatsPanelUpdates:
         app, ui = await self._ui(tmp_path)
         async with app.run_test():
             plan = Plan(goal="g", steps=[
-                PlanStep(index=1, description="step one", status=StepStatus.pending),
-                PlanStep(index=2, description="step two", status=StepStatus.pending),
+                PlanNode(index=1, description="step one", status=StepStatus.pending),
+                PlanNode(index=2, description="step two", status=StepStatus.pending),
             ])
             ui.on_plan(plan)
             assert ui.stats.current_step == "step one"

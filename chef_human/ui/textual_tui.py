@@ -148,7 +148,7 @@ class TuiUI:
         self.render_stats()
 
     def _update_plan_stats(self, plan: "Plan") -> None:
-        current = plan.current_step()
+        current = plan.current_leaf()
         self.stats.current_step = current.description if current else None
         self.stats.steps_total = len(plan.steps)
         self.stats.steps_done = sum(

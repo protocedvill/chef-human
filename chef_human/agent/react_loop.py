@@ -1813,12 +1813,140 @@ class ReActLoop:
         self._ui.on_plan(plan)
         return plan
 
+    # Cap on the deterministic repo-context enrichment appended ahead of the
+    # bare tree -- it shares settings.max_context_tokens with conversation
+    # history and file context, so it must stay in the low hundreds of
+    # tokens even on a large repo, not grow with file count.
+    _REPO_CONTEXT_ENRICHMENT_TOKEN_BUDGET = 300
+    _REPO_CONTEXT_README_CHARS = 500
+    _REPO_CONTEXT_TOP_EXTENSIONS = 8
+    _REPO_CONTEXT_TOP_DIRS = 12
+
     def _get_repo_context(self) -> str:
         try:
-            tree = self._context._repo_map.generate_tree()
-            return tree[:1000]
+            tree = self._context._repo_map.generate_tree()[:1000]
         except Exception:
+            tree = ""
+        try:
+            enrichment = self._build_repo_context_enrichment()
+        except Exception:
+            logger.debug("Repo-context enrichment failed", exc_info=True)
+            enrichment = ""
+        if enrichment and tree:
+            return f"{enrichment}\n\n{tree}"
+        return enrichment or tree
+
+    def _build_repo_context_enrichment(self) -> str:
+        """Cheap, deterministic repo grounding fed to the planner ahead of
+        the bare directory tree -- a language/file-type breakdown, a README
+        excerpt (unconditional, unlike _get_referenced_document_contents
+        which only fires when the task names a doc by filename), and a
+        top-level directory listing with per-directory language hints.
+        Exists because a vague task ("add a web interface") gives the
+        planner nothing to ground on but the tree, which regularly produces
+        explore-only plans on unfamiliar repos."""
+        workspace = self._context.workspace
+        files = workspace.list_files(max_depth=4)
+        sections: list[str] = []
+
+        lang_section = self._format_extension_breakdown(files)
+        if lang_section:
+            sections.append(lang_section)
+
+        readme_section = self._format_readme_excerpt(workspace)
+        if readme_section:
+            sections.append(readme_section)
+
+        dirs_section = self._format_top_level_dirs(workspace, files)
+        if dirs_section:
+            sections.append(dirs_section)
+
+        enrichment = "\n\n".join(sections)
+        return self._truncate_repo_context(
+            enrichment, self._REPO_CONTEXT_ENRICHMENT_TOKEN_BUDGET
+        )
+
+    def _format_extension_breakdown(self, files: list[Path]) -> str:
+        counts: dict[str, int] = {}
+        for f in files:
+            ext = f.suffix or "(no extension)"
+            counts[ext] = counts.get(ext, 0) + 1
+        if not counts:
             return ""
+        top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[
+            : self._REPO_CONTEXT_TOP_EXTENSIONS
+        ]
+        breakdown = ", ".join(f"{ext} ({count})" for ext, count in top)
+        return f"### File Types\n\n{breakdown}"
+
+    def _format_readme_excerpt(self, workspace: WorkspaceManager) -> str:
+        for name in ("README.md", "README.rst", "README.txt", "README"):
+            try:
+                path = workspace.resolve(name)
+                if path.is_file():
+                    content = path.read_text(errors="replace")[
+                        : self._REPO_CONTEXT_README_CHARS
+                    ]
+                    return f"### Contents of {name}\n\n{content}"
+            except Exception:
+                continue
+        return ""
+
+    def _format_top_level_dirs(
+        self, workspace: WorkspaceManager, files: list[Path]
+    ) -> str:
+        dir_extensions: dict[str, dict[str, int]] = {}
+        top_level_files = 0
+        for f in files:
+            try:
+                rel = f.relative_to(workspace.root)
+            except ValueError:
+                continue
+            if len(rel.parts) <= 1:
+                top_level_files += 1
+                continue
+            top_dir = rel.parts[0]
+            ext = f.suffix or "(no extension)"
+            exts = dir_extensions.setdefault(top_dir, {})
+            exts[ext] = exts.get(ext, 0) + 1
+
+        if not dir_extensions and not top_level_files:
+            return ""
+
+        lines = ["### Top-Level Directories"]
+        if top_level_files:
+            lines.append(f"  {top_level_files} file(s) at repo root")
+        for top_dir in sorted(dir_extensions)[: self._REPO_CONTEXT_TOP_DIRS]:
+            exts = dir_extensions[top_dir]
+            dominant_ext = max(exts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            file_count = sum(exts.values())
+            lines.append(
+                f"  {top_dir}/ -- {file_count} file(s), mostly {dominant_ext}"
+            )
+        return "\n".join(lines)
+
+    def _truncate_repo_context(self, text: str, max_tokens: int) -> str:
+        if not text:
+            return ""
+        try:
+            tokenizer = self._context._repo_map._tokenizer
+        except Exception:
+            tokenizer = None
+        if tokenizer is None:
+            # No tokenizer reachable -- fall back to a conservative
+            # chars-per-token estimate rather than skip the cap entirely.
+            return text[: max_tokens * 4]
+        if tokenizer.count(text) <= max_tokens:
+            return text
+        suffix = "\n... (truncated)"
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if tokenizer.count(text[:mid] + suffix) <= max_tokens:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo] + suffix
 
     def _get_referenced_document_contents(
         self, task: str, max_chars_per_file: int = 4000

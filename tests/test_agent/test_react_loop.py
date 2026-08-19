@@ -1670,6 +1670,95 @@ class TestPlanningPreflight:
         assert "- slugify.py: missing" in call.kwargs["repo_context"]
 
 
+class TestRepoContextEnrichment:
+    """_get_repo_context replaces a bare truncated tree with deterministic
+    grounding (file-type breakdown, README excerpt, top-level directory
+    listing) so a vague task on an unfamiliar repo gives the planner
+    something to ground a real plan on, not just a directory tree."""
+
+    def _loop_rooted_at(self, tmp_path):
+        from chef_human.agent.repo_map import RepoMap
+        from chef_human.llm.tokenizer import ApproxTokenizer
+
+        workspace = WorkspaceManager(root=tmp_path)
+        context = _make_mock_context()
+        context.workspace = workspace
+        context._repo_map = RepoMap(workspace, ApproxTokenizer())
+
+        return ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=_make_mock_planner(),
+            config=ReActConfig(),
+        )
+
+    def test_includes_file_type_breakdown(self, tmp_path):
+        (tmp_path / "a.c").write_text("int main() {}\n")
+        (tmp_path / "b.c").write_text("int foo() {}\n")
+        (tmp_path / "c.py").write_text("print('hi')\n")
+
+        loop = self._loop_rooted_at(tmp_path)
+        repo_context = loop._get_repo_context()
+
+        assert "### File Types" in repo_context
+        assert ".c (2)" in repo_context
+        assert ".py (1)" in repo_context
+
+    def test_includes_readme_excerpt_unconditionally(self, tmp_path):
+        (tmp_path / "README.md").write_text(
+            "# Ubertooth\n\nA project for wireless security research.\n"
+        )
+        (tmp_path / "main.c").write_text("int main() {}\n")
+
+        loop = self._loop_rooted_at(tmp_path)
+        # No filename referenced in the task -- unlike
+        # _get_referenced_document_contents, README enrichment must fire
+        # for a fully vague task.
+        repo_context = loop._get_repo_context()
+
+        assert "### Contents of README.md" in repo_context
+        assert "wireless security research" in repo_context
+
+    def test_includes_top_level_directory_listing_with_language_hints(self, tmp_path):
+        (tmp_path / "host").mkdir()
+        (tmp_path / "host" / "a.c").write_text("int a() {}\n")
+        (tmp_path / "host" / "b.c").write_text("int b() {}\n")
+        (tmp_path / "firmware").mkdir()
+        (tmp_path / "firmware" / "main.c").write_text("int main() {}\n")
+
+        loop = self._loop_rooted_at(tmp_path)
+        repo_context = loop._get_repo_context()
+
+        assert "### Top-Level Directories" in repo_context
+        assert "host/" in repo_context
+        assert "firmware/" in repo_context
+        assert ".c" in repo_context
+
+    def test_respects_token_budget_on_large_repo(self, tmp_path):
+        for i in range(200):
+            d = tmp_path / f"dir{i}"
+            d.mkdir()
+            (d / "file.c").write_text("int x() {}\n")
+        (tmp_path / "README.md").write_text("# Big repo\n\n" + ("x" * 5000))
+
+        loop = self._loop_rooted_at(tmp_path)
+
+        from chef_human.llm.tokenizer import ApproxTokenizer
+
+        enrichment_budget = loop._REPO_CONTEXT_ENRICHMENT_TOKEN_BUDGET
+        # The enrichment portion (everything before the bare tree, which is
+        # appended separately and already capped elsewhere) must respect its
+        # own token cap regardless of repo size.
+        enrichment = loop._build_repo_context_enrichment()
+        assert ApproxTokenizer().count(enrichment) <= enrichment_budget + 10
+
+    def test_falls_back_to_bare_tree_when_workspace_empty(self, tmp_path):
+        loop = self._loop_rooted_at(tmp_path)
+        repo_context = loop._get_repo_context()
+        assert repo_context == "" or "### File Types" not in repo_context
+
+
 class TestObjectiveFileVerification:
     """_verify_and_mark_step's objective-file-creation bypass: for a step
     that names a specific file and reads like "create/write X", check the

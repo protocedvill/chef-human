@@ -74,8 +74,26 @@ _INVESTIGATIVE_TOOL_NAMES = (
 )
 
 # Matches a filename token a step description might name, e.g. "Create a
-# new file named 'hello_world.py'" -> "hello_world.py".
-_FILE_TARGET_RE = re.compile(r"[`'\"]?([\w\-./]+\.\w{1,10})[`'\"]?")
+# new file named 'hello_world.py'" -> "hello_world.py". The extension is
+# restricted to a real-extension allowlist (rather than a bare \w{1,10})
+# because the unrestricted version also matched dotted attribute/method
+# references in ordinary prose -- e.g. a task describing an API as
+# "bus.publish(...)" or "bus.dead_letters" produced fake planning-facts
+# entries for nonexistent "files" named "bus.publish" and (since the old
+# extension cap silently truncated at 10 chars) a garbled "bus.dead_lette".
+# Observed feeding a real benchmark run's planner: those bogus entries were
+# enough on their own to make a smaller model (qwen3.6:35b-a3b) collapse an
+# otherwise-reasonable multi-step plan into a single unproductive "explore
+# the project structure" step, for a task with nothing to explore.
+_FILE_EXTENSIONS = (
+    "py|pyi|md|rst|txt|json|yaml|yml|toml|cfg|ini|lock|env|"
+    "sh|bash|zsh|js|jsx|ts|tsx|mjs|cjs|html|htm|css|scss|"
+    "c|h|cpp|hpp|cc|hh|rs|go|rb|php|java|kt|swift|"
+    "sql|csv|xml|log"
+)
+_FILE_TARGET_RE = re.compile(
+    r"[`'\"]?([\w\-./]+\.(?:" + _FILE_EXTENSIONS + r"))[`'\"]?", re.IGNORECASE
+)
 
 # If a step's description contains one of these verbs *and* names a
 # specific file, "is that file created" is objectively checkable (does it

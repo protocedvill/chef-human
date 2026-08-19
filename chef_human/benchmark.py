@@ -788,16 +788,23 @@ def _prune_worktrees(source_repo: Path) -> None:
     )
 
 
-def _prepare_agent_path(workspace: Path) -> dict[str, str]:
+def _prepare_agent_path() -> dict[str, str]:
     """Ensure benchmark workspaces expose a stable `python` command.
 
     The benchmark tasks ask the agent to "run with Python", and many local
     models naturally choose `python ...`. On this machine the supported
     interpreter is available as `python3.12`/`sys.executable`, but not as a
-    `python` shell command. Seed a tiny shim in the disposable workspace so
-    the benchmark measures agent behavior rather than host PATH quirks."""
-    shim_dir = (workspace / ".benchmark-bin").resolve()
-    shim_dir.mkdir(parents=True, exist_ok=True)
+    `python` shell command. Seed a tiny shim so the benchmark measures agent
+    behavior rather than host PATH quirks.
+
+    The shim directory only needs to be an absolute path on PATH -- it does
+    not need to live inside the workspace, and living there was actively
+    harmful: WorkspaceManager's IGNORE_PATTERNS doesn't know about this
+    harness-specific directory name, so it showed up as a real file in the
+    repo map the agent's own planner sees, making an otherwise-empty
+    greenfield workspace look like "an existing codebase" (same failure mode
+    as the workspace-root agent.log fixed alongside this)."""
+    shim_dir = Path(tempfile.mkdtemp(prefix="chef-human-benchmark-shim-"))
     python_shim = shim_dir / "python"
     python_shim.write_text(
         f"#!/bin/sh\nexec {json.dumps(sys.executable)} \"$@\"\n",
@@ -858,7 +865,12 @@ def run_case(
     else:
         workspace.mkdir(parents=True, exist_ok=False)
         _write_seed(workspace, case.seed_files)
-    agent_env = _prepare_agent_path(workspace)
+    agent_env = _prepare_agent_path()
+    # The agent process configures its log file before it creates
+    # .chef-human/ itself (that happens later, during create_agent()'s
+    # symbol-index setup), so the directory must exist up front or
+    # logging.basicConfig(filename=...) fails outright.
+    (workspace / ".chef-human").mkdir(parents=True, exist_ok=True)
     before = _snapshot(workspace)
     if case.protect_all_existing_files:
         protected = dict(before)
@@ -877,7 +889,15 @@ def run_case(
         "--max-steps",
         str(case.max_steps),
         "--log-file",
-        str((workspace / "agent.log").resolve()),
+        # Inside .chef-human/, not the workspace root: WorkspaceManager's
+        # IGNORE_PATTERNS already excludes that directory from the repo map
+        # the agent's own planner sees. A log file sitting in the workspace
+        # root instead makes an otherwise-empty greenfield workspace look
+        # like "an existing codebase" to the planner, which then applies the
+        # system prompt's mandatory explore-before-implementing rule and
+        # (observed against qwen3.6:35b-a3b) collapses the whole plan into a
+        # single unproductive "explore the project structure" step.
+        str((workspace / ".chef-human" / "agent.log").resolve()),
     ]
     if model:
         command.extend(("--model", model))

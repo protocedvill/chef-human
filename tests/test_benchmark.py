@@ -50,23 +50,24 @@ class TestCaseSelection:
 
 
 class TestRunCase:
-    def test_prepare_agent_path_exposes_python_shim(self, tmp_path):
-        env = benchmark._prepare_agent_path(tmp_path)
-        shim = tmp_path / ".benchmark-bin" / "python"
+    def test_prepare_agent_path_exposes_python_shim(self):
+        env = benchmark._prepare_agent_path()
+        shim_dir = Path(env["PATH"].split(":")[0])
+        shim = shim_dir / "python"
 
         assert shim.exists()
         assert shim.stat().st_mode & 0o111
-        assert env["PATH"].split(":")[0] == str(tmp_path / ".benchmark-bin")
 
-    def test_prepare_agent_path_resolves_relative_workspace(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        relative_workspace = Path("relative-workspace")
+    def test_prepare_agent_path_shim_lives_outside_any_workspace(self, tmp_path):
+        # The shim dir must not sit inside a workspace being planned over --
+        # WorkspaceManager's IGNORE_PATTERNS doesn't know its name, so a
+        # workspace-local shim dir would show up in the agent's own repo map
+        # and make an empty greenfield workspace look non-empty.
+        env = benchmark._prepare_agent_path()
+        shim_dir = Path(env["PATH"].split(":")[0])
 
-        env = benchmark._prepare_agent_path(relative_workspace)
-
-        assert env["PATH"].split(":")[0] == str(
-            (tmp_path / "relative-workspace" / ".benchmark-bin").resolve()
-        )
+        assert shim_dir.is_absolute()
+        assert tmp_path not in shim_dir.parents
 
     def test_pass_requires_agent_and_external_verifier(self, tmp_path, monkeypatch):
         calls: list[list[str]] = []
@@ -121,7 +122,7 @@ class TestRunCase:
         workspace_index = commands[0].index("--workspace") + 1
         assert commands[0][workspace_index] == str(workspace.resolve())
         log_index = commands[0].index("--log-file") + 1
-        assert commands[0][log_index] == str((workspace / "agent.log").resolve())
+        assert commands[0][log_index] == str((workspace / ".chef-human" / "agent.log").resolve())
 
     def test_verifier_can_fail_after_agent_reports_success(self, tmp_path, monkeypatch):
         responses = iter(

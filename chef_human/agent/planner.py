@@ -384,6 +384,89 @@ class Planner:
         )
         return messages
 
+    async def replan_subtree(
+        self, plan: Plan, node: PlanNode, failure_context: str
+    ) -> None:
+        """Regenerate `node`'s own children in response to a failure --
+        either the leaf itself failing verification, or a branch getting
+        rejected by rollup verification. `node` keeps its own `node_id`
+        (its goal is unchanged, only how to achieve it is reconsidered);
+        only its descendants are discarded and replaced. The replan call
+        only ever sees/produces `node`'s own descendants -- siblings and
+        ancestors elsewhere in the tree are untouched by this call."""
+        ancestors = self._ancestor_descriptions(node)
+        messages = self._build_replan_messages(
+            goal=plan.goal,
+            ancestors=ancestors,
+            node=node,
+            failure_context=failure_context,
+        )
+        response = await self._complete(
+            CompletionRequest(messages=messages, temperature=0.0, max_tokens=2048),
+            activity="replanning",
+        )
+        children = self._normalize_steps(
+            plan.goal, self._parse_steps(response.message.content)
+        )
+        node.set_children(children)
+
+        child_ancestors = ancestors + [node.description]
+        for child in children:
+            if child.requested_branch:
+                await self._expand_node(
+                    child,
+                    ancestors=child_ancestors,
+                    task=plan.goal,
+                    repo_context="",
+                    planning_facts=None,
+                    is_root=False,
+                )
+
+    @staticmethod
+    def _ancestor_descriptions(node: PlanNode) -> list[str]:
+        """The chain of descriptions from (but not including) the true root
+        down through every ancestor to (but not including) `node` itself."""
+        chain: list[str] = []
+        ancestor = node.parent
+        while ancestor is not None and ancestor.parent is not None:
+            chain.append(ancestor.description)
+            ancestor = ancestor.parent
+        chain.reverse()
+        return chain
+
+    @staticmethod
+    def _build_replan_messages(
+        *,
+        goal: str,
+        ancestors: list[str],
+        node: PlanNode,
+        failure_context: str,
+    ) -> list[Message]:
+        messages = [
+            Message(
+                role=Role.system,
+                content=PLANNER_SYSTEM_PROMPT
+                + "\n\nA part of the plan failed. Revise just this sub-goal's own "
+                "next steps; do not touch anything outside this sub-goal.",
+            )
+        ]
+        chain = "\n".join(f"- {d}" for d in ([goal] + ancestors))
+        messages.append(
+            Message(
+                role=Role.user,
+                content=(
+                    f"Overall goal: {goal}\n\n"
+                    f"Ancestor chain (root goal down to this sub-goal):\n{chain}\n\n"
+                    "This sub-goal needs to be redone (its previous attempt failed):\n"
+                    f"{node.description}\n\n"
+                    f"Failure context:\n{failure_context}\n\n"
+                    "Break this sub-goal down into fresh immediate next steps "
+                    "(do not re-plan anything outside this sub-goal)."
+                ),
+            )
+        )
+        return messages
+
     async def verify_step(
         self,
         plan: Plan,

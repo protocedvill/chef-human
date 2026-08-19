@@ -11,6 +11,7 @@ from chef_human.agent.react_loop import (
     AgentResult,
     ReActConfig,
     ReActLoop,
+    StepEvidence,
     _step_file_contents,
     _step_python_syntax_errors,
 )
@@ -124,6 +125,11 @@ def _make_mock_planner() -> MagicMock:
     # setting update_plan.return_value still get something build_agent_prompt
     # can safely call plan.current_leaf() / iterate plan.steps on.
     planner.update_plan = AsyncMock(return_value=Plan(goal="Replanned", steps=[]))
+    # Subtree-scoped replan (used by REPLAN handling instead of update_plan
+    # whenever a specific failing node can be identified) -- mutates the
+    # target node's children in place and returns None, matching the real
+    # Planner.replan_subtree contract.
+    planner.replan_subtree = AsyncMock(return_value=None)
     # Default to "complete" so existing tests that don't care about step
     # verification keep their old behavior (any non-failing turn advances
     # the plan). Tests that specifically exercise verification override this.
@@ -542,7 +548,7 @@ class TestReActLoopRun:
         )
         await loop.run("do something")
         # After 2 consecutive failures (max_retries_per_step=2), should trigger re-plan
-        planner.update_plan.assert_awaited()
+        planner.replan_subtree.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_reasoning_stored_as_assistant_message(self):
@@ -1285,7 +1291,7 @@ class TestReActLoopRun:
         ) as mock_build:
             await loop.run("do something")
 
-        planner.update_plan.assert_awaited()
+        planner.replan_subtree.assert_awaited()
         scratchpad_args = [c.kwargs["scratchpad"] for c in mock_build.call_args_list]
         assert len(scratchpad_args) >= 2
         # First prompt is built before the model has written anything.
@@ -1345,7 +1351,7 @@ class TestStepVerification:
         )
         await loop.run("do something")
 
-        planner.update_plan.assert_awaited_once()
+        planner.replan_subtree.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_successful_tools_do_not_reset_verification_failures(self):
@@ -1402,7 +1408,7 @@ class TestStepVerification:
         )
         await loop.run("do something")
 
-        planner.update_plan.assert_awaited_once()
+        planner.replan_subtree.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_partial_verdict_does_not_advance_step(self):
@@ -2918,7 +2924,7 @@ class TestAskUserVagueQuestionGuard:
 
         ui.on_ask_user.assert_not_awaited()
         planner.verify_step.assert_not_awaited()
-        planner.update_plan.assert_awaited_once()
+        planner.replan_subtree.assert_awaited_once()
         assert any(
             call.args[0] == "repeat-guard"
             for call in ui.on_tool_result.call_args_list
@@ -4859,3 +4865,176 @@ class TestAutoFinishWhenPlanComplete:
         assert result.success is True
         assert plan.steps[0].status == StepStatus.completed
         planner.verify_step.assert_not_awaited()
+
+
+def _evidence(files_written: dict, commands: list) -> StepEvidence:
+    evidence = StepEvidence()
+    evidence.merge_turn(files_written, commands)
+    return evidence
+
+
+class TestSubtreeReplanAndEvidence:
+    """Ticket 04: evidence propagation + subtree-scoped replan (see
+    .scratch/planning-tree/issues/04-evidence-propagation-and-subtree-replan.md)."""
+
+    def _make_loop(self, planner: MagicMock) -> ReActLoop:
+        return ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_evidence_propagates_to_every_ancestor_at_write_time(self):
+        planner = _make_mock_planner()
+        loop = self._make_loop(planner)
+
+        branch = PlanNode(index=1, description="Build the subsystem")
+        leaf = PlanNode(index=1, description="Write feature.py")
+        branch.set_children([leaf])
+        plan = Plan(goal="Task", steps=[branch])
+
+        leaf.status = StepStatus.pending
+        # Drive the leaf through verification with real write evidence so
+        # merge_turn actually records something to propagate.
+        loop._planner.verify_step = AsyncMock(return_value=(StepVerdict.complete, "done"))
+        await loop._verify_and_mark_step(
+            plan,
+            "wrote feature.py",
+            files_written_this_turn={"/repo/feature.py": False},
+            successful_commands_this_turn=["python feature.py"],
+        )
+
+        leaf_evidence = loop._step_evidence[leaf.node_id]
+        branch_evidence = loop._step_evidence[branch.node_id]
+        assert leaf_evidence.files_written == branch_evidence.files_written
+        assert leaf_evidence.successful_commands == branch_evidence.successful_commands
+        assert "/repo/feature.py" in branch_evidence.files_written
+
+    @pytest.mark.asyncio
+    async def test_leaf_failure_replan_is_scoped_to_that_node(self):
+        planner = _make_mock_planner()
+        loop = self._make_loop(planner)
+
+        sibling = PlanNode(index=1, description="Untouched sibling")
+        failing_leaf = PlanNode(index=2, description="Failing leaf")
+        plan = Plan(goal="Task", steps=[sibling, failing_leaf])
+
+        loop._last_failed_node = failing_leaf
+        loop._step_evidence[failing_leaf.node_id] = StepEvidence()
+
+        await loop._replan_failing_node(plan, "it failed")
+
+        planner.replan_subtree.assert_awaited_once_with(plan, failing_leaf, "it failed")
+        assert loop._last_failed_node is None
+
+    @pytest.mark.asyncio
+    async def test_branch_rollup_rejection_targets_the_branch_not_current_leaf(self):
+        planner = _make_mock_planner()
+        loop = self._make_loop(planner)
+
+        branch = PlanNode(index=1, description="Build the subsystem")
+        leaf = PlanNode(index=1, description="Write feature.py", status=StepStatus.completed)
+        branch.set_children([leaf])
+        next_leaf = PlanNode(index=2, description="Unrelated next step")
+        plan = Plan(goal="Task", steps=[branch, next_leaf])
+
+        planner.verify_rollup = AsyncMock(
+            return_value=(StepVerdict.not_complete, "coverage gap")
+        )
+        feedback = await loop._process_rollups(plan)
+
+        assert feedback is not None
+        # current_leaf() has already moved on to next_leaf, but the failing
+        # node the replan should target is the rejected branch.
+        assert plan.current_leaf() is next_leaf
+        assert loop._last_failed_node is branch
+
+        await loop._replan_failing_node(plan, "coverage gap")
+        planner.replan_subtree.assert_awaited_once_with(plan, branch, "coverage gap")
+
+    @pytest.mark.asyncio
+    async def test_rollup_exception_targets_the_branch_not_a_stale_leaf(self):
+        """Regression: an exception from verify_rollup used to leave
+        _last_failed_node pointing at whatever leaf/branch was last recorded
+        (e.g. the leaf that just completed and triggered this rollup),
+        so a subsequent replan would reset an already-succeeded leaf back to
+        pending instead of retrying the branch whose rollup actually failed."""
+        planner = _make_mock_planner()
+        loop = self._make_loop(planner)
+
+        branch = PlanNode(index=1, description="Build the subsystem")
+        leaf = PlanNode(index=1, description="Write feature.py", status=StepStatus.completed)
+        branch.set_children([leaf])
+        plan = Plan(goal="Task", steps=[branch])
+
+        loop._last_failed_node = leaf  # stale, as if leaf just completed
+        planner.verify_rollup = AsyncMock(side_effect=RuntimeError("backend hiccup"))
+
+        feedback = await loop._process_rollups(plan)
+
+        assert feedback is not None
+        assert loop._last_failed_node is branch
+
+    @pytest.mark.asyncio
+    async def test_completed_rollup_clears_last_failed_node(self):
+        """Regression: a branch passing its own rollup used to leave
+        _last_failed_node unchanged, so a later rollup failure elsewhere in
+        the tree (via the exception path) could get mis-attributed back to
+        this now-completed branch instead of the branch that actually needs
+        a replan."""
+        planner = _make_mock_planner()
+        loop = self._make_loop(planner)
+
+        branch = PlanNode(index=1, description="Build the subsystem")
+        leaf = PlanNode(index=1, description="Write feature.py", status=StepStatus.completed)
+        branch.set_children([leaf])
+        plan = Plan(goal="Task", steps=[branch])
+
+        loop._last_failed_node = leaf  # stale, as if leaf just completed
+        planner.verify_rollup = AsyncMock(return_value=(StepVerdict.complete, "covered"))
+
+        feedback = await loop._process_rollups(plan)
+
+        assert feedback is None
+        assert loop._last_failed_node is None
+
+    def test_subtree_replan_discards_descendant_evidence_and_scrubs_ancestors(self):
+        planner = _make_mock_planner()
+        loop = self._make_loop(planner)
+
+        root_leaf_sibling = PlanNode(index=1, description="Sibling branch")
+        branch = PlanNode(index=2, description="Failing branch")
+        child_a = PlanNode(index=1, description="child a")
+        child_b = PlanNode(index=2, description="child b")
+        branch.set_children([child_a, child_b])
+        _ = Plan(goal="Task", steps=[root_leaf_sibling, branch])
+
+        loop._step_evidence[child_a.node_id] = _evidence({"a.py": True}, ["cmd-a"])
+        loop._step_evidence[child_b.node_id] = _evidence({"b.py": True}, ["cmd-b"])
+        loop._step_evidence[branch.node_id] = _evidence(
+            {"a.py": True, "b.py": True}, ["cmd-a", "cmd-b"]
+        )
+
+        loop._discard_subtree_evidence(branch)
+
+        assert child_a.node_id not in loop._step_evidence
+        assert child_b.node_id not in loop._step_evidence
+        assert loop._step_evidence[branch.node_id].files_written == {}
+        assert loop._step_evidence[branch.node_id].successful_commands == []
+
+        # New children replace the old ones (as a real replan_subtree call
+        # would do), then ancestor buckets are rebuilt from what's actually
+        # left in the tree.
+        new_child = PlanNode(index=1, description="fresh child")
+        branch.set_children([new_child])
+        loop._step_evidence[new_child.node_id] = _evidence({"c.py": True}, ["cmd-c"])
+        loop._rebuild_ancestor_evidence(new_child)
+
+        branch_evidence = loop._step_evidence[branch.node_id]
+        assert branch_evidence.files_written == {"c.py": True}
+        assert branch_evidence.successful_commands == ["cmd-c"]
+        assert "a.py" not in branch_evidence.files_written
+        assert "b.py" not in branch_evidence.files_written

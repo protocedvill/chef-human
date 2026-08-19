@@ -766,6 +766,78 @@ class TestUpdatePlan:
         assert "[✗]" in user_msg
 
 
+class TestReplanSubtree:
+    @pytest.mark.asyncio
+    async def test_leaf_replan_keeps_node_id_and_gets_fresh_children(self):
+        leaf = PlanNode(index=1, description="Write feature.py")
+        original_id = leaf.node_id
+        plan = Plan(goal="Add a feature", steps=[leaf])
+
+        mock_llm = _make_mock_backend([PlanNode(index=1, description="Write feature.py properly")])
+        planner = Planner(mock_llm)
+        await planner.replan_subtree(plan, leaf, failure_context="syntax error")
+
+        assert leaf.node_id == original_id
+        assert leaf.is_leaf is False  # gained children
+        assert [c.description for c in leaf.children] == ["Write feature.py properly"]
+
+    @pytest.mark.asyncio
+    async def test_branch_replan_discards_old_children_keeps_node_id(self):
+        old_child = PlanNode(index=1, description="Old child", status=StepStatus.completed)
+        branch = PlanNode(index=1, description="Build the subsystem")
+        branch.set_children([old_child])
+        original_id = branch.node_id
+        plan = Plan(goal="Big task", steps=[branch])
+
+        mock_llm = _make_mock_backend([PlanNode(index=1, description="New child")])
+        planner = Planner(mock_llm)
+        await planner.replan_subtree(plan, branch, failure_context="rollup rejected")
+
+        assert branch.node_id == original_id
+        assert [c.description for c in branch.children] == ["New child"]
+        assert old_child not in branch.children
+
+    @pytest.mark.asyncio
+    async def test_only_targets_own_subtree_siblings_untouched(self):
+        sibling = PlanNode(index=1, description="Untouched sibling")
+        target = PlanNode(index=2, description="Failing part")
+        plan = Plan(goal="Task", steps=[sibling, target])
+        sibling_id = sibling.node_id
+        sibling_children_before = list(sibling.children)
+
+        mock_llm = _make_mock_backend([PlanNode(index=1, description="Fixed part")])
+        planner = Planner(mock_llm)
+        await planner.replan_subtree(plan, target, failure_context="failed")
+
+        assert plan.steps[0] is sibling
+        assert sibling.node_id == sibling_id
+        assert sibling.children == sibling_children_before
+        assert [c.description for c in target.children] == ["Fixed part"]
+
+    @pytest.mark.asyncio
+    async def test_sends_ancestor_chain_and_failure_context(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content='["Fixed sub-step"]'),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        branch = PlanNode(index=1, description="Build the subsystem")
+        root_leaf = PlanNode(index=1, description="Build the subsystem")
+        plan = Plan(goal="Big task", steps=[root_leaf])
+        root_leaf.set_children([branch])
+
+        planner = Planner(mock_llm)
+        await planner.replan_subtree(plan, branch, failure_context="rollup said no coverage")
+
+        call_args = mock_complete.await_args
+        request = call_args.args[0]
+        user_msg = request.messages[1].content
+        assert "Big task" in user_msg
+        assert "Build the subsystem" in user_msg
+        assert "rollup said no coverage" in user_msg
+
+
 class TestParseVerdict:
     def test_complete(self):
         verdict, reason = Planner._parse_verdict("VERDICT: COMPLETE\nREASON: file was created")

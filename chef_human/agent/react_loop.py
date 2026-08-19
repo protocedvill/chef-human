@@ -556,6 +556,14 @@ class ReActLoop:
         self._planning_facts: dict[str, bool] = {}
         self._step_evidence: dict[str, StepEvidence] = {}
         self._mutation_no_tool_stalls: dict[str, int] = {}
+        # The node (leaf or branch) whose verification most recently failed
+        # -- set in _verify_and_mark_step/_process_rollups/the mutation-guard
+        # block, right before returning failure feedback, so a subsequent
+        # REPLAN action can scope replan_subtree to that exact node instead
+        # of guessing from plan.current_leaf() (wrong once the failing node
+        # is a branch: by rollup-rejection time its leaves already report
+        # complete, so current_leaf() has already moved past it).
+        self._last_failed_node: PlanNode | None = None
 
     def _record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
         self._total_prompt_tokens += prompt_tokens
@@ -591,6 +599,61 @@ class ReActLoop:
             evidence = StepEvidence()
             self._step_evidence[key] = evidence
         return evidence
+
+    def _discard_subtree_evidence(self, node: PlanNode) -> None:
+        """Ahead of a subtree replan: permanently drop every descendant's
+        evidence bucket (their node_ids are about to stop existing in the
+        tree) and reset `node`'s own bucket to empty (its goal survives the
+        replan, but the evidence for how it was previously attempted does
+        not)."""
+
+        def walk(n: PlanNode) -> None:
+            for child in n.children:
+                self._step_evidence.pop(self._step_evidence_key(child), None)
+                self._mutation_no_tool_stalls.pop(self._step_evidence_key(child), None)
+                walk(child)
+
+        walk(node)
+        self._step_evidence[self._step_evidence_key(node)] = StepEvidence()
+        self._mutation_no_tool_stalls.pop(self._step_evidence_key(node), None)
+
+    def _rebuild_ancestor_evidence(self, node: PlanNode) -> None:
+        """After a subtree replan, recompute every ancestor above `node`
+        from scratch as the union of its *current* descendants' evidence
+        buckets -- rather than trying to subtract the discarded entries out
+        of the additive propagation, this just recomputes from what's
+        actually still in the tree, so no stale propagated entry from a
+        discarded attempt can survive in an ancestor's bucket."""
+        ancestor = node.parent
+        while ancestor is not None:
+            rebuilt = StepEvidence()
+
+            def collect(n: PlanNode) -> None:
+                entry = self._step_evidence.get(self._step_evidence_key(n))
+                if entry is not None:
+                    rebuilt.merge_turn(entry.files_written, entry.successful_commands)
+                for child in n.children:
+                    collect(child)
+
+            for child in ancestor.children:
+                collect(child)
+            self._step_evidence[self._step_evidence_key(ancestor)] = rebuilt
+            ancestor = ancestor.parent
+
+    async def _replan_failing_node(self, plan: Plan, failure_context: str) -> Plan:
+        """Scope a replan to whichever node most recently failed
+        verification (leaf or rollup), preserving its node_id and touching
+        no sibling/ancestor node elsewhere in the tree. Falls back to a
+        whole-plan replan only when no specific node can be identified."""
+        target = self._last_failed_node or plan.current_leaf()
+        if target is None:
+            return await self._planner.update_plan(plan, failure_context=failure_context)
+        self._discard_subtree_evidence(target)
+        target.status = StepStatus.pending
+        await self._planner.replan_subtree(plan, target, failure_context)
+        self._rebuild_ancestor_evidence(target)
+        self._last_failed_node = None
+        return plan
 
     def _note_mutation_no_tool_stall(self, step: PlanNode) -> int:
         key = self._step_evidence_key(step)
@@ -801,6 +864,7 @@ class ReActLoop:
                                     )
 
                         if current is not None and mutation_targets:
+                            self._last_failed_node = current
                             stall_count = self._note_mutation_no_tool_stall(current)
                             mutation_feedback = _file_mutation_no_tool_feedback(
                                 current,
@@ -816,9 +880,9 @@ class ReActLoop:
                             steps_taken += 1
                             if action == RetryAction.REPLAN:
                                 self._ui.on_replan()
-                                plan = await self._planner.update_plan(
+                                plan = await self._replan_failing_node(
                                     plan,
-                                    failure_context="\n".join(verify_failure_history),
+                                    "\n".join(verify_failure_history),
                                 )
                                 retry_mgr.on_replan()
                                 verify_failure_history.clear()
@@ -868,9 +932,9 @@ class ReActLoop:
                         )
                     if action == RetryAction.REPLAN:
                         self._ui.on_replan()
-                        plan = await self._planner.update_plan(
+                        plan = await self._replan_failing_node(
                             plan,
-                            failure_context="\n".join(verify_failure_history),
+                            "\n".join(verify_failure_history),
                         )
                         retry_mgr.on_replan()
                         verify_failure_history.clear()
@@ -1445,10 +1509,7 @@ class ReActLoop:
                     # files touched, assumptions, open questions) and is
                     # exactly what the next attempt needs, not something to
                     # discard just because this attempt failed.
-                    plan = await self._planner.update_plan(
-                        plan,
-                        failure_context=failure_context,
-                    )
+                    plan = await self._replan_failing_node(plan, failure_context)
                     retry_mgr.on_replan()
                     verify_failure_history.clear()
                 elif action == RetryAction.ESCALATE:
@@ -1571,6 +1632,7 @@ class ReActLoop:
         while True:
             ready = plan.ready_rollup_branches()
             if not ready:
+                self._last_failed_node = None
                 return None
             branch = ready[0]
             evidence = self._rollup_evidence(branch)
@@ -1585,6 +1647,11 @@ class ReActLoop:
                 )
             except Exception as exc:
                 logger.warning("Branch rollup verification failed with an exception: %s", exc)
+                # Repoint at this branch, not whatever leaf/branch was last
+                # recorded (e.g. the leaf that just completed and triggered
+                # this rollup) -- otherwise a subsequent REPLAN would target
+                # the wrong node and discard already-correct work.
+                self._last_failed_node = branch
                 return (
                     f"Branch '{branch.description}' could not be verified due to an "
                     f"error ({exc}); it will be re-checked next turn."
@@ -1594,6 +1661,7 @@ class ReActLoop:
             )
             if verdict != StepVerdict.complete:
                 branch.last_verdict_reason = reason
+                self._last_failed_node = branch
                 return (
                     f"Branch '{branch.description}' is not fully done yet ({verdict.value}): "
                     f"{reason or 'insufficient evidence that the sub-goal was achieved'}. "
@@ -1603,6 +1671,11 @@ class ReActLoop:
                 )
             branch.status = StepStatus.completed
             branch.last_verdict_reason = reason
+            # This branch is done -- clear the stale reference so a later
+            # rollup failure higher in the tree (or the exception path
+            # above, on a *different* branch) doesn't get attributed back
+            # to this now-completed one.
+            self._last_failed_node = None
 
     def _rollup_evidence(self, branch: PlanNode) -> str:
         """Ground-truth evidence for a branch's own sub-goal: current
@@ -1639,11 +1712,26 @@ class ReActLoop:
             return None
 
         step.status = StepStatus.in_progress
+        # Set unconditionally, ahead of every failure-feedback return point
+        # below (including the exception path) -- corrected to point at a
+        # branch instead if _process_rollups goes on to reject one, or
+        # cleared if verification (leaf and every ready rollup) fully
+        # succeeds. See the attribute's docstring in __init__.
+        self._last_failed_node = step
         files_written_this_turn = files_written_this_turn or {}
         successful_commands_this_turn = successful_commands_this_turn or []
         files_read = files_read or set()
         step_evidence = self._step_evidence_for(step)
         step_evidence.merge_turn(files_written_this_turn, successful_commands_this_turn)
+        # Propagate upward at write time so every ancestor branch's bucket
+        # always reflects everything that happened under it, without a
+        # separate read-time aggregation step at rollup-verification time.
+        ancestor = step.parent
+        while ancestor is not None:
+            self._step_evidence_for(ancestor).merge_turn(
+                files_written_this_turn, successful_commands_this_turn
+            )
+            ancestor = ancestor.parent
         accumulated_files_written = step_evidence.files_written
         accumulated_commands = step_evidence.successful_commands
 

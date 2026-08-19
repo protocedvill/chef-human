@@ -5038,3 +5038,129 @@ class TestSubtreeReplanAndEvidence:
         assert branch_evidence.successful_commands == ["cmd-c"]
         assert "a.py" not in branch_evidence.files_written
         assert "b.py" not in branch_evidence.files_written
+
+
+class TestPerNodeRetryEscalation:
+    """RetryManager tracks retry/replan pressure per node_id (ticket 05) --
+    ReActLoop is where that turns into tree mutations: in headless mode
+    (disable_ask_user) a node that exhausts its own budget is marked failed
+    and execution continues onto the rest of the tree instead of the whole
+    run terminating."""
+
+    @pytest.mark.asyncio
+    async def test_headless_marks_node_failed_and_continues_to_next_sibling(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        step_one = PlanNode(index=1, description="Step one", status=StepStatus.pending)
+        step_two = PlanNode(index=2, description="Step two", status=StepStatus.pending)
+        plan = Plan(goal="Test task", steps=[step_one, step_two])
+        planner.generate_plan.return_value = plan
+
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        underlying_run = _make_tool_run("fail", success=False)
+        call_count = 0
+
+        async def counting_run(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            return await underlying_run(**kwargs)
+
+        read_tool.run = counting_run
+        registry.get.return_value = read_tool
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(
+                max_steps=4,
+                max_retries_per_step=1,
+                max_replans=0,
+                disable_ask_user=True,
+            ),
+        )
+        result = await loop.run("do something")
+
+        # Both leaves exhausted their own (independent) budget and were
+        # marked failed -- the run kept going past step one's escalation
+        # instead of terminating on the first one.
+        assert step_one.status == StepStatus.failed
+        assert step_two.status == StepStatus.failed
+        assert call_count >= 2
+        # Neither leaf ever reached `completed`, so the run can't report
+        # success -- it should exhaust max_steps rather than escalate-abort
+        # immediately after the first node fails.
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_interactive_mode_still_escalates_whole_run(self):
+        """Without disable_ask_user, ESCALATE keeps its old whole-run
+        behavior -- headless-only continuation must not change interactive
+        sessions."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        step_one = PlanNode(index=1, description="Step one", status=StepStatus.pending)
+        step_two = PlanNode(index=2, description="Step two", status=StepStatus.pending)
+        plan = Plan(goal="Test task", steps=[step_one, step_two])
+        planner.generate_plan.return_value = plan
+
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        underlying_run = _make_tool_run("fail", success=False)
+        call_count = 0
+
+        async def counting_run(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            return await underlying_run(**kwargs)
+
+        read_tool.run = counting_run
+        registry.get.return_value = read_tool
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(
+                max_steps=4,
+                max_retries_per_step=1,
+                max_replans=0,
+            ),
+        )
+        result = await loop.run("do something")
+
+        assert result.success is False
+        assert step_one.status != StepStatus.completed
+        # The run terminated on the first node's escalation -- step two was
+        # never attempted.
+        assert call_count == 1
+        assert step_two.status == StepStatus.pending

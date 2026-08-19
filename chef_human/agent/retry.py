@@ -15,6 +15,15 @@ class RetryState:
 
 
 class RetryManager:
+    """Tracks retry/replan pressure per plan node (`node_id`), so one
+    struggling branch's failures can't leak into an unrelated branch and a
+    sibling's replan can't reset a different node's accumulated count.
+
+    Deliberately knows nothing about `Plan`/`PlanNode` shape -- callers pass
+    a bare `node_id` string, and `ReActLoop` is the only place that maps the
+    returned `RetryAction` onto actual tree mutations (e.g. marking a node
+    `failed`)."""
+
     def __init__(self, max_retries_per_step: int = 3, max_replans: int = 1) -> None:
         if max_retries_per_step < 1:
             raise ValueError("max_retries_per_step must be >= 1")
@@ -22,37 +31,44 @@ class RetryManager:
             raise ValueError("max_replans must be >= 0")
         self._max_retries = max_retries_per_step
         self._max_replans = max_replans
-        self._state = RetryState()
+        self._states: dict[str, RetryState] = {}
 
-    @property
-    def consecutive_failures(self) -> int:
-        return self._state.consecutive_failures
+    def _state_for(self, node_id: str) -> RetryState:
+        state = self._states.get(node_id)
+        if state is None:
+            state = RetryState()
+            self._states[node_id] = state
+        return state
 
-    @property
-    def replan_count(self) -> int:
-        return self._state.replan_count
+    def consecutive_failures(self, node_id: str) -> int:
+        return self._state_for(node_id).consecutive_failures
 
-    @property
-    def tool_results(self) -> list[str]:
-        return self._state.tool_results
+    def replan_count(self, node_id: str) -> int:
+        return self._state_for(node_id).replan_count
+
+    def tool_results(self, node_id: str) -> list[str]:
+        return self._state_for(node_id).tool_results
 
     def record_iteration(
-        self, total_calls: int, failed_calls: int, tool_results: list[str]
+        self, node_id: str, total_calls: int, failed_calls: int, tool_results: list[str]
     ) -> RetryAction:
+        state = self._state_for(node_id)
+
         if failed_calls == 0:
-            self._state.consecutive_failures = 0
-            self._state.tool_results = []
+            state.consecutive_failures = 0
+            state.tool_results = []
             return RetryAction.STEP_COMPLETED
 
-        self._state.tool_results.extend(tool_results)
-        self._state.consecutive_failures += 1
+        state.tool_results.extend(tool_results)
+        state.consecutive_failures += 1
 
-        if self._state.consecutive_failures >= self._max_retries:
-            if self._state.replan_count >= self._max_replans:
+        if state.consecutive_failures >= self._max_retries:
+            if state.replan_count >= self._max_replans:
                 logger.warning(
-                    "Escalating after %d replans and %d consecutive failures",
-                    self._state.replan_count,
-                    self._state.consecutive_failures,
+                    "Escalating node %s after %d replans and %d consecutive failures",
+                    node_id,
+                    state.replan_count,
+                    state.consecutive_failures,
                 )
                 return RetryAction.ESCALATE
             return RetryAction.REPLAN
@@ -62,10 +78,11 @@ class RetryManager:
 
         return RetryAction.RETRY
 
-    def on_replan(self) -> None:
-        self._state.replan_count += 1
-        self._state.consecutive_failures = 0
-        self._state.tool_results = []
+    def on_replan(self, node_id: str) -> None:
+        state = self._state_for(node_id)
+        state.replan_count += 1
+        state.consecutive_failures = 0
+        state.tool_results = []
 
 
 class RetryAction(StrEnum):

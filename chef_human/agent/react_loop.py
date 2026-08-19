@@ -592,6 +592,47 @@ class ReActLoop:
     def _step_evidence_key(step: PlanNode) -> str:
         return step.node_id
 
+    _ROOT_RETRY_NODE_ID = "__root__"
+
+    def _retry_node_id(self, node: PlanNode | None) -> str:
+        """Resolves the node_id RetryManager should key this turn's outcome
+        under. Prefers the node actually being worked this turn; falls back
+        to whichever node most recently failed verification, then to a
+        stable sentinel for turns with no specific step in play (e.g. the
+        plan is already complete and only the deferred `finish` call is
+        outstanding)."""
+        if node is not None:
+            return node.node_id
+        if self._last_failed_node is not None:
+            return self._last_failed_node.node_id
+        return self._ROOT_RETRY_NODE_ID
+
+    def _handle_escalation(
+        self, plan: Plan, node: PlanNode | None, steps_taken: int, message: str
+    ) -> AgentResult | None:
+        """Applies an ESCALATE verdict for `node`. In headless mode
+        (`disable_ask_user`) a node exhausting its own retry/replan budget is
+        marked failed and execution continues on the rest of the tree --
+        returns None so the caller keeps looping. Interactively (or when no
+        specific node is in play), the whole run terminates as before --
+        returns the `AgentResult` for the caller to return."""
+        target = node or self._last_failed_node
+        if self._config.disable_ask_user and target is not None:
+            target.status = StepStatus.failed
+            logger.warning(
+                "Node %s exhausted its retry/replan budget; marking failed "
+                "and continuing on the rest of the tree (headless mode)",
+                target.node_id,
+            )
+            self._last_failed_node = None
+            return None
+        return self._make_result(
+            plan=plan,
+            steps_taken=steps_taken,
+            message=message,
+            success=False,
+        )
+
     def _step_evidence_for(self, step: PlanNode) -> StepEvidence:
         key = self._step_evidence_key(step)
         evidence = self._step_evidence.get(key)
@@ -876,7 +917,9 @@ class ReActLoop:
                                 Message(role=Role.tool, content=mutation_feedback)
                             )
                             verify_failure_history.append(mutation_feedback)
-                            action = retry_mgr.record_iteration(1, 1, [mutation_feedback])
+                            action = retry_mgr.record_iteration(
+                                current.node_id, 1, 1, [mutation_feedback]
+                            )
                             steps_taken += 1
                             if action == RetryAction.REPLAN:
                                 self._ui.on_replan()
@@ -884,23 +927,24 @@ class ReActLoop:
                                     plan,
                                     "\n".join(verify_failure_history),
                                 )
-                                retry_mgr.on_replan()
+                                retry_mgr.on_replan(current.node_id)
                                 verify_failure_history.clear()
                             elif action == RetryAction.ESCALATE:
-                                return self._make_result(
-                                    plan=plan,
-                                    steps_taken=steps_taken,
-                                    message=(
-                                        "The task could not be completed because step "
-                                        "verification repeatedly failed."
-                                    ),
-                                    success=False,
+                                result = self._handle_escalation(
+                                    plan,
+                                    current,
+                                    steps_taken,
+                                    "The task could not be completed because step "
+                                    "verification repeatedly failed.",
                                 )
+                                if result is not None:
+                                    return result
                             continue
 
                     steps_taken += 1
+                    node_id = self._retry_node_id(current)
                     if parse_error:
-                        action = retry_mgr.record_iteration(1, 1, [parse_error])
+                        action = retry_mgr.record_iteration(node_id, 1, 1, [parse_error])
                     else:
                         verify_feedback = await self._verify_and_mark_step(
                             plan,
@@ -914,10 +958,10 @@ class ReActLoop:
                                 Message(role=Role.tool, content=verify_feedback)
                             )
                             verify_failure_history.append(verify_feedback)
-                            action = retry_mgr.record_iteration(1, 1, [verify_feedback])
+                            action = retry_mgr.record_iteration(node_id, 1, 1, [verify_feedback])
                         else:
                             verify_failure_history.clear()
-                            action = retry_mgr.record_iteration(0, 0, [])
+                            action = retry_mgr.record_iteration(node_id, 0, 0, [])
 
                     if (
                         self._detect_finish(non_tool_reasoning)
@@ -936,18 +980,18 @@ class ReActLoop:
                             plan,
                             "\n".join(verify_failure_history),
                         )
-                        retry_mgr.on_replan()
+                        retry_mgr.on_replan(node_id)
                         verify_failure_history.clear()
                     elif action == RetryAction.ESCALATE:
-                        return self._make_result(
-                            plan=plan,
-                            steps_taken=steps_taken,
-                            message=(
-                                "The task could not be completed because step "
-                                "verification repeatedly failed."
-                            ),
-                            success=False,
+                        result = self._handle_escalation(
+                            plan,
+                            current,
+                            steps_taken,
+                            "The task could not be completed because step "
+                            "verification repeatedly failed.",
                         )
+                        if result is not None:
+                            return result
                     continue
 
                 # Interactive ask_user calls are excluded because a repeated
@@ -991,6 +1035,12 @@ class ReActLoop:
                 deferred_finish_call: tuple[ParsedToolCall, Tool] | None = None
                 parallel_candidates: list[tuple[ParsedToolCall, Tool]] = []
                 current = plan.current_leaf()
+                # Captured now, before `current` can be reassigned below (the
+                # deferred-finish branch reassigns it to an unresolved step
+                # purely for messaging) -- this is the node whose retry
+                # pressure this turn's outcome should count against.
+                retry_node = current
+                node_id = self._retry_node_id(retry_node)
                 if current is not None and _looks_like_file_mutation_step(current.description):
                     self._clear_mutation_no_tool_stall(current)
 
@@ -1421,15 +1471,15 @@ class ReActLoop:
                             Message(role=Role.tool, content=verify_feedback)
                         )
                         verify_failure_history.append(verify_feedback)
-                        action = retry_mgr.record_iteration(1, 1, [verify_feedback])
+                        action = retry_mgr.record_iteration(node_id, 1, 1, [verify_feedback])
                     else:
                         verify_failure_history.clear()
                         action = retry_mgr.record_iteration(
-                            total_calls, failed_calls, tool_results
+                            node_id, total_calls, failed_calls, tool_results
                         )
                 else:
                     action = retry_mgr.record_iteration(
-                        total_calls, failed_calls, tool_results
+                        node_id, total_calls, failed_calls, tool_results
                     )
 
                 if deferred_finish_call is not None:
@@ -1463,14 +1513,14 @@ class ReActLoop:
                             self._context.conversation.add_message(
                                 Message(role=Role.tool, content=result)
                             )
-                            action = retry_mgr.record_iteration(1, 1, [result])
+                            action = retry_mgr.record_iteration(node_id, 1, 1, [result])
                         except Exception as exc:
                             result = self._make_tool_error(f"Execution error: {exc}")
                             self._ui.on_tool_result(tc.name, result)
                             self._context.conversation.add_message(
                                 Message(role=Role.tool, content=result)
                             )
-                            action = retry_mgr.record_iteration(1, 1, [result])
+                            action = retry_mgr.record_iteration(node_id, 1, 1, [result])
                         else:
                             finish_msg = (
                                 finish_result.output
@@ -1502,7 +1552,7 @@ class ReActLoop:
                     failure_context = (
                         "\n".join(verify_failure_history)
                         if verify_failure_history
-                        else "\n".join(retry_mgr.tool_results)
+                        else "\n".join(retry_mgr.tool_results(node_id))
                     )
                     # Note: the scratchpad is deliberately NOT reset here --
                     # it's the agent's accumulated working memory (decisions,
@@ -1510,17 +1560,19 @@ class ReActLoop:
                     # exactly what the next attempt needs, not something to
                     # discard just because this attempt failed.
                     plan = await self._replan_failing_node(plan, failure_context)
-                    retry_mgr.on_replan()
+                    retry_mgr.on_replan(node_id)
                     verify_failure_history.clear()
                 elif action == RetryAction.ESCALATE:
                     logger.warning("Escalating: persistent failures despite re-planning (step %d)", steps_taken)
-                    return self._make_result(
-                        plan=plan,
-                        steps_taken=steps_taken,
-                        message="The task could not be completed despite re-planning. "
-                                "The agent encountered persistent failures.",
-                        success=False,
+                    result = self._handle_escalation(
+                        plan,
+                        retry_node,
+                        steps_taken,
+                        "The task could not be completed despite re-planning. "
+                        "The agent encountered persistent failures.",
                     )
+                    if result is not None:
+                        return result
 
                 self._ui.on_plan_progress(plan)
 

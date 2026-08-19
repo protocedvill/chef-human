@@ -12,10 +12,10 @@ root's own eventual rollup verification then reflects the incompleteness rather 
 
 **Blocked by:** 04 (Evidence propagation + subtree-scoped replan)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `RetryManager`'s failure counter and replan budget are tracked per-`node_id`, not as a single instance-wide counter
-- [ ] A node's failures/replans don't affect an unrelated node's counters elsewhere in the tree
-- [ ] A sibling branch's replan doesn't reset a different node's accumulated failure count
-- [ ] In headless mode, a node exhausting its own retry/replan budget is marked failed and execution continues on the rest of the tree (verified: the run doesn't abort, and unrelated branches still complete)
-- [ ] `RetryManager`'s public interface stays fully decoupled from `Plan`/`PlanNode` shape — it still only knows about counters and node ids, not tree structure; `ReActLoop` remains the only place mapping retry decisions onto tree mutations
+- [x] `RetryManager`'s failure counter and replan budget are tracked per-`node_id`, not as a single instance-wide counter
+- [x] A node's failures/replans don't affect an unrelated node's counters elsewhere in the tree
+- [x] A sibling branch's replan doesn't reset a different node's accumulated failure count
+- [x] In headless mode, a node exhausting its own retry/replan budget is marked failed and execution continues on the rest of the tree (verified: the run doesn't abort, and unrelated branches still complete)
+- [x] `RetryManager`'s public interface stays fully decoupled from `Plan`/`PlanNode` shape — it still only knows about counters and node ids, not tree structure; `ReActLoop` remains the only place mapping retry decisions onto tree mutations

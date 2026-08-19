@@ -24,6 +24,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "qwen2.5-coder:7b"
 DEFAULT_CONTEXT_LENGTH = 32768
 
+# Every CompletionRequest in this codebase asks for temperature=0.0 (greedy
+# decoding), which is fine for non-thinking calls but actively breaks
+# thinking ones: Qwen's own docs warn greedy decoding under think mode
+# "can lead to performance degradation and endless repetitions", and that
+# is exactly what was observed live -- the model getting stuck re-deriving
+# the same write-vs-edit tool choice for its entire token budget without
+# ever emitting a decision. Switching to these sampling params (Qwen's
+# documented thinking-mode recommendation) reproducibly fixed it in
+# isolation: the identical prompt went from exhausting a 16384-token budget
+# with zero output to a clean ~4300-token completion with a single pass
+# over the same decision. Applied unconditionally whenever a call actually
+# goes out with think enabled, overriding whatever temperature the caller
+# specified -- callers have no way to know this constraint exists, so it's
+# not reasonable to expect every one of them to opt in individually.
+_THINK_SAMPLING_OVERRIDES: dict[str, Any] = {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+}
+
 
 class OllamaBackend(LLMBackend):
     def __init__(
@@ -73,7 +94,9 @@ class OllamaBackend(LLMBackend):
         doesn't re-fail on every subsequent call."""
         think = False if self._think_unsupported else self._think
         try:
-            return await self._async_client.chat(think=think, **kwargs)
+            return await self._async_client.chat(
+                think=think, **self._with_sampling_overrides(kwargs, think)
+            )
         except ollama.ResponseError as exc:
             if think is False or "does not support thinking" not in str(exc):
                 # Either already sending think=False (retrying identically
@@ -85,7 +108,19 @@ class OllamaBackend(LLMBackend):
                 self._model,
             )
             self._think_unsupported = True
-            return await self._async_client.chat(think=False, **kwargs)
+            return await self._async_client.chat(
+                think=False, **self._with_sampling_overrides(kwargs, False)
+            )
+
+    @staticmethod
+    def _with_sampling_overrides(
+        kwargs: dict[str, Any], think: bool | Literal["low", "medium", "high"]
+    ) -> dict[str, Any]:
+        if not think:
+            return kwargs
+        options = dict(kwargs.get("options") or {})
+        options.update(_THINK_SAMPLING_OVERRIDES)
+        return {**kwargs, "options": options}
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         ollama_messages = [_to_ollama_msg(m) for m in request.messages]

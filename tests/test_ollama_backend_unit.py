@@ -146,6 +146,88 @@ async def test_complete_stream_accumulates_thinking_across_chunks(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_think_calls_override_greedy_sampling(monkeypatch):
+    """Greedy decoding (temperature=0, the default every CompletionRequest
+    uses) is documented by Qwen to cause endless repetition loops under
+    think mode, reproduced live in this session -- thinking calls must
+    always go out with the non-greedy override, regardless of what
+    temperature the caller asked for."""
+    backend = OllamaBackend(model="qwen2.5-coder:7b", think="low")
+
+    calls: list[dict] = []
+
+    async def fake_chat(**kwargs):
+        calls.append(kwargs)
+        return {"message": {"content": "ok"}, "prompt_eval_count": 1, "eval_count": 1}
+
+    monkeypatch.setattr(backend._async_client, "chat", AsyncMock(side_effect=fake_chat))
+
+    await backend.complete(
+        CompletionRequest(
+            messages=[Message(role=Role.user, content="hi")], temperature=0.0
+        )
+    )
+
+    assert len(calls) == 1
+    options = calls[0]["options"]
+    assert options["temperature"] == 0.6
+    assert options["top_p"] == 0.95
+    assert options["top_k"] == 20
+    assert options["min_p"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_non_think_calls_keep_caller_temperature(monkeypatch):
+    backend = OllamaBackend(model="qwen2.5-coder:7b", think=False)
+
+    calls: list[dict] = []
+
+    async def fake_chat(**kwargs):
+        calls.append(kwargs)
+        return {"message": {"content": "ok"}, "prompt_eval_count": 1, "eval_count": 1}
+
+    monkeypatch.setattr(backend._async_client, "chat", AsyncMock(side_effect=fake_chat))
+
+    await backend.complete(
+        CompletionRequest(
+            messages=[Message(role=Role.user, content="hi")], temperature=0.0
+        )
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["options"]["temperature"] == 0.0
+    assert "top_p" not in calls[0]["options"]
+
+
+@pytest.mark.asyncio
+async def test_fallback_after_think_unsupported_drops_sampling_override(monkeypatch):
+    """Once a model proves it rejects `think` outright, the retry -- and
+    every call after it -- must not carry the thinking-mode sampling
+    override either, since it's no longer a thinking call."""
+    backend = OllamaBackend(model="some-model", think="low")
+
+    calls: list[dict] = []
+
+    async def fake_chat(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise _think_unsupported_error()
+        return {"message": {"content": "ok"}, "prompt_eval_count": 1, "eval_count": 1}
+
+    monkeypatch.setattr(backend._async_client, "chat", AsyncMock(side_effect=fake_chat))
+
+    await backend.complete(
+        CompletionRequest(
+            messages=[Message(role=Role.user, content="hi")], temperature=0.0
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["options"]["temperature"] == 0.6  # the failed thinking attempt
+    assert calls[1]["options"]["temperature"] == 0.0  # fallback, caller's own value
+
+
+@pytest.mark.asyncio
 async def test_no_retry_when_think_already_false(monkeypatch):
     backend = OllamaBackend(model="qwen2.5-coder:7b", think=False)
 

@@ -119,6 +119,24 @@ VERDICT: COMPLETE, PARTIAL, or NOT_COMPLETE
 REASON: <one short sentence about THIS step only, quoting the offending lines when the verdict is not COMPLETE>"""
 
 
+ROLLUP_VERIFY_PROMPT = """You are checking whether a branch (sub-goal) of a plan has actually been achieved, now that every one of its individual child steps has been marked complete. The children all reporting complete is NOT proof by itself -- a decomposition can be flawed, leaving a real gap in what the sub-goal needed even though each child step technically succeeded on its own narrow terms. Judge the branch's own sub-goal directly against the ground-truth evidence below. Say COMPLETE only if that evidence clearly shows the sub-goal itself was achieved. If real progress was made but something is still missing, say PARTIAL. If the evidence does not support the sub-goal being achieved, say NOT_COMPLETE.
+
+Overall goal: {goal}
+Branch (sub-goal) to verify: {branch}
+
+Ground-truth evidence for this sub-goal (current repo/file state, read directly -- this is the primary signal):
+{evidence}
+
+Each child step's own verification verdict/reason (supporting context only -- do not treat "all children complete" as sufficient by itself):
+{children_summary}
+
+If the branch is not COMPLETE, your REASON must be specific and actionable: name exactly what is missing or wrong, quoting file contents where relevant.
+
+Respond with exactly two lines and nothing else:
+VERDICT: COMPLETE, PARTIAL, or NOT_COMPLETE
+REASON: <one short sentence about THIS branch's own sub-goal only>"""
+
+
 AGENT_FINISH_PROMPT = """
 The task is now complete. Summarize what was accomplished:
 - What changes were made
@@ -149,6 +167,21 @@ def build_verify_prompt(
         or "(no immediate tool calls this turn -- only reasoning text was produced)",
         recent_history=recent_history.strip() or "(no recent tool history available)",
         finish_summary=finish_summary.strip() or "(no finish request summary provided)",
+    )
+
+
+def build_rollup_verify_prompt(
+    goal: str,
+    branch: str,
+    evidence: str,
+    *,
+    children_summary: str = "",
+) -> str:
+    return ROLLUP_VERIFY_PROMPT.format(
+        goal=goal,
+        branch=branch,
+        evidence=evidence.strip() or "(no ground-truth evidence found for this sub-goal)",
+        children_summary=children_summary.strip() or "(no child verdicts recorded)",
     )
 
 

@@ -12,9 +12,9 @@ whose children are all individually complete; the tree shape alone is never proo
 
 **Blocked by:** 02 (Multi-level decomposition)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Every branch node, once all its children report complete, goes through a rollup verification call before the branch itself is marked complete
-- [ ] The rollup check's primary evidence is ground-truth state for the branch's own goal; children's verdicts/reasons are supporting context only
-- [ ] A branch whose children are all complete can still be rejected by the rollup check (verified with a case constructed to have a genuine coverage gap)
-- [ ] A branch that's genuinely complete passes rollup verification without false rejection
+- [x] Every branch node, once all its children report complete, goes through a rollup verification call before the branch itself is marked complete
+- [x] The rollup check's primary evidence is ground-truth state for the branch's own goal; children's verdicts/reasons are supporting context only
+- [x] A branch whose children are all complete can still be rejected by the rollup check (verified with a case constructed to have a genuine coverage gap)
+- [x] A branch that's genuinely complete passes rollup verification without false rejection

@@ -8,7 +8,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
 
-from chef_human.agent.prompts import PLANNER_SYSTEM_PROMPT, build_verify_prompt
+from chef_human.agent.prompts import (
+    PLANNER_SYSTEM_PROMPT,
+    build_rollup_verify_prompt,
+    build_verify_prompt,
+)
 from chef_human.llm.backend import (
     CompletionRequest,
     CompletionResponse,
@@ -76,10 +80,29 @@ class PlanNode:
     # is only actually a leaf/branch based on whether `children` ends up
     # populated, not based on this flag.
     requested_branch: bool = False
+    # Not identity, not persisted -- set by `set_children()` whenever a node
+    # gets children, so rollup verification can walk from a just-completed
+    # leaf up to its ancestor branches. Excluded from `__eq__`/`repr` since
+    # it would otherwise make the dataclass-generated equality/repr recurse
+    # through parent<->child cycles.
+    parent: "PlanNode | None" = field(default=None, repr=False, compare=False)
+    # Reason text from this node's own last verification (leaf step verifier
+    # or branch rollup verifier), kept so an ancestor's rollup check can show
+    # each child's verdict/reason as supporting context. Not identity, not
+    # persisted.
+    last_verdict_reason: str = field(default="", repr=False, compare=False)
 
     @property
     def is_leaf(self) -> bool:
         return not self.children
+
+    def set_children(self, children: list["PlanNode"]) -> None:
+        """Assigns `children` and links each child's `.parent` back to this
+        node -- the only way `children` should be assigned once a node needs
+        rollup verification to walk parent pointers."""
+        self.children = children
+        for child in children:
+            child.parent = self
 
     def to_dict(self) -> dict:
         return {
@@ -108,7 +131,7 @@ class Plan:
         self.goal = goal
         self.root = root if root is not None else PlanNode(description="root")
         if steps is not None:
-            self.root.children = steps
+            self.root.set_children(steps)
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Plan):
@@ -134,7 +157,7 @@ class Plan:
 
     @steps.setter
     def steps(self, value: list[PlanNode]) -> None:
-        self.root.children = value
+        self.root.set_children(value)
 
     def _leaves(self) -> list[PlanNode]:
         """Every leaf node, in DFS pre-order."""
@@ -161,8 +184,39 @@ class Plan:
         """Leaves that prevent a plan from being reported as complete."""
         return [n for n in self._leaves() if n.status != StepStatus.completed]
 
+    def _branches(self) -> list[PlanNode]:
+        """Every non-root node with children, post-order -- deepest branches
+        first, so a caller processing this list in order naturally resolves
+        a branch's rollup before its parent's. The root itself is excluded:
+        it represents the plan as a whole, which is already gated by
+        `unresolved_steps()`/the finish flow, not by branch rollup."""
+        branches: list[PlanNode] = []
+
+        def walk(node: PlanNode) -> None:
+            for child in node.children:
+                walk(child)
+            if not node.is_leaf and node is not self.root:
+                branches.append(node)
+
+        walk(self.root)
+        return branches
+
+    def ready_rollup_branches(self) -> list[PlanNode]:
+        """Branches whose children are all complete but that haven't
+        themselves passed rollup verification yet, post-order. A tree shape
+        alone is never proof of completion -- each of these still needs a
+        rollup verification call before it can be marked complete."""
+        return [
+            branch
+            for branch in self._branches()
+            if branch.status != StepStatus.completed
+            and all(child.status == StepStatus.completed for child in branch.children)
+        ]
+
     def is_complete(self) -> bool:
-        return not self.unresolved_steps()
+        return not self.unresolved_steps() and all(
+            branch.status == StepStatus.completed for branch in self._branches()
+        )
 
 
 class Planner:
@@ -283,7 +337,7 @@ class Planner:
             self._parse_steps(response.message.content),
             planning_facts=planning_facts,
         )
-        node.children = children
+        node.set_children(children)
 
         child_ancestors = ancestors if is_root else ancestors + [node.description]
         for child in children:
@@ -350,13 +404,42 @@ class Planner:
             recent_history=recent_history,
             finish_summary=finish_summary,
         )
+        return await self._verdict_from_prompt(prompt, activity="verifying step")
+
+    async def verify_rollup(
+        self,
+        plan: Plan,
+        branch: PlanNode,
+        evidence: str,
+        *,
+        children_summary: str = "",
+    ) -> tuple[StepVerdict, str]:
+        """Check whether a branch's own sub-goal was actually achieved, now
+        that every one of its children individually reports complete. The
+        tree shape alone (all children complete) is never proof by itself --
+        `evidence` (ground-truth repo/file state for the branch's own goal)
+        is the primary signal; `children_summary` (each child's own verdict/
+        reason) is supporting context only, mirroring how leaf verification
+        treats current file contents as ground truth over a tool's own
+        success wording."""
+        prompt = build_rollup_verify_prompt(
+            goal=plan.goal,
+            branch=branch.description,
+            evidence=evidence,
+            children_summary=children_summary,
+        )
+        return await self._verdict_from_prompt(prompt, activity="verifying branch rollup")
+
+    async def _verdict_from_prompt(
+        self, prompt: str, *, activity: str
+    ) -> tuple[StepVerdict, str]:
         response = await self._complete(
             CompletionRequest(
                 messages=[Message(role=Role.user, content=prompt)],
                 temperature=0.0,
                 max_tokens=100,
             ),
-            activity="verifying step",
+            activity=activity,
         )
         verdict, reason = self._parse_verdict(response.message.content)
         if reason != "Could not parse verifier response":

@@ -1559,6 +1559,65 @@ class ReActLoop:
                 continue
         return facts
 
+    async def _process_rollups(self, plan: Plan) -> str | None:
+        """After a leaf is marked complete, walk any ancestor branches whose
+        children are now all complete and run a rollup verification on each
+        before marking the branch itself complete -- cascading upward as
+        long as each rollup passes. A branch whose children are all
+        individually complete can still fail its own rollup (a flawed
+        decomposition can leave the sub-goal uncovered); on the first
+        rejection, stop and return feedback for the model instead of
+        continuing to roll up higher branches that depend on it."""
+        while True:
+            ready = plan.ready_rollup_branches()
+            if not ready:
+                return None
+            branch = ready[0]
+            evidence = self._rollup_evidence(branch)
+            children_summary = "\n".join(
+                f"- {child.description}: {child.status.value}"
+                + (f" -- {child.last_verdict_reason}" if child.last_verdict_reason else "")
+                for child in branch.children
+            )
+            try:
+                verdict, reason = await self._planner.verify_rollup(
+                    plan, branch, evidence, children_summary=children_summary
+                )
+            except Exception as exc:
+                logger.warning("Branch rollup verification failed with an exception: %s", exc)
+                return (
+                    f"Branch '{branch.description}' could not be verified due to an "
+                    f"error ({exc}); it will be re-checked next turn."
+                )
+            logger.debug(
+                "Branch %r rollup verdict: %s (%s)", branch.description, verdict.value, reason
+            )
+            if verdict != StepVerdict.complete:
+                branch.last_verdict_reason = reason
+                return (
+                    f"Branch '{branch.description}' is not fully done yet ({verdict.value}): "
+                    f"{reason or 'insufficient evidence that the sub-goal was achieved'}. "
+                    "All of its individual steps were marked complete, but the sub-goal as a "
+                    "whole is not -- the decomposition may have missed something; keep "
+                    "working on this part of the plan."
+                )
+            branch.status = StepStatus.completed
+            branch.last_verdict_reason = reason
+
+    def _rollup_evidence(self, branch: PlanNode) -> str:
+        """Ground-truth evidence for a branch's own sub-goal: current
+        contents of any files its description names, read directly from
+        disk -- the same "current file contents are ground truth" framing
+        leaf verification uses, not inferred from any child's tool-result
+        wording."""
+        named_files = _named_step_files(branch.description)
+        contents = _step_file_contents(
+            self._context.workspace, written_paths=[], named_files=named_files
+        )
+        if contents:
+            return f"Current file contents (read directly from disk for verification):\n{contents}"
+        return ""
+
     async def _verify_and_mark_step(
         self,
         plan: Plan,
@@ -1695,7 +1754,8 @@ class ReActLoop:
                     step.description,
                 )
                 step.status = StepStatus.completed
-                return None
+                step.last_verdict_reason = "auto-completed: investigative step had tool evidence"
+                return await self._process_rollups(plan)
             else:
                 step.status = StepStatus.pending
                 return (
@@ -1721,7 +1781,8 @@ class ReActLoop:
                         target_name,
                     )
                     step.status = StepStatus.completed
-                    return None
+                    step.last_verdict_reason = f"auto-completed: {target_name} now exists on disk"
+                    return await self._process_rollups(plan)
             for path_str in files_written_this_turn:
                 p = Path(path_str)
                 if p.name in target_names and p.exists() and p.stat().st_size > 0:
@@ -1735,7 +1796,8 @@ class ReActLoop:
                         step.description, path_str,
                     )
                     step.status = StepStatus.completed
-                    return None
+                    step.last_verdict_reason = f"auto-completed: {path_str} exists on disk"
+                    return await self._process_rollups(plan)
 
         mutation_targets = _looks_like_file_mutation_step(step.description)
         if (
@@ -1757,7 +1819,10 @@ class ReActLoop:
                 successful_commands_this_turn,
             )
             step.status = StepStatus.completed
-            return None
+            step.last_verdict_reason = (
+                f"auto-completed: successful command(s) {successful_commands_this_turn}"
+            )
+            return await self._process_rollups(plan)
 
         if (
             _looks_like_execution_step(step.description)
@@ -1858,7 +1923,8 @@ class ReActLoop:
             )
         if verdict == StepVerdict.complete:
             step.status = StepStatus.completed
-            return None
+            step.last_verdict_reason = reason
+            return await self._process_rollups(plan)
 
         step.status = StepStatus.pending
         return (

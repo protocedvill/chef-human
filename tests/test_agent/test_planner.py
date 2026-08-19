@@ -58,6 +58,15 @@ class TestPlanNode:
         branch = PlanNode(description="branch", children=[PlanNode(description="child")])
         assert not branch.is_leaf
 
+    def test_set_children_links_parent(self):
+        parent = PlanNode(description="parent")
+        child_a = PlanNode(description="a")
+        child_b = PlanNode(description="b")
+        parent.set_children([child_a, child_b])
+        assert parent.children == [child_a, child_b]
+        assert child_a.parent is parent
+        assert child_b.parent is parent
+
 
 class TestPlan:
     def test_creation(self):
@@ -73,6 +82,56 @@ class TestPlan:
         plan = Plan(goal="Fix the bug", steps=steps)
         assert len(plan.steps) == 2
         assert plan.steps[0].description == "Find the bug"
+
+    def test_construction_links_parent_pointers(self):
+        steps = [PlanNode(index=1, description="Find the bug")]
+        plan = Plan(goal="Fix the bug", steps=steps)
+        assert steps[0].parent is plan.root
+
+
+class TestReadyRollupBranches:
+    def test_root_is_never_a_rollup_branch(self):
+        """The root represents the whole plan, already gated by
+        unresolved_steps()/the finish flow -- it's excluded from rollup
+        so a simple depth-1 plan doesn't need an extra rollup call."""
+        leaf = PlanNode(description="leaf", status=StepStatus.completed)
+        plan = Plan(goal="g", steps=[leaf])
+        assert plan.ready_rollup_branches() == []
+        assert plan.is_complete()
+
+    def test_branch_ready_only_once_all_children_complete(self):
+        child_a = PlanNode(description="a", status=StepStatus.completed)
+        child_b = PlanNode(description="b", status=StepStatus.pending)
+        branch = PlanNode(description="branch")
+        branch.set_children([child_a, child_b])
+        plan = Plan(goal="g", steps=[branch])
+
+        assert plan.ready_rollup_branches() == []
+
+        child_b.status = StepStatus.completed
+        assert plan.ready_rollup_branches() == [branch]
+
+    def test_branch_not_ready_again_once_completed(self):
+        child = PlanNode(description="a", status=StepStatus.completed)
+        branch = PlanNode(description="branch", status=StepStatus.completed)
+        branch.set_children([child])
+        plan = Plan(goal="g", steps=[branch])
+        assert plan.ready_rollup_branches() == []
+
+    def test_deepest_branches_come_first(self):
+        grandchild = PlanNode(description="gc", status=StepStatus.completed)
+        inner_branch = PlanNode(description="inner")
+        inner_branch.set_children([grandchild])
+        outer_branch = PlanNode(description="outer")
+        outer_branch.set_children([inner_branch])
+        plan = Plan(goal="g", steps=[outer_branch])
+
+        # Only inner_branch's children are all complete so far -- outer_branch
+        # isn't ready until inner_branch itself is marked complete.
+        assert plan.ready_rollup_branches() == [inner_branch]
+
+        inner_branch.status = StepStatus.completed
+        assert plan.ready_rollup_branches() == [outer_branch]
 
 
 class TestCurrentStep:
@@ -142,6 +201,12 @@ class TestCurrentStep:
 
         leaf_2.status = StepStatus.completed
         assert plan.current_leaf() is None
+        # All leaves are complete, but branch_1 hasn't passed rollup
+        # verification yet -- is_complete() requires that too.
+        assert not plan.is_complete()
+        assert plan.ready_rollup_branches() == [branch_1]
+
+        branch_1.status = StepStatus.completed
         assert plan.is_complete()
 
 
@@ -855,6 +920,69 @@ class TestVerifyStep:
             "Verifier repair response could not be parsed" in record.message
             for record in caplog.records
         )
+
+
+class TestVerifyRollup:
+    @pytest.mark.asyncio
+    async def test_returns_parsed_verdict(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content="VERDICT: COMPLETE\nREASON: covered"),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = Plan(goal="Build the scheduler", steps=[])
+        branch = PlanNode(description="Implement the scheduler module")
+        verdict, reason = await planner.verify_rollup(plan, branch, "utils.py exists and works")
+
+        assert verdict == StepVerdict.complete
+        assert reason == "covered"
+
+    @pytest.mark.asyncio
+    async def test_sends_goal_branch_evidence_and_children_summary(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content="VERDICT: NOT_COMPLETE\nREASON: gap"),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = Plan(goal="Build the scheduler", steps=[])
+        branch = PlanNode(description="Implement the scheduler module")
+
+        verdict, reason = await planner.verify_rollup(
+            plan,
+            branch,
+            "scheduler.py is missing the topo-sort function",
+            children_summary="- Write scheduler.py: completed -- created the file",
+        )
+
+        call_args = mock_complete.await_args
+        prompt = call_args.args[0].messages[0].content
+        assert "Build the scheduler" in prompt
+        assert "Implement the scheduler module" in prompt
+        assert "scheduler.py is missing the topo-sort function" in prompt
+        assert "Write scheduler.py: completed -- created the file" in prompt
+        assert verdict == StepVerdict.not_complete
+        assert reason == "gap"
+
+    @pytest.mark.asyncio
+    async def test_can_reject_branch_even_with_no_children_summary(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content="VERDICT: NOT_COMPLETE\nREASON: missing coverage"),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        plan = Plan(goal="Build the scheduler", steps=[])
+        branch = PlanNode(description="Implement the scheduler module")
+
+        verdict, reason = await planner.verify_rollup(plan, branch, "")
+
+        assert verdict == StepVerdict.not_complete
+        assert reason == "missing coverage"
 
 
 class TestUsageCallback:

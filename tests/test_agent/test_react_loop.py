@@ -128,6 +128,9 @@ def _make_mock_planner() -> MagicMock:
     # verification keep their old behavior (any non-failing turn advances
     # the plan). Tests that specifically exercise verification override this.
     planner.verify_step = AsyncMock(return_value=(StepVerdict.complete, "done"))
+    # Same default-to-complete rationale as verify_step above: only tests
+    # exercising rollup verification specifically override this.
+    planner.verify_rollup = AsyncMock(return_value=(StepVerdict.complete, "covered"))
     planner.format_plan_for_prompt = MagicMock(
         side_effect=lambda p: f"Plan: {p.goal}"
     )
@@ -1928,6 +1931,172 @@ class TestObjectiveFileVerification:
         _, _, evidence_arg = planner.verify_step.await_args.args
         assert "Objective facts" in evidence_arg
         assert "hello_world.py: exists=True, lines=2, created_during_step=True" in evidence_arg
+
+
+class TestRollupVerification:
+    """A branch node, once all its children are marked complete, must pass
+    its own rollup verification call before the branch itself is marked
+    complete -- a decomposition can leave the sub-goal uncovered even
+    though every child step individually succeeded."""
+
+    def _context_rooted_at(self, tmp_path):
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(side_effect=lambda p: tmp_path / p)
+        return context
+
+    def _branch_plan(self):
+        child_a = PlanNode(index=1, description="Write utils.py", status=StepStatus.completed)
+        child_b = PlanNode(index=2, description="Verify main.py runs", status=StepStatus.pending)
+        branch = PlanNode(description="Implement the module")
+        branch.set_children([child_a, child_b])
+        plan = Plan(goal="Build the module", steps=[branch])
+        return plan, branch, child_a, child_b
+
+    @pytest.mark.asyncio
+    async def test_rollup_runs_only_once_all_children_complete(self, tmp_path):
+        planner = _make_mock_planner()
+        plan, branch, child_a, child_b = self._branch_plan()
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        # child_b still pending: completing it should trigger the rollup,
+        # since it's the last of branch's children.
+        feedback = await loop._verify_and_mark_step(
+            plan,
+            evidence="ran python main.py successfully",
+            successful_commands_this_turn=["python main.py"],
+            step_override=child_b,
+        )
+
+        assert feedback is None
+        assert child_b.status == StepStatus.completed
+        planner.verify_rollup.assert_awaited_once()
+        assert branch.status == StepStatus.completed
+        assert plan.is_complete()
+
+    @pytest.mark.asyncio
+    async def test_rollup_rejection_leaves_branch_incomplete_with_feedback(self, tmp_path):
+        planner = _make_mock_planner()
+        planner.verify_rollup = AsyncMock(
+            return_value=(StepVerdict.not_complete, "main.py never calls utils.slugify")
+        )
+        plan, branch, child_a, child_b = self._branch_plan()
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        feedback = await loop._verify_and_mark_step(
+            plan,
+            evidence="ran python main.py successfully",
+            successful_commands_this_turn=["python main.py"],
+            step_override=child_b,
+        )
+
+        # child_b itself still verified complete on its own terms --
+        # rollup rejection is about the branch's sub-goal, not the leaf.
+        assert child_b.status == StepStatus.completed
+        assert branch.status != StepStatus.completed
+        assert feedback is not None
+        assert "Implement the module" in feedback
+        assert "main.py never calls utils.slugify" in feedback
+        assert not plan.is_complete()
+
+    @pytest.mark.asyncio
+    async def test_rollup_receives_children_verdicts_as_supporting_context(self, tmp_path):
+        planner = _make_mock_planner()
+        plan, branch, child_a, child_b = self._branch_plan()
+        child_a.last_verdict_reason = "created utils.py with slugify()"
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._verify_and_mark_step(
+            plan,
+            evidence="ran python main.py successfully",
+            successful_commands_this_turn=["python main.py"],
+            step_override=child_b,
+        )
+
+        planner.verify_rollup.assert_awaited_once()
+        call = planner.verify_rollup.await_args
+        assert call.args[1] is branch
+        children_summary = call.kwargs["children_summary"]
+        assert "Write utils.py: completed -- created utils.py with slugify()" in children_summary
+        assert "Verify main.py runs: completed" in children_summary
+
+    @pytest.mark.asyncio
+    async def test_rollup_evidence_is_current_disk_contents_not_children_say_so(self, tmp_path):
+        planner = _make_mock_planner()
+        child_a = PlanNode(index=1, description="Write module.py", status=StepStatus.completed)
+        branch = PlanNode(description="Implement module.py correctly")
+        branch.set_children([child_a])
+        plan = Plan(goal="Build the module", steps=[branch])
+        context = self._context_rooted_at(tmp_path)
+        (tmp_path / "module.py").write_text("def real_impl():\n    return 42\n")
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._verify_and_mark_step(
+            plan,
+            evidence="wrote module.py",
+            files_written_this_turn={str(tmp_path / "module.py"): False},
+            step_override=child_a,
+        )
+
+        planner.verify_rollup.assert_awaited_once()
+        evidence_arg = planner.verify_rollup.await_args.args[2]
+        assert "def real_impl():" in evidence_arg
+
+    @pytest.mark.asyncio
+    async def test_no_rollup_call_while_siblings_still_pending(self, tmp_path):
+        planner = _make_mock_planner()
+        child_a = PlanNode(index=1, description="Run the utils tests", status=StepStatus.completed)
+        child_b = PlanNode(index=2, description="Write main.py", status=StepStatus.pending)
+        branch = PlanNode(description="Implement the module")
+        branch.set_children([child_a, child_b])
+        plan = Plan(goal="Build the module", steps=[branch])
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        # Re-verify child_a (already complete) via step_override -- branch
+        # still has child_b pending, so no rollup should fire.
+        feedback = await loop._verify_and_mark_step(
+            plan,
+            evidence="ran tests",
+            successful_commands_this_turn=["python -m pytest"],
+            step_override=child_a,
+        )
+
+        assert feedback is None
+        assert child_a.status == StepStatus.completed
+        planner.verify_rollup.assert_not_awaited()
 
 
 class TestVerifierSeesFileContents:

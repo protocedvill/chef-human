@@ -240,6 +240,14 @@ class TuiUI:
         self.stats.add_warning(message[:150])
         self.render_stats()
 
+    def on_escalation(self, node, message: str) -> None:
+        self._chat().write(
+            f"[bold red]Escalation:[/] {escape(node.description[:80])!r} was "
+            f"marked failed and skipped -- {escape(message)}"
+        )
+        self.stats.add_warning(f"Escalated: {node.description[:80]}")
+        self.render_stats()
+
     async def on_approval_request(self, tool_call: "ParsedToolCall") -> bool:
         command = tool_call.arguments.get("command", "")
         approved = await self._app.push_screen_wait(ApprovalModal(command))

@@ -626,6 +626,7 @@ class TestToDict:
                     {"index": 2, "description": "step two", "status": "pending"},
                 ],
             },
+            "escalations": [],
         }
 
     def test_plan_to_dict(self):

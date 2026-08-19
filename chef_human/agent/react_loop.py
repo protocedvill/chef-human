@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from collections import deque
 
@@ -449,6 +449,20 @@ def _is_low_value_ask_user_question(question: str) -> bool:
 
 
 @dataclass
+class EscalationRecord:
+    """A node that exhausted its retry/replan budget mid-run. The default
+    fallback (mark failed, keep executing the rest of the tree) is already
+    applied by the time this is created -- it exists purely so a human can
+    act on the escalation *after* the fact, via `ReActLoop.resolve_escalation`,
+    rather than the run blocking on them while it happens. See ticket 06
+    (mid-execution-escalation-ux) in `.scratch/planning-tree/issues/`."""
+
+    node_id: str
+    description: str
+    message: str
+
+
+@dataclass
 class AgentResult:
     plan: Plan
     steps_taken: int
@@ -456,6 +470,7 @@ class AgentResult:
     success: bool = True
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
+    escalations: list[EscalationRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -465,6 +480,10 @@ class AgentResult:
             "plan": self.plan.to_dict(),
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "escalations": [
+                {"node_id": e.node_id, "description": e.description, "message": e.message}
+                for e in self.escalations
+            ],
         }
 
 
@@ -564,6 +583,19 @@ class ReActLoop:
         # is a branch: by rollup-rejection time its leaves already report
         # complete, so current_leaf() has already moved past it).
         self._last_failed_node: PlanNode | None = None
+        # Nodes that exhausted their retry/replan budget mid-run, in headless
+        # or interactive mode alike -- both apply the same mark-failed-and-
+        # continue default (see `_handle_escalation`). Kept so a human can
+        # review and act on them retroactively via `resolve_escalation` once
+        # the run has surfaced them, rather than the run blocking on a
+        # decision no one is there (headless) or ready (interactive) to make
+        # the instant it happens.
+        self._escalations: list[EscalationRecord] = []
+        # RetryManager for the run currently in progress -- lives on the
+        # instance (not a `_execute` local) so `resolve_escalation`'s resume
+        # reuses it instead of resetting every node's failure/replan counters.
+        # Reset to None at the top of every `run()`.
+        self._retry_mgr: RetryManager | None = None
 
     def _record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
         self._total_prompt_tokens += prompt_tokens
@@ -610,20 +642,31 @@ class ReActLoop:
     def _handle_escalation(
         self, plan: Plan, node: PlanNode | None, steps_taken: int, message: str
     ) -> AgentResult | None:
-        """Applies an ESCALATE verdict for `node`. In headless mode
-        (`disable_ask_user`) a node exhausting its own retry/replan budget is
-        marked failed and execution continues on the rest of the tree --
-        returns None so the caller keeps looping. Interactively (or when no
-        specific node is in play), the whole run terminates as before --
-        returns the `AgentResult` for the caller to return."""
+        """Applies an ESCALATE verdict for `node`. Headless and interactive
+        modes apply the identical default fallback: mark the node failed and
+        keep executing the rest of the tree -- returns None so the caller
+        keeps looping. `ReActLoop` dispatch is already sequential (one leaf
+        at a time), so there's no real concurrency for a blocking prompt to
+        let something "keep running in the background" past; the default
+        already applies before a human could see a prompt anyway. A
+        notification is surfaced via `self._ui.on_escalation` and recorded in
+        `self._escalations` so the human can act on it retroactively --
+        `resolve_escalation` edits/redecomposes/rejects after the fact. Only
+        when no specific node can be identified (nothing to mark failed and
+        continue past) does the whole run still terminate."""
         target = node or self._last_failed_node
-        if self._config.disable_ask_user and target is not None:
+        if target is not None:
             target.status = StepStatus.failed
             logger.warning(
                 "Node %s exhausted its retry/replan budget; marking failed "
-                "and continuing on the rest of the tree (headless mode)",
+                "and continuing on the rest of the tree",
                 target.node_id,
             )
+            record = EscalationRecord(
+                node_id=target.node_id, description=target.description, message=message
+            )
+            self._escalations.append(record)
+            self._ui.on_escalation(target, message)
             self._last_failed_node = None
             return None
         return self._make_result(
@@ -708,13 +751,69 @@ class ReActLoop:
     async def run(self, task: str) -> AgentResult:
         logger.info("Task started: %s", task[:200])
         self._ui.on_start(task)
-        steps_taken = 0
+        self._retry_mgr = None
         plan = await self._plan_task(task)
         logger.info(
             "Plan generated: %d step(s): %s",
             len(plan.steps),
             [s.description for s in plan.steps],
         )
+        return await self._execute(plan, task)
+
+    async def resolve_escalation(
+        self,
+        plan: Plan,
+        task: str,
+        node_id: str,
+        action: str,
+        description: str | None = None,
+        guidance: str | None = None,
+    ) -> AgentResult:
+        """Acts, after the fact, on a node recorded in `self._escalations`
+        (an ESCALATE verdict that was already resolved via the automatic
+        mark-failed-and-continue default -- see `_handle_escalation`). This
+        is the human's retroactive override, per ticket 06
+        (mid-execution-escalation-ux): `action` is one of "edit" (change the
+        node's description and retry it), "redecompose" (ask the planner to
+        retry the node's subtree with `guidance`), or "reject" (abort the
+        whole run). "edit"/"redecompose" reverse the already-applied default
+        by un-marking the node failed and resuming execution from the
+        current plan state -- everything else in the tree (other completed
+        nodes, their evidence) is untouched.
+
+        `plan` and `task` should be the ones returned by/passed into the
+        original `run()` call this escalation came from; the plan is mutated
+        and re-executed in place, so passing a different plan than the one
+        the escalation actually belongs to would silently look up the wrong
+        node."""
+        target = plan.find_node(node_id)
+        if target is None:
+            raise ValueError(f"No node with id {node_id!r} in this plan")
+        self._escalations = [e for e in self._escalations if e.node_id != node_id]
+
+        if action == "reject":
+            return self._make_result(
+                plan=plan,
+                steps_taken=0,
+                message=f"Run rejected by user at node {node_id} ({target.description!r}).",
+                success=False,
+            )
+        if action == "edit":
+            if description is not None:
+                target.description = description
+            target.status = StepStatus.pending
+        elif action == "redecompose":
+            self._discard_subtree_evidence(target)
+            target.status = StepStatus.pending
+            await self._planner.replan_subtree(plan, target, guidance or "")
+            self._rebuild_ancestor_evidence(target)
+        else:
+            raise ValueError(f"Unknown escalation action: {action!r}")
+
+        return await self._execute(plan, task, resume=True)
+
+    async def _execute(self, plan: Plan, task: str, resume: bool = False) -> AgentResult:
+        steps_taken = 0
         scratchpad = Scratchpad()
         last_call_signature: str | None = None
         files_read: set[str] = set()
@@ -725,10 +824,17 @@ class ReActLoop:
         # wipe out prior verify-failure reasons before a later REPLAN could
         # see them.
         verify_failure_history: list[str] = []
-        retry_mgr = RetryManager(
-            max_retries_per_step=self._config.max_retries_per_step,
-            max_replans=self._config.max_replans,
-        )
+        # Persisted on the instance (not a local, as it used to be) so a
+        # `resolve_escalation` resume reuses the same RetryManager rather
+        # than resetting every node's failure/replan counters back to zero
+        # -- see ticket 06. `run()` always starts a fresh one; a resume
+        # keeps whatever `run()` already built.
+        if self._retry_mgr is None:
+            self._retry_mgr = RetryManager(
+                max_retries_per_step=self._config.max_retries_per_step,
+                max_replans=self._config.max_replans,
+            )
+        retry_mgr = self._retry_mgr
         # Counts consecutive turns that started with the plan already fully
         # complete (current_leaf() is None) where the model still didn't
         # call `finish`. The prompt already tells it to ("All steps are
@@ -740,9 +846,10 @@ class ReActLoop:
         # permission to stop -- see the auto-finish check below.
         turns_with_plan_complete_no_finish = 0
 
-        self._context.conversation.add_message(
-            Message(role=Role.user, content=task)
-        )
+        if not resume:
+            self._context.conversation.add_message(
+                Message(role=Role.user, content=task)
+            )
 
         try:
             while steps_taken < self._config.max_steps:
@@ -2208,6 +2315,7 @@ class ReActLoop:
             success=success,
             total_prompt_tokens=self._total_prompt_tokens,
             total_completion_tokens=self._total_completion_tokens,
+            escalations=list(self._escalations),
         )
 
     def _save_conversation(self, task: str) -> None:

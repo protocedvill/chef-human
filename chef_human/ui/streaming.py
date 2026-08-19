@@ -101,6 +101,12 @@ class StreamingUI:
         if not self._quiet:
             self._console.print("[bold yellow]↻ Re-planning...[/]")
 
+    def on_escalation(self, node, message: str) -> None:
+        self._console.print(
+            f"[bold red]⚠ Escalation:[/] {node.description[:80]!r} was marked "
+            f"failed and skipped -- {message}"
+        )
+
     def on_error(self, message: str) -> None:
         self._console.print(f"[bold red]Error:[/] {message}")
 

@@ -22,6 +22,7 @@ from chef_human.config import Settings
 
 import re
 from rich.console import Console
+from rich.prompt import Prompt
 from rich.syntax import Syntax
 
 
@@ -661,6 +662,9 @@ async def _run_repl(
     total_prompt_tokens = 0
     total_completion_tokens = 0
     conversation_saved = False
+    last_loop = None
+    last_result = None
+    last_task = ""
 
     ui._console.print("[bold cyan]chef-human interactive mode[/]")
     ui._console.print("Type [bold]/help[/] for commands. [dim]Ctrl+C or /exit to quit.[/]")
@@ -725,6 +729,53 @@ async def _run_repl(
                     ui._console.print(f"[dim]{result.output or result.error}[/]")
                 continue
 
+            if cmd == "escalations":
+                if last_loop is None or last_result is None or not last_result.escalations:
+                    ui._console.print("[dim]No pending escalations.[/]")
+                    continue
+                for esc in last_result.escalations:
+                    ui._console.print(
+                        f"  [bold]{esc.node_id}[/] {esc.description!r} -- {esc.message}"
+                    )
+                choice = Prompt.ask(
+                    "Node id to act on (blank to skip)", default=""
+                ).strip()
+                if not choice:
+                    continue
+                action = Prompt.ask(
+                    "Action", choices=["edit", "redecompose", "reject"], default="reject"
+                )
+                description = None
+                guidance = None
+                if action == "edit":
+                    description = Prompt.ask("New description")
+                elif action == "redecompose":
+                    guidance = Prompt.ask("Guidance for the planner", default="")
+                # `resolve_escalation` reuses `last_loop`, whose
+                # total_*_tokens are lifetime-cumulative for that loop (not a
+                # per-call delta) -- diff against the pre-call totals rather
+                # than adding the new cumulative value on top of the old one.
+                prev_prompt_tokens = last_result.total_prompt_tokens
+                prev_completion_tokens = last_result.total_completion_tokens
+                try:
+                    last_result = await last_loop.resolve_escalation(
+                        last_result.plan,
+                        last_task,
+                        choice,
+                        action,
+                        description=description,
+                        guidance=guidance,
+                    )
+                except ValueError as exc:
+                    ui._console.print(f"[red]{exc}[/]")
+                    continue
+                total_prompt_tokens += last_result.total_prompt_tokens - prev_prompt_tokens
+                total_completion_tokens += (
+                    last_result.total_completion_tokens - prev_completion_tokens
+                )
+                ui.display_result(last_result)
+                continue
+
             continue
 
         if not text:
@@ -752,6 +803,14 @@ async def _run_repl(
         total_completion_tokens += result.total_completion_tokens
 
         ui.display_result(result)
+        last_loop = loop
+        last_result = result
+        last_task = text
+        if result.escalations:
+            ui._console.print(
+                f"[dim]{len(result.escalations)} node(s) were escalated and "
+                f"skipped -- run /escalations to review.[/]"
+            )
 
     if not conversation_saved:
         conv = context.conversation.to_dict()

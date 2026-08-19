@@ -213,6 +213,26 @@ class Plan:
             and all(child.status == StepStatus.completed for child in branch.children)
         ]
 
+    def find_node(self, node_id: str) -> PlanNode | None:
+        """Looks up a node anywhere in the tree by its stable `node_id`,
+        including the root and branches -- used by retroactive escalation
+        handling (`ReActLoop.resolve_escalation`), which only has a node_id
+        recorded from an earlier turn, not a live reference into this
+        particular `Plan` instance."""
+        if self.root.node_id == node_id:
+            return self.root
+
+        def walk(node: PlanNode) -> PlanNode | None:
+            for child in node.children:
+                if child.node_id == node_id:
+                    return child
+                found = walk(child)
+                if found is not None:
+                    return found
+            return None
+
+        return walk(self.root)
+
     def is_complete(self) -> bool:
         return not self.unresolved_steps() and all(
             branch.status == StepStatus.completed for branch in self._branches()

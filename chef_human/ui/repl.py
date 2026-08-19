@@ -82,6 +82,14 @@ class ReplUI:
     def on_replan(self) -> None:
         self._console.print("[bold yellow]↻ Re-planning...[/]")
 
+    def on_escalation(self, node, message: str) -> None:
+        self._console.print(
+            f"\n[bold red]⚠ Escalation:[/] {node.description!r} exhausted its "
+            f"retry/replan budget -- marked failed and skipped ({message})\n"
+            f"  [dim]Run /escalations after this finishes to edit, redecompose, "
+            f"or reject.[/]"
+        )
+
     def on_error(self, message: str) -> None:
         self._console.print(f"[bold red]Error:[/] {message}")
 
@@ -116,7 +124,7 @@ class ReplUI:
             elif cmd == "help":
                 self._print_help()
                 return ""
-            elif cmd in ("clear", "save", "tokens", "history", "undo", "redo"):
+            elif cmd in ("clear", "save", "tokens", "history", "undo", "redo", "escalations"):
                 return text
             else:
                 self._console.print(f"[yellow]Unknown command: {text}. Type /help for available commands.[/]")
@@ -135,6 +143,8 @@ class ReplUI:
   /redo               Redo the last undone change
   /tokens             Show token usage
   /history            Show recent messages
+  /escalations        Review nodes that exhausted their retry budget and
+                      were skipped -- edit, redecompose, or reject
 
 Any other input is sent to the agent as a task.
 """)

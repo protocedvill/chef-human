@@ -17,9 +17,9 @@ overridden.
 
 **Status:** ready-for-agent
 
-- [ ] In interactive mode, a node exhausting its budget gets the same automatic fallback as headless (marked failed, execution continues) — the run never blocks waiting on the human
-- [ ] A notification of the escalation is surfaced to the human, referencing the specific node
-- [ ] The human can retroactively edit the node's description and have it retried
-- [ ] The human can retroactively trigger a guided redecomposition of the node's subtree
-- [ ] The human can reject, aborting the whole run
-- [ ] Overriding an already-applied default correctly reverses it (e.g. an edit-and-retry un-marks the node as failed and re-attempts it)
+- [x] In interactive mode, a node exhausting its budget gets the same automatic fallback as headless (marked failed, execution continues) — the run never blocks waiting on the human
+- [x] A notification of the escalation is surfaced to the human, referencing the specific node
+- [x] The human can retroactively edit the node's description and have it retried
+- [x] The human can retroactively trigger a guided redecomposition of the node's subtree
+- [x] The human can reject, aborting the whole run
+- [x] Overriding an already-applied default correctly reverses it (e.g. an edit-and-retry un-marks the node as failed and re-attempts it)

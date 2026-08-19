@@ -259,6 +259,14 @@ class DebugTUI:
         self._check_keys()
         self._log("[yellow]Re-planning...[/]")
 
+    def on_escalation(self, node, message: str) -> None:
+        self._ensure_live()
+        self._check_keys()
+        self._log(
+            f"[bold red]Escalation:[/] node {node.node_id} "
+            f"({node.description[:60]!r}) marked failed and skipped -- {message}"
+        )
+
     def on_error(self, message: str) -> None:
         self._ensure_live()
         self._check_keys()

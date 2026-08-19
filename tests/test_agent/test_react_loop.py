@@ -6,9 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from chef_human.agent.planner import Plan, PlanNode, Planner, StepStatus, StepVerdict
+from chef_human.agent.retry import RetryManager
 from chef_human.agent.prompts import build_agent_prompt
 from chef_human.agent.react_loop import (
     AgentResult,
+    EscalationRecord,
     ReActConfig,
     ReActLoop,
     StepEvidence,
@@ -1325,10 +1327,14 @@ class TestStepVerification:
         )
         result = await loop.run("do something")
 
+        # Ticket 06: escalation marks the node failed and continues (same
+        # default as headless) instead of terminating the run on the spot --
+        # with nothing left to work on, the loop idles out to max_steps
+        # rather than stopping the instant the one node escalates.
         assert not result.success
-        assert result.steps_taken == 1
-        assert plan.steps[0].status == StepStatus.pending
-        assert "verification repeatedly failed" in result.message
+        assert plan.steps[0].status == StepStatus.failed
+        assert len(result.escalations) == 1
+        assert result.escalations[0].node_id == plan.steps[0].node_id
 
     @pytest.mark.asyncio
     async def test_reasoning_only_verifier_rejections_accumulate(self):
@@ -5108,10 +5114,12 @@ class TestPerNodeRetryEscalation:
         assert result.success is False
 
     @pytest.mark.asyncio
-    async def test_interactive_mode_still_escalates_whole_run(self):
-        """Without disable_ask_user, ESCALATE keeps its old whole-run
-        behavior -- headless-only continuation must not change interactive
-        sessions."""
+    async def test_interactive_mode_also_marks_failed_and_continues(self):
+        """Ticket 06: interactive mode applies the identical mark-failed-and-
+        continue default as headless -- the run never blocks waiting on a
+        human mid-execution. It differs from headless only in that a
+        notification is recorded (`AgentResult.escalations`) for the human to
+        act on retroactively."""
         backend = _make_mock_backend()
         backend.complete.return_value = CompletionResponse(
             message=Message(
@@ -5158,9 +5166,337 @@ class TestPerNodeRetryEscalation:
         )
         result = await loop.run("do something")
 
+        # Same fallback as headless: both leaves get their own turn and are
+        # marked failed individually rather than the run terminating on the
+        # first escalation.
+        assert step_one.status == StepStatus.failed
+        assert step_two.status == StepStatus.failed
+        assert call_count >= 2
         assert result.success is False
-        assert step_one.status != StepStatus.completed
-        # The run terminated on the first node's escalation -- step two was
-        # never attempted.
-        assert call_count == 1
-        assert step_two.status == StepStatus.pending
+        assert len(result.escalations) == 2
+        assert {e.node_id for e in result.escalations} == {
+            step_one.node_id,
+            step_two.node_id,
+        }
+
+
+class TestResolveEscalation:
+    """Ticket 06: after a node escalates and gets auto-marked failed, the
+    human can retroactively edit/redecompose/reject via
+    `ReActLoop.resolve_escalation`, reversing the applied default and
+    resuming execution."""
+
+    @pytest.mark.asyncio
+    async def test_edit_unmarks_failed_and_retries_node(self):
+        read_call = '<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>'
+        finish_call = '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(
+            side_effect=[
+                CompletionResponse(message=Message(role=Role.assistant, content=read_call)),
+                CompletionResponse(message=Message(role=Role.assistant, content=read_call)),
+                CompletionResponse(message=Message(role=Role.assistant, content=finish_call)),
+            ]
+        )
+        planner = _make_mock_planner()
+        step_one = PlanNode(index=1, description="Step one", status=StepStatus.pending)
+        plan = Plan(goal="Test task", steps=[step_one])
+        planner.generate_plan.return_value = plan
+
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        call_count = 0
+
+        async def flaky_run(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            obj = MagicMock()
+            obj.success = call_count > 1
+            obj.output = "ok" if obj.success else "fail"
+            obj.error = None if obj.success else "fail"
+            return obj
+
+        read_tool.run = flaky_run
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="Task complete: done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {
+            "read": read_tool, "finish": finish_tool
+        }.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=4, max_retries_per_step=1, max_replans=0),
+        )
+        result = await loop.run("do something")
+        assert step_one.status == StepStatus.failed
+        assert len(result.escalations) == 1
+
+        resumed = await loop.resolve_escalation(
+            result.plan, "do something", step_one.node_id, "edit",
+            description="Step one (edited)",
+        )
+
+        assert step_one.description == "Step one (edited)"
+        assert step_one.status == StepStatus.completed
+        assert resumed.success is True
+        assert resumed.escalations == []
+
+    @pytest.mark.asyncio
+    async def test_reject_aborts_without_retrying(self):
+        planner = _make_mock_planner()
+        step_one = PlanNode(index=1, description="Step one", status=StepStatus.failed)
+        plan = Plan(goal="Test task", steps=[step_one])
+
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=4),
+        )
+        loop._escalations.append(
+            EscalationRecord(
+                node_id=step_one.node_id, description=step_one.description, message="x"
+            )
+        )
+
+        result = await loop.resolve_escalation(
+            plan, "do something", step_one.node_id, "reject"
+        )
+
+        assert result.success is False
+        assert step_one.status == StepStatus.failed
+        assert loop._escalations == []
+
+    @pytest.mark.asyncio
+    async def test_redecompose_calls_planner_with_guidance(self):
+        read_call = '<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>'
+        finish_call = '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(
+            side_effect=[
+                CompletionResponse(message=Message(role=Role.assistant, content=read_call)),
+                CompletionResponse(message=Message(role=Role.assistant, content=finish_call)),
+            ]
+        )
+        planner = _make_mock_planner()
+        step_one = PlanNode(index=1, description="Step one", status=StepStatus.failed)
+        plan = Plan(goal="Test task", steps=[step_one])
+
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = _make_tool_run("ok", success=True)
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="Task complete: done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {
+            "read": read_tool, "finish": finish_tool
+        }.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=4),
+        )
+        loop._escalations.append(
+            EscalationRecord(
+                node_id=step_one.node_id, description=step_one.description, message="x"
+            )
+        )
+
+        resumed = await loop.resolve_escalation(
+            plan, "do something", step_one.node_id, "redecompose",
+            guidance="try a different approach",
+        )
+
+        planner.replan_subtree.assert_awaited_once()
+        _, called_node, called_guidance = planner.replan_subtree.await_args.args
+        assert called_node is step_one
+        assert called_guidance == "try a different approach"
+        assert resumed.success is True
+
+    @pytest.mark.asyncio
+    async def test_unknown_node_id_raises(self):
+        plan = Plan(goal="Test task", steps=[PlanNode(index=1, description="Step one")])
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=_make_mock_context(),
+            planner=_make_mock_planner(),
+            config=ReActConfig(),
+        )
+        with pytest.raises(ValueError):
+            await loop.resolve_escalation(plan, "task", "nonexistent-id", "edit")
+
+
+class TestPlanFindNode:
+    def test_finds_leaf_branch_and_root(self):
+        leaf = PlanNode(description="leaf")
+        branch = PlanNode(description="branch")
+        branch.set_children([leaf])
+        plan = Plan(goal="g", steps=[branch])
+
+        assert plan.find_node(leaf.node_id) is leaf
+        assert plan.find_node(branch.node_id) is branch
+        assert plan.find_node(plan.root.node_id) is plan.root
+
+    def test_missing_id_returns_none(self):
+        plan = Plan(goal="g", steps=[PlanNode(description="leaf")])
+        assert plan.find_node("does-not-exist") is None
+
+
+class TestResolveEscalationPreservesState:
+    """Regression coverage for issues found in code review of ticket 06:
+    a resume via `resolve_escalation` must not reset an unrelated sibling's
+    retry/replan budget, and must not re-inject the task message a second
+    time into conversation history."""
+
+    @pytest.mark.asyncio
+    async def test_sibling_retry_budget_survives_a_resume(self):
+        read_call = '<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>'
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(role=Role.assistant, content=read_call)
+        )
+        planner = _make_mock_planner()
+        step_one = PlanNode(index=1, description="Step one", status=StepStatus.failed)
+        step_two = PlanNode(index=2, description="Step two", status=StepStatus.pending)
+        plan = Plan(goal="Test task", steps=[step_one, step_two])
+
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = _make_tool_run("fail", success=False)
+        registry.get.return_value = read_tool
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=_make_mock_context(),
+            planner=planner,
+            config=ReActConfig(max_steps=1, max_retries_per_step=2, max_replans=0),
+        )
+        # Pre-seed step_two's retry counter as if run() had already burned
+        # one of its two allowed failures earlier in the same run.
+        loop._retry_mgr = RetryManager(max_retries_per_step=2, max_replans=0)
+        loop._retry_mgr.record_iteration(step_two.node_id, 1, 1, ["earlier failure"])
+
+        await loop.resolve_escalation(
+            plan, "do something", step_one.node_id, "edit", description="Step one (edited)"
+        )
+
+        # A resume must not have replaced/reset the RetryManager -- step_two's
+        # pre-existing failure count is still tracked, one away from its cap.
+        assert loop._retry_mgr.consecutive_failures(step_two.node_id) == 1
+
+    @pytest.mark.asyncio
+    async def test_resume_does_not_re_add_task_message(self):
+        read_call = '<tool_call>{"name": "read", "arguments": {"path": "x.py"}}</tool_call>'
+        finish_call = '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>'
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(
+            side_effect=[
+                CompletionResponse(message=Message(role=Role.assistant, content=read_call)),
+                CompletionResponse(message=Message(role=Role.assistant, content=read_call)),
+                CompletionResponse(message=Message(role=Role.assistant, content=finish_call)),
+            ]
+        )
+        planner = _make_mock_planner()
+        step_one = PlanNode(index=1, description="Step one", status=StepStatus.pending)
+        plan = Plan(goal="Test task", steps=[step_one])
+        planner.generate_plan.return_value = plan
+
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        call_count = 0
+
+        async def flaky_run(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            obj = MagicMock()
+            obj.success = call_count > 1
+            obj.output = "ok" if obj.success else "fail"
+            obj.error = None if obj.success else "fail"
+            return obj
+
+        read_tool.run = flaky_run
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="Task complete: done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {
+            "read": read_tool, "finish": finish_tool
+        }.get(name)
+
+        context = _make_mock_context()
+        added_messages: list[Message] = []
+        context.conversation.add_message = MagicMock(side_effect=added_messages.append)
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=4, max_retries_per_step=1, max_replans=0),
+        )
+        result = await loop.run("do the task")
+
+        def task_message_count() -> int:
+            return sum(
+                1 for m in added_messages
+                if m.role == Role.user and m.content == "do the task"
+            )
+
+        assert task_message_count() == 1
+
+        await loop.resolve_escalation(
+            result.plan, "do the task", step_one.node_id, "edit",
+            description="Step one (edited)",
+        )
+
+        assert task_message_count() == 1

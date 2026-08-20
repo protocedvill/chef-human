@@ -2319,6 +2319,45 @@ class TestRollupVerification:
         assert "from flask import Flask" in evidence
 
     @pytest.mark.asyncio
+    async def test_rollup_evidence_includes_files_children_only_read(self, tmp_path):
+        """A pure-exploration branch (every checkpoint's children, by
+        construction) never *writes* anything -- its children only read.
+        Before this fix, `_rollup_evidence` only aggregated
+        `files_written`, so such a branch always got "" as evidence no
+        matter how thorough the exploration was, and the rollup verifier
+        rejected it every time for "no ground-truth evidence found",
+        regardless of what was actually read. Reproduces a real
+        vague_feature_request_real_repo benchmark run where an exploration
+        checkpoint's rollup was rejected 6 times in a row on exactly this
+        basis despite the agent having read the README, CMakeLists.txt,
+        several Python entry points, and C headers -- none of which ever
+        reached the verifier."""
+        planner = _make_mock_planner()
+        child_a = PlanNode(
+            index=1, description="Read the README", status=StepStatus.completed
+        )
+        branch = PlanNode(
+            description="Explore the codebase to understand its structure"
+        )
+        branch.set_children([child_a])
+        plan = Plan(goal="Add a web interface", steps=[branch])
+        context = self._context_rooted_at(tmp_path)
+        readme = tmp_path / "README.md"
+        readme.write_text("This project does bluetooth stuff via C and Python.\n")
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+        loop._step_evidence_for(child_a).merge_turn({}, [], {str(readme)})
+
+        evidence = loop._rollup_evidence(branch)
+
+        assert "bluetooth stuff" in evidence
+
+    @pytest.mark.asyncio
     async def test_no_rollup_call_while_siblings_still_pending(self, tmp_path):
         planner = _make_mock_planner()
         child_a = PlanNode(index=1, description="Run the utils tests", status=StepStatus.completed)

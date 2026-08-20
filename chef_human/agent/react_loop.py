@@ -2361,22 +2361,36 @@ class ReActLoop:
         concrete filename in it (e.g. "Implement the backend API server ...
         to wrap existing host commands"), in which case `_named_step_files`
         finds nothing -- falls back to the files the branch's own children
-        actually wrote (`self._step_evidence`), so an abstractly-worded
-        branch doesn't get zero ground truth just because its own wording
-        never names a file. Observed in a real benchmark run: a fully
-        implemented `web/app.py` was repeatedly rejected by rollup
+        actually wrote or read (`self._step_evidence`), so an abstractly-
+        worded branch doesn't get zero ground truth just because its own
+        wording never names a file. Observed in a real benchmark run: a
+        fully implemented `web/app.py` was repeatedly rejected by rollup
         verification because the branch's description named no file, so
-        this always returned "" regardless of what was actually on disk."""
+        this always returned "" regardless of what was actually on disk.
+
+        Files a child merely *read* (not wrote) are included here too, not
+        just written ones -- a pure-exploration branch (every checkpoint's
+        children, by construction) never writes anything, so before this
+        fix `_rollup_evidence` always returned "" for one regardless of how
+        thorough the exploration was, and the rollup verifier -- correctly,
+        given what it was shown -- rejected it every time for "no
+        ground-truth evidence found for this sub-goal". Confirmed against a
+        real vague_feature_request_real_repo run where a checkpoint's
+        rollup was rejected 6 times in a row despite the agent having read
+        the README, both CMakeLists.txt files, three Python entry points,
+        and several C headers/sources -- none of which ever reached the
+        verifier."""
         named_files = _named_step_files(branch.description)
-        written_paths: list[str] = []
+        evidence_paths: list[str] = []
         seen: set[str] = set()
         for child in branch.children:
-            for path_str in self._step_evidence_for(child).files_written:
+            child_evidence = self._step_evidence_for(child)
+            for path_str in (*child_evidence.files_written, *child_evidence.files_read):
                 if path_str not in seen:
                     seen.add(path_str)
-                    written_paths.append(path_str)
+                    evidence_paths.append(path_str)
         contents = _step_file_contents(
-            self._context.workspace, written_paths=written_paths, named_files=named_files
+            self._context.workspace, written_paths=evidence_paths, named_files=named_files
         )
         if contents:
             return f"Current file contents (read directly from disk for verification):\n{contents}"

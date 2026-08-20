@@ -512,17 +512,26 @@ class StepEvidence:
     # write/edit recorded for this step
     files_written: dict[str, bool] = None
     successful_commands: list[str] = None
+    # Paths read while this step was current, newly observed on the turn
+    # they were recorded (see ReActLoop._files_read_recorded) -- kept
+    # separately from files_written so a checkpoint's continuation call
+    # (mostly exploration-heavy, reads not writes) has ground truth on what
+    # was actually looked at, not just what was produced.
+    files_read: set[str] = None
 
     def __post_init__(self) -> None:
         if self.files_written is None:
             self.files_written = {}
         if self.successful_commands is None:
             self.successful_commands = []
+        if self.files_read is None:
+            self.files_read = set()
 
     def merge_turn(
         self,
         files_written_this_turn: dict[str, bool],
         successful_commands_this_turn: list[str],
+        files_read_this_turn: set[str] | None = None,
     ) -> None:
         for path_str, existed_before in files_written_this_turn.items():
             previous = self.files_written.get(path_str)
@@ -534,6 +543,8 @@ class StepEvidence:
         for command in successful_commands_this_turn:
             if command and command not in self.successful_commands:
                 self.successful_commands.append(command)
+        if files_read_this_turn:
+            self.files_read.update(files_read_this_turn)
 
 
 @dataclass
@@ -623,6 +634,22 @@ class ReActLoop:
         # .scratch/planning-tree/issues/). Reset to 0 whenever any node
         # under that branch actually completes.
         self._subtree_replan_streak: dict[str, int] = {}
+        # Every path ever recorded into a step's StepEvidence.files_read so
+        # far -- `files_read` passed into _verify_and_mark_step is the
+        # whole session's running set, not just this turn's, so this is
+        # used to diff out only the newly-read paths each call (mirroring
+        # how files_written_this_turn/successful_commands_this_turn are
+        # already turn-scoped by their caller).
+        self._files_read_recorded: set[str] = set()
+        # Per-parent-node streak of consecutive checkpoint completions
+        # whose continuation call spliced in nothing but further
+        # checkpoints (no real leaf/branch work in between) -- bounds a
+        # pathological checkpoint chain across execution turns, separate
+        # from _ConvergenceTracker (scoped to one synchronous generation-
+        # time recursion, the wrong shape for something triggered across
+        # turns via _process_rollups). Reset whenever a splice includes at
+        # least one non-checkpoint step.
+        self._checkpoint_chain_streak: dict[str, int] = {}
         # RetryManager for the run currently in progress -- lives on the
         # instance (not a `_execute` local) so `resolve_escalation`'s resume
         # reuses it instead of resetting every node's failure/replan counters.
@@ -1011,6 +1038,16 @@ class ReActLoop:
         try:
             while steps_taken < self._config.max_steps:
                 current = plan.current_leaf()
+                if current is not None and current.is_checkpoint and current.is_leaf:
+                    # The current node was declared a checkpoint but has no
+                    # children yet -- this is the first turn execution has
+                    # reached it, so decompose it now instead of at
+                    # generation time.
+                    logger.debug(
+                        "Checkpoint %r reached; expanding lazily", current.description
+                    )
+                    await self._planner.expand_checkpoint(plan, current)
+                    current = plan.current_leaf()
                 plan_was_complete_at_turn_start = plan.is_complete()
                 logger.debug(
                     "Turn starting: steps_taken=%d/%d, current step=%r",
@@ -2125,16 +2162,125 @@ class ReActLoop:
             # above, on a *different* branch) doesn't get attributed back
             # to this now-completed one.
             self._last_failed_node = None
+            if branch.is_checkpoint:
+                await self._fire_checkpoint_continuation(plan, branch)
+
+    async def _fire_checkpoint_continuation(self, plan: Plan, checkpoint: PlanNode) -> None:
+        """Once a checkpoint's own rollup verification has passed (it is
+        already marked complete by the caller, independent of what happens
+        below), plan and splice in what comes next -- as fresh sibling
+        nodes immediately following the checkpoint in its own parent's
+        children list, not nested deeper under it."""
+        evidence = self._checkpoint_continuation_evidence(checkpoint)
+        new_nodes = await self._planner.continue_from_checkpoint(plan, checkpoint, evidence)
+        parent = checkpoint.parent or plan.root
+        self._bound_checkpoint_chain(parent, new_nodes)
+        if not new_nodes:
+            return
+        idx = next(
+            i for i, c in enumerate(parent.children) if c.node_id == checkpoint.node_id
+        )
+        updated_children = (
+            parent.children[: idx + 1] + new_nodes + parent.children[idx + 1 :]
+        )
+        parent.set_children(updated_children)
+        await self._planner.expand_spliced_steps(plan, new_nodes)
+
+    def _checkpoint_continuation_evidence(self, checkpoint: PlanNode) -> str:
+        """Evidence for the continuation call: files read by the
+        checkpoint's own descendants (not just files written -- checkpoints
+        are typically exploration-heavy) plus each descendant's own
+        recorded verification reasoning, alongside the same current-disk-
+        contents evidence an ordinary rollup check gets."""
+        files_read: list[str] = []
+        seen_reads: set[str] = set()
+        reasoning_lines: list[str] = []
+
+        def walk(node: PlanNode) -> None:
+            for path_str in sorted(self._step_evidence_for(node).files_read):
+                if path_str not in seen_reads:
+                    seen_reads.add(path_str)
+                    files_read.append(path_str)
+            if node is not checkpoint and node.last_verdict_reason:
+                reasoning_lines.append(f"- {node.description}: {node.last_verdict_reason}")
+            for child in node.children:
+                walk(child)
+
+        walk(checkpoint)
+
+        parts: list[str] = []
+        if files_read:
+            parts.append(
+                "Files read during this checkpoint's work:\n"
+                + "\n".join(f"- {p}" for p in files_read)
+            )
+        if reasoning_lines:
+            parts.append("What each of the checkpoint's own steps found:\n" + "\n".join(reasoning_lines))
+        written_evidence = self._rollup_evidence(checkpoint)
+        if written_evidence:
+            parts.append(written_evidence)
+        return "\n\n".join(parts)
+
+    # A checkpoint's continuation splicing in nothing but further
+    # checkpoints, this many times in a row under the same parent, with no
+    # real (non-checkpoint) work happening in between, is a pathological
+    # chain -- bounded here rather than left to run unbounded.
+    _CHECKPOINT_CHAIN_STREAK_LIMIT = 3
+
+    def _bound_checkpoint_chain(self, parent: PlanNode, new_nodes: list[PlanNode]) -> None:
+        """Tracks, per parent node, how many consecutive checkpoint splices
+        produced no real work -- only further checkpoints. Once the streak
+        crosses the limit, force-demotes any checkpoint among `new_nodes`
+        to an ordinary leaf so the chain can't continue unbounded, and
+        resets the streak. A splice that includes any non-checkpoint step
+        resets the streak to 0 (real progress happened)."""
+        if not new_nodes:
+            return
+        all_checkpoints = all(n.is_checkpoint for n in new_nodes)
+        if not all_checkpoints:
+            self._checkpoint_chain_streak.pop(parent.node_id, None)
+            return
+        streak = self._checkpoint_chain_streak.get(parent.node_id, 0) + 1
+        self._checkpoint_chain_streak[parent.node_id] = streak
+        if streak < self._CHECKPOINT_CHAIN_STREAK_LIMIT:
+            return
+        logger.warning(
+            "Checkpoint chain under node %s has produced %d consecutive "
+            "checkpoint-only splices with no real work in between; forcing "
+            "further checkpoints in this splice to ordinary leaves",
+            parent.node_id,
+            streak,
+        )
+        for node in new_nodes:
+            node.declared_type = "leaf"
+            node.requested_branch = False
+        self._checkpoint_chain_streak[parent.node_id] = 0
 
     def _rollup_evidence(self, branch: PlanNode) -> str:
         """Ground-truth evidence for a branch's own sub-goal: current
         contents of any files its description names, read directly from
         disk -- the same "current file contents are ground truth" framing
         leaf verification uses, not inferred from any child's tool-result
-        wording."""
+        wording. A branch description is often abstract prose with no
+        concrete filename in it (e.g. "Implement the backend API server ...
+        to wrap existing host commands"), in which case `_named_step_files`
+        finds nothing -- falls back to the files the branch's own children
+        actually wrote (`self._step_evidence`), so an abstractly-worded
+        branch doesn't get zero ground truth just because its own wording
+        never names a file. Observed in a real benchmark run: a fully
+        implemented `web/app.py` was repeatedly rejected by rollup
+        verification because the branch's description named no file, so
+        this always returned "" regardless of what was actually on disk."""
         named_files = _named_step_files(branch.description)
+        written_paths: list[str] = []
+        seen: set[str] = set()
+        for child in branch.children:
+            for path_str in self._step_evidence_for(child).files_written:
+                if path_str not in seen:
+                    seen.add(path_str)
+                    written_paths.append(path_str)
         contents = _step_file_contents(
-            self._context.workspace, written_paths=[], named_files=named_files
+            self._context.workspace, written_paths=written_paths, named_files=named_files
         )
         if contents:
             return f"Current file contents (read directly from disk for verification):\n{contents}"
@@ -2170,15 +2316,19 @@ class ReActLoop:
         files_written_this_turn = files_written_this_turn or {}
         successful_commands_this_turn = successful_commands_this_turn or []
         files_read = files_read or set()
+        files_read_this_turn = files_read - self._files_read_recorded
+        self._files_read_recorded |= files_read_this_turn
         step_evidence = self._step_evidence_for(step)
-        step_evidence.merge_turn(files_written_this_turn, successful_commands_this_turn)
+        step_evidence.merge_turn(
+            files_written_this_turn, successful_commands_this_turn, files_read_this_turn
+        )
         # Propagate upward at write time so every ancestor branch's bucket
         # always reflects everything that happened under it, without a
         # separate read-time aggregation step at rollup-verification time.
         ancestor = step.parent
         while ancestor is not None:
             self._step_evidence_for(ancestor).merge_turn(
-                files_written_this_turn, successful_commands_this_turn
+                files_written_this_turn, successful_commands_this_turn, files_read_this_turn
             )
             ancestor = ancestor.parent
         accumulated_files_written = step_evidence.files_written

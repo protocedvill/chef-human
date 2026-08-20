@@ -1161,6 +1161,45 @@ class TestUpdatePlan:
         assert revised.steps[0].index == 1
 
     @pytest.mark.asyncio
+    async def test_reworded_pending_step_keeps_node_id_via_continues_node_id(self):
+        """A whole-plan replan that merely rewords an in-flight step should
+        preserve that step's node_id (and thus its evidence bucket) rather
+        than silently orphaning it as a brand-new node. See
+        docs/adr/0001-evidence-carry-forward-across-whole-plan-replan.md --
+        this reproduces the stuck-replan-loop bug from a real benchmark run
+        (frontier/vague_feature_request_real_repo), where the planner kept
+        alternating between "Read docs/source/software.rst" and "Use the
+        read tool on docs/source/software.rst" every replan, losing the
+        prior read's evidence each time."""
+        pending = PlanNode(index=1, description="Read docs/source/software.rst")
+        original_id = pending.node_id
+        plan = Plan(goal="Add a web interface", steps=[pending])
+
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps([
+                    {
+                        "description": "Use the read tool on docs/source/software.rst",
+                        "continues_node_id": original_id,
+                    }
+                ]),
+            ),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        revised = await planner.update_plan(
+            plan, failure_context="Use the `read` tool on `docs/source/software.rst` in this turn"
+        )
+
+        assert len(revised.steps) == 1
+        assert revised.steps[0].node_id == original_id
+        assert revised.steps[0].description == "Use the read tool on docs/source/software.rst"
+        assert revised.steps[0].status == StepStatus.pending
+
+    @pytest.mark.asyncio
     async def test_sends_failure_context(self):
         mock_complete = AsyncMock(return_value=CompletionResponse(
             message=Message(role=Role.assistant, content='["Revised step"]'),
@@ -1256,6 +1295,175 @@ class TestReplanSubtree:
         assert "Big task" in user_msg
         assert "Build the subsystem" in user_msg
         assert "rollup said no coverage" in user_msg
+
+
+class TestCheckpointParsing:
+    def test_type_checkpoint_parses_as_checkpoint_not_branch(self):
+        planner = Planner(MagicMock())
+        content = json.dumps([
+            {"description": "Explore the existing code", "type": "checkpoint"},
+        ])
+        steps = planner._parse_steps(content)
+
+        assert steps[0].declared_type == "checkpoint"
+        assert steps[0].is_checkpoint is True
+        # Deliberately not requested_branch -- a checkpoint must not be
+        # expanded at generation time by _expand_node's requested_branch
+        # recursion; only lazily, later, via expand_checkpoint.
+        assert steps[0].requested_branch is False
+
+    def test_unrecognized_type_falls_back_to_leaf(self):
+        planner = Planner(MagicMock())
+        content = json.dumps([{"description": "Do a thing", "type": "bogus"}])
+        steps = planner._parse_steps(content)
+
+        assert steps[0].declared_type == "leaf"
+        assert steps[0].is_checkpoint is False
+
+    def test_normalize_steps_carries_declared_type_through(self):
+        steps = [PlanNode(index=1, description="Explore first", declared_type="checkpoint")]
+        normalized = Planner._normalize_steps("goal", steps)
+
+        assert normalized[0].declared_type == "checkpoint"
+        assert normalized[0].is_checkpoint is True
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_has_zero_children_immediately_after_generate_plan(self):
+        mock_llm = _make_mock_backend([
+            PlanNode(index=1, description="Explore the repo", declared_type="branch"),
+        ])
+        # Force the generation call to actually emit a checkpoint step,
+        # since _make_mock_backend's helper only round-trips descriptions.
+        mock_llm.complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps([
+                    {"description": "Explore the repo first", "type": "checkpoint"},
+                ]),
+            ),
+        ))
+        planner = Planner(mock_llm)
+
+        plan = await planner.generate_plan("Add a web interface")
+
+        assert len(plan.steps) == 1
+        assert plan.steps[0].is_checkpoint is True
+        assert plan.steps[0].children == []
+
+
+class TestExpandCheckpoint:
+    @pytest.mark.asyncio
+    async def test_expands_checkpoint_into_real_children(self, monkeypatch):
+        monkeypatch.setattr(Planner, "_check_atomicity", AsyncMock(return_value=(False, "")))
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps(["Read the README", "List the source directory"]),
+            ),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        checkpoint = PlanNode(index=1, description="Explore the repo first", declared_type="checkpoint")
+        plan = Plan(goal="Add a web interface", steps=[checkpoint])
+        planner = Planner(mock_llm)
+
+        await planner.expand_checkpoint(plan, checkpoint)
+
+        assert [c.description for c in checkpoint.children] == [
+            "Read the README",
+            "List the source directory",
+        ]
+        assert checkpoint.is_checkpoint is True  # kind itself is unchanged
+
+    @pytest.mark.asyncio
+    async def test_expansion_not_triggered_by_generate_plan_itself(self, monkeypatch):
+        """Sanity check for the "lazy" half of lazy expansion: the
+        expand_checkpoint call above must be the only thing that populates
+        a checkpoint's children -- generate_plan on its own must never do
+        it (already covered by TestCheckpointParsing, re-asserted here at
+        the same seam expand_checkpoint tests use)."""
+        checkpoint = PlanNode(index=1, description="Explore the repo first", declared_type="checkpoint")
+        assert checkpoint.children == []
+        assert checkpoint.is_leaf is True
+
+    @pytest.mark.asyncio
+    async def test_single_checkpoint_child_pass_through_is_demoted_to_leaf(self, monkeypatch):
+        monkeypatch.setattr(Planner, "_check_atomicity", AsyncMock(return_value=(False, "")))
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps([
+                    {"description": "Explore some more", "type": "checkpoint"},
+                ]),
+            ),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        checkpoint = PlanNode(index=1, description="Explore the repo first", declared_type="checkpoint")
+        plan = Plan(goal="Add a web interface", steps=[checkpoint])
+        planner = Planner(mock_llm)
+
+        await planner.expand_checkpoint(plan, checkpoint)
+
+        assert len(checkpoint.children) == 1
+        assert checkpoint.children[0].is_checkpoint is False
+        assert checkpoint.children[0].requested_branch is False
+
+
+class TestContinueFromCheckpoint:
+    @pytest.mark.asyncio
+    async def test_prompt_is_success_framed_not_failure_framed(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(role=Role.assistant, content='["Implement the Flask app"]'),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        checkpoint = PlanNode(index=1, description="Explore the repo", declared_type="checkpoint")
+        checkpoint.status = StepStatus.completed
+        child = PlanNode(index=1, description="Read app structure", status=StepStatus.completed)
+        checkpoint.set_children([child])
+        plan = Plan(goal="Add a web interface", steps=[checkpoint])
+        planner = Planner(mock_llm)
+
+        await planner.continue_from_checkpoint(
+            plan, checkpoint, evidence="Found a Flask app skeleton in web/app.py"
+        )
+
+        call_args = mock_complete.await_args
+        request = call_args.args[0]
+        system_msg = request.messages[0].content
+        user_msg = request.messages[1].content
+        assert "completed and verified" in system_msg
+        assert "nothing failed" in system_msg.lower()
+        assert "failure" not in system_msg.lower()
+        assert "Found a Flask app skeleton in web/app.py" in user_msg
+        assert "Explore the repo" in user_msg
+
+    @pytest.mark.asyncio
+    async def test_returns_fresh_unattached_nodes_without_continues_node_id(self):
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps([
+                    {"description": "Implement the Flask app", "continues_node_id": "some-stale-id"},
+                ]),
+            ),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        checkpoint = PlanNode(index=1, description="Explore the repo", declared_type="checkpoint")
+        plan = Plan(goal="Add a web interface", steps=[checkpoint])
+        planner = Planner(mock_llm)
+
+        new_nodes = await planner.continue_from_checkpoint(plan, checkpoint, evidence="")
+
+        assert len(new_nodes) == 1
+        assert new_nodes[0].parent is None
+        assert new_nodes[0].continues_node_id is None
 
 
 class TestParseVerdict:

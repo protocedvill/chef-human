@@ -39,6 +39,16 @@ Rules:
   to that step's object, e.g. {"description": "Decide how limits vary per client", "type": "branch",
   "uncertain": true} — this surfaces the step for human review before execution starts. Use this
   sparingly, only for real ambiguity, not as a default.
+- Use "type": "checkpoint" for a step whose own implementation shape you cannot responsibly plan
+  yet — you don't know enough about this codebase/task to decide what to build, only what to go
+  find out first. A checkpoint's own steps (exploration, or a genuinely uncertain partial
+  implementation) are decomposed later, once execution reaches it; nothing past it is planned now.
+  When you don't know how to implement something: first plan the concrete steps that would gain
+  the missing knowledge (explore the relevant code, read the spec, run something to see what
+  happens), THEN end that phase with a checkpoint step — do not place a checkpoint reflexively at
+  the start of every plan, and do not chain a checkpoint's own steps into another checkpoint with
+  no real exploration or implementation work done in between; each checkpoint must earn its place
+  by resolving real uncertainty, not by deferring the same decision again.
 - Do NOT include any explanation or markdown — just the JSON array"""
 
 

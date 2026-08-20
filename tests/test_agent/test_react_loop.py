@@ -2170,6 +2170,54 @@ class TestRollupVerification:
         assert "def real_impl():" in evidence_arg
 
     @pytest.mark.asyncio
+    async def test_rollup_evidence_falls_back_to_files_children_actually_wrote(self, tmp_path):
+        """A branch whose own description names no concrete file (e.g. an
+        abstract sub-goal like "Implement the backend API server ... to
+        wrap existing host commands") must not get zero ground-truth
+        evidence just because `_named_step_files` finds nothing in its
+        description text. It should fall back to the files its own
+        children actually wrote (tracked in `self._step_evidence`), so the
+        rollup verifier sees real disk content instead of being forced to
+        rely solely on children's self-reported status text. Reproduces a
+        real benchmark run (frontier/vague_feature_request_real_repo) where
+        a fully-implemented `web/app.py` (a real Flask app) was repeatedly
+        rejected by rollup verification with reasons like "no Flask/FastAPI
+        application code... exists" -- because the branch description
+        ("Implement the backend API server (e.g., using Flask/FastAPI in
+        Python) to wrap existing host commands or logic.") names no file,
+        so `_rollup_evidence` returned "" every time regardless of what was
+        actually on disk."""
+        planner = _make_mock_planner()
+        child_a = PlanNode(
+            index=1,
+            description="Write the core module",
+            status=StepStatus.completed,
+        )
+        branch = PlanNode(
+            description="Implement the backend API server to wrap existing host commands or logic."
+        )
+        branch.set_children([child_a])
+        plan = Plan(goal="Add a web interface", steps=[branch])
+        context = self._context_rooted_at(tmp_path)
+        app_py = tmp_path / "web" / "app.py"
+        app_py.parent.mkdir(parents=True)
+        app_py.write_text("from flask import Flask\napp = Flask(__name__)\n")
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+        loop._step_evidence_for(child_a).merge_turn(
+            {str(app_py): False}, ["written this turn"]
+        )
+
+        evidence = loop._rollup_evidence(branch)
+
+        assert "from flask import Flask" in evidence
+
+    @pytest.mark.asyncio
     async def test_no_rollup_call_while_siblings_still_pending(self, tmp_path):
         planner = _make_mock_planner()
         child_a = PlanNode(index=1, description="Run the utils tests", status=StepStatus.completed)
@@ -2198,6 +2246,333 @@ class TestRollupVerification:
         assert feedback is None
         assert child_a.status == StepStatus.completed
         planner.verify_rollup.assert_not_awaited()
+
+
+class TestCheckpointOrchestration:
+    """Checkpoint completion (a checkpoint is just a PlanNode branch, see
+    `PlanNode.declared_type`) triggers a success-framed continuation call
+    and splices its output as fresh siblings -- orchestrated from
+    `_process_rollups`/`_fire_checkpoint_continuation`, mirroring
+    TestRollupVerification's style with a mocked Planner."""
+
+    def _context_rooted_at(self, tmp_path):
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(side_effect=lambda p: tmp_path / p)
+        return context
+
+    def _checkpoint_plan(self):
+        child = PlanNode(index=1, description="Read the README", status=StepStatus.pending)
+        checkpoint = PlanNode(description="Explore the repo first", declared_type="checkpoint")
+        checkpoint.set_children([child])
+        plan = Plan(goal="Add a web interface", steps=[checkpoint])
+        return plan, checkpoint, child
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_rollup_success_fires_continuation_call(self, tmp_path):
+        planner = _make_mock_planner()
+        continuation_step = PlanNode(index=1, description="Implement the Flask app")
+        planner.continue_from_checkpoint = AsyncMock(return_value=[continuation_step])
+        planner.expand_spliced_steps = AsyncMock(return_value=None)
+        plan, checkpoint, child = self._checkpoint_plan()
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._verify_and_mark_step(
+            plan,
+            evidence="read the README",
+            successful_commands_this_turn=[],
+            has_tool_evidence=True,
+            step_override=child,
+        )
+
+        planner.continue_from_checkpoint.assert_awaited_once()
+        call = planner.continue_from_checkpoint.await_args
+        assert call.args[1] is checkpoint
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_marked_complete_independent_of_spawned_work(self, tmp_path):
+        planner = _make_mock_planner()
+        planner.continue_from_checkpoint = AsyncMock(
+            return_value=[PlanNode(index=1, description="Implement the Flask app")]
+        )
+        planner.expand_spliced_steps = AsyncMock(return_value=None)
+        plan, checkpoint, child = self._checkpoint_plan()
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._verify_and_mark_step(
+            plan, evidence="read the README", has_tool_evidence=True, step_override=child
+        )
+
+        assert checkpoint.status == StepStatus.completed
+
+    @pytest.mark.asyncio
+    async def test_continuation_steps_spliced_as_siblings_after_checkpoint(self, tmp_path):
+        planner = _make_mock_planner()
+        continuation_step = PlanNode(index=1, description="Implement the Flask app")
+        planner.continue_from_checkpoint = AsyncMock(return_value=[continuation_step])
+        planner.expand_spliced_steps = AsyncMock(return_value=None)
+        checkpoint_child = PlanNode(index=1, description="Read the README", status=StepStatus.pending)
+        checkpoint = PlanNode(description="Explore the repo first", declared_type="checkpoint")
+        checkpoint.set_children([checkpoint_child])
+        trailing_sibling = PlanNode(index=2, description="Run the final smoke test")
+        plan = Plan(goal="Add a web interface", steps=[checkpoint, trailing_sibling])
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._verify_and_mark_step(
+            plan,
+            evidence="read the README",
+            has_tool_evidence=True,
+            step_override=checkpoint_child,
+        )
+
+        assert [s.description for s in plan.steps] == [
+            "Explore the repo first",
+            "Implement the Flask app",
+            "Run the final smoke test",
+        ]
+        assert continuation_step.parent is plan.root
+        # Checkpoint node itself is not removed or replaced.
+        assert plan.steps[0] is checkpoint
+
+    @pytest.mark.asyncio
+    async def test_no_new_nodes_returned_leaves_tree_unchanged(self, tmp_path):
+        planner = _make_mock_planner()
+        planner.continue_from_checkpoint = AsyncMock(return_value=[])
+        planner.expand_spliced_steps = AsyncMock(return_value=None)
+        plan, checkpoint, child = self._checkpoint_plan()
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._verify_and_mark_step(
+            plan, evidence="read the README", has_tool_evidence=True, step_override=child
+        )
+
+        assert [s.description for s in plan.steps] == ["Explore the repo first"]
+        planner.expand_spliced_steps.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_parent_branch_rollup_waits_on_spliced_siblings(self, tmp_path):
+        """Spliced siblings become real children of the checkpoint's own
+        parent branch, so that branch's rollup naturally waits on them via
+        ready_rollup_branches -- no new rollup-scoping mechanism needed."""
+        planner = _make_mock_planner()
+        continuation_step = PlanNode(index=1, description="Implement the Flask app")
+        planner.continue_from_checkpoint = AsyncMock(return_value=[continuation_step])
+        planner.expand_spliced_steps = AsyncMock(return_value=None)
+        checkpoint_child = PlanNode(index=1, description="Read the README", status=StepStatus.pending)
+        checkpoint = PlanNode(description="Explore the repo first", declared_type="checkpoint")
+        checkpoint.set_children([checkpoint_child])
+        outer_branch = PlanNode(description="Build the web interface")
+        outer_branch.set_children([checkpoint])
+        plan = Plan(goal="Add a web interface", steps=[outer_branch])
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._verify_and_mark_step(
+            plan,
+            evidence="read the README",
+            has_tool_evidence=True,
+            step_override=checkpoint_child,
+        )
+
+        # outer_branch is not yet ready for its own rollup -- it now has a
+        # second, still-pending child (the spliced continuation step).
+        assert outer_branch not in plan.ready_rollup_branches()
+        assert continuation_step in outer_branch.children
+        planner.verify_rollup.assert_awaited_once()  # only the checkpoint's own rollup fired
+
+    @pytest.mark.asyncio
+    async def test_ordinary_branch_completion_does_not_fire_continuation_call(self, tmp_path):
+        """A plain (non-checkpoint) branch's rollup passing must not invoke
+        the checkpoint-only continuation path."""
+        planner = _make_mock_planner()
+        planner.continue_from_checkpoint = AsyncMock(return_value=[])
+        child = PlanNode(index=1, description="Write utils.py", status=StepStatus.pending)
+        branch = PlanNode(description="Implement the module")
+        branch.set_children([child])
+        plan = Plan(goal="Build the module", steps=[branch])
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._verify_and_mark_step(
+            plan, evidence="wrote utils.py", has_tool_evidence=True, step_override=child
+        )
+
+        planner.continue_from_checkpoint.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_lazy_expansion_fires_at_first_execution_not_generation(self, tmp_path):
+        """A checkpoint reached at the top of the main loop, with no
+        children yet, is expanded right then -- not before."""
+        planner = _make_mock_planner()
+        planner.expand_checkpoint = AsyncMock(
+            side_effect=lambda plan, node: node.set_children(
+                [PlanNode(index=1, description="Read the README")]
+            )
+        )
+        checkpoint = PlanNode(description="Explore the repo first", declared_type="checkpoint")
+        plan = Plan(goal="Add a web interface", steps=[checkpoint])
+        assert checkpoint.children == []  # nothing generated yet
+
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>',
+            )
+        )
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(side_effect=lambda p: tmp_path / p)
+        registry = _make_mock_tool_registry()
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=2),
+        )
+
+        await loop._execute(plan, "Add a web interface")
+
+        planner.expand_checkpoint.assert_awaited_once()
+        assert checkpoint.children  # populated by the time execution reached it
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_chain_streak_bounds_checkpoint_only_splices(self, tmp_path):
+        """A pathological chain of checkpoints splicing in nothing but
+        further checkpoints, with no real work in between, is forced to
+        stop after `_CHECKPOINT_CHAIN_STREAK_LIMIT` consecutive occurrences."""
+        planner = _make_mock_planner()
+        checkpoint_child = PlanNode(index=1, description="Read the README", status=StepStatus.pending)
+        checkpoint = PlanNode(description="Explore the repo first", declared_type="checkpoint")
+        checkpoint.set_children([checkpoint_child])
+        plan = Plan(goal="Add a web interface", steps=[checkpoint])
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+        loop._checkpoint_chain_streak[plan.root.node_id] = (
+            loop._CHECKPOINT_CHAIN_STREAK_LIMIT - 1
+        )
+        next_checkpoint = PlanNode(description="Explore some more", declared_type="checkpoint")
+        planner.continue_from_checkpoint = AsyncMock(return_value=[next_checkpoint])
+        planner.expand_spliced_steps = AsyncMock(return_value=None)
+
+        await loop._verify_and_mark_step(
+            plan,
+            evidence="read the README",
+            has_tool_evidence=True,
+            step_override=checkpoint_child,
+        )
+
+        assert next_checkpoint.is_checkpoint is False
+        assert next_checkpoint.requested_branch is False
+        assert loop._checkpoint_chain_streak[plan.root.node_id] == 0
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_chain_streak_resets_on_real_work(self, tmp_path):
+        planner = _make_mock_planner()
+        checkpoint_child = PlanNode(index=1, description="Read the README", status=StepStatus.pending)
+        checkpoint = PlanNode(description="Explore the repo first", declared_type="checkpoint")
+        checkpoint.set_children([checkpoint_child])
+        plan = Plan(goal="Add a web interface", steps=[checkpoint])
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+        loop._checkpoint_chain_streak[plan.root.node_id] = 5
+        real_step = PlanNode(description="Implement the Flask app")
+        planner.continue_from_checkpoint = AsyncMock(return_value=[real_step])
+        planner.expand_spliced_steps = AsyncMock(return_value=None)
+
+        await loop._verify_and_mark_step(
+            plan,
+            evidence="read the README",
+            has_tool_evidence=True,
+            step_override=checkpoint_child,
+        )
+
+        assert plan.root.node_id not in loop._checkpoint_chain_streak
+
+    @pytest.mark.asyncio
+    async def test_continuation_evidence_includes_files_read_and_children_reasoning(self, tmp_path):
+        planner = _make_mock_planner()
+        planner.continue_from_checkpoint = AsyncMock(
+            return_value=[PlanNode(index=1, description="Implement the Flask app")]
+        )
+        planner.expand_spliced_steps = AsyncMock(return_value=None)
+        checkpoint_child = PlanNode(index=1, description="Read app.py", status=StepStatus.pending)
+        checkpoint = PlanNode(description="Explore the repo first", declared_type="checkpoint")
+        checkpoint.set_children([checkpoint_child])
+        plan = Plan(goal="Add a web interface", steps=[checkpoint])
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        read_path = str(tmp_path / "web" / "app.py")
+        await loop._verify_and_mark_step(
+            plan,
+            evidence="read app.py",
+            has_tool_evidence=True,
+            files_read={read_path},
+            step_override=checkpoint_child,
+        )
+
+        call = planner.continue_from_checkpoint.await_args
+        evidence_arg = call.args[2]
+        assert read_path in evidence_arg
+        assert "Read app.py" in evidence_arg
 
 
 class TestVerifierSeesFileContents:

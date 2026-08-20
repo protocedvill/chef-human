@@ -99,13 +99,12 @@ class PlanNode:
     Identity is a stable `node_id` (assigned once) rather than description
     text or position -- evidence in `ReActLoop` is now keyed by `node_id`,
     not by description string (see CLAUDE.md for the bug that keying used to
-    cause). `update_plan()` still only carries a node forward across a
-    replan for steps already `StepStatus.completed`; a replan that reworks
-    the wording of a still-pending/in-progress step gets a fresh `node_id`
-    and an empty evidence bucket exactly as before this change -- fixing
-    that is out of scope for this ticket (see the "Known, not-yet-fixed
-    follow-up" note in CLAUDE.md and the per-node-evidence-and-replan-scope
-    ticket in `.scratch/planning-tree-adr/`).
+    cause). `update_plan()` carries a node forward across a whole-plan replan
+    either because it's already `StepStatus.completed`, or because the LLM's
+    revised step tagged `continues_node_id` naming a still-non-completed
+    prior node (see docs/adr/0001-evidence-carry-forward-across-whole-plan-
+    replan.md) -- an untagged or unmatched step gets a fresh `node_id` and an
+    empty evidence bucket, same as before that decision.
     `index` is purely a cosmetic display ordinal, not an identity.
 
     A node with no children is a leaf and must correspond to exactly one
@@ -150,10 +149,28 @@ class PlanNode:
     # what to split by instead of re-deriving that structure from scratch.
     # Empty for a node marked "branch" directly by the generation call.
     atomicity_reason: str = field(default="", repr=False, compare=False)
+    # Generation-time hint only (not identity, not persisted): set from a
+    # revised step's `continues_node_id` tag during `update_plan()`'s
+    # whole-plan replan, naming the prior node this step continues. Consumed
+    # once by `update_plan()` to decide node_id reuse, then irrelevant.
+    continues_node_id: str | None = field(default=None, repr=False, compare=False)
+    # Generation-time declared kind ("leaf", "branch", or "checkpoint"),
+    # parsed/preserved the same way `requested_branch`/`flagged` already
+    # are. Unlike `requested_branch` (a yes/no expand-now signal consumed
+    # once by `_expand_node`), a checkpoint's "branch-ness" is deferred:
+    # `requested_branch` stays False for a checkpoint so `_expand_node`
+    # does not recurse into it at generation time, but `declared_type`
+    # records that it should still be decomposed later, lazily, the first
+    # time execution reaches it (see `Planner.expand_checkpoint`).
+    declared_type: str = field(default="leaf", repr=False, compare=False)
 
     @property
     def is_leaf(self) -> bool:
         return not self.children
+
+    @property
+    def is_checkpoint(self) -> bool:
+        return self.declared_type == "checkpoint"
 
     def set_children(self, children: list["PlanNode"]) -> None:
         """Assigns `children` and links each child's `.parent` back to this
@@ -510,7 +527,14 @@ class Planner:
         step's own wording to reveal that loop, only the surrounding tree
         structure could."""
         for child in children:
-            if child.requested_branch:
+            if child.requested_branch or child.is_checkpoint:
+                # A checkpoint is deliberately left undecomposed at
+                # generation time (see `expand_checkpoint`) -- running it
+                # through the atomicity check here would judge a sub-goal
+                # that has no children yet against the same "does this
+                # bundle multiple pieces" rubric a leaf gets, and could
+                # reclassify it into an ordinary branch, defeating the
+                # lazy-expansion point of declaring it a checkpoint at all.
                 continue
             nearby = self._collect_nearby_nodes(child, limit=self._ATOMICITY_TREE_CONTEXT_LIMIT)
             tree_context = self._render_nearby_tree(child, nearby)
@@ -786,6 +810,124 @@ class Planner:
         )
         return messages
 
+    @staticmethod
+    def _demote_pass_through_checkpoint(children: list[PlanNode]) -> None:
+        """Structural guard (not left to prompt wording alone): a
+        decomposition of exactly one child that is itself another
+        checkpoint, with no other real work alongside it, achieves nothing
+        -- it would just chain straight through to another deferred
+        sub-goal. Force that lone child back to an ordinary leaf instead of
+        letting it re-defer indefinitely."""
+        if len(children) == 1 and children[0].is_checkpoint:
+            logger.debug(
+                "Demoting pass-through checkpoint (sole child, no other work): %r",
+                children[0].description,
+            )
+            children[0].declared_type = "leaf"
+            children[0].requested_branch = False
+
+    async def expand_checkpoint(self, plan: Plan, checkpoint: PlanNode) -> None:
+        """Lazily decomposes `checkpoint` into real children, the first
+        time execution reaches it -- reusing the ordinary `_expand_node`
+        pipeline a generation-time branch would go through. Nothing is
+        speculatively generated past a checkpoint before this is called."""
+        ancestors = self._ancestor_descriptions(checkpoint)
+        convergence = _ConvergenceTracker(subtree_label=checkpoint.description)
+        await self._expand_node(
+            checkpoint,
+            ancestors=ancestors,
+            task=plan.goal,
+            repo_context="",
+            planning_facts=None,
+            is_root=False,
+            depth=len(ancestors) + 1,
+            convergence=convergence,
+        )
+        self._demote_pass_through_checkpoint(checkpoint.children)
+        if not checkpoint.children:
+            # Should not happen in practice (the expansion call always
+            # yields at least the parsed-fallback single step), but a
+            # checkpoint stuck with zero children would look like an
+            # unexpanded checkpoint forever and loop `expand_checkpoint`
+            # every turn -- fail safe by treating it as an ordinary leaf.
+            logger.warning(
+                "Checkpoint %r expanded to zero children; treating it as "
+                "an ordinary leaf instead",
+                checkpoint.description,
+            )
+            checkpoint.declared_type = "leaf"
+
+    async def continue_from_checkpoint(
+        self, plan: Plan, checkpoint: PlanNode, evidence: str
+    ) -> list[PlanNode]:
+        """Success-framed planning call: fires once `checkpoint`'s own
+        rollup verification has passed, to plan the concrete next steps
+        using what its children actually discovered -- distinct from
+        `update_plan`, which is framed around recovering from a failure.
+        Returned nodes are brand-new (no `continues_node_id`) and are not
+        yet attached to the tree; the caller is responsible for splicing
+        them in as siblings and, once attached, running them through
+        `expand_spliced_steps` for classification/further expansion."""
+        ancestors = self._ancestor_descriptions(checkpoint)
+        chain = "\n".join(f"- {d}" for d in ([plan.goal] + ancestors))
+        messages = [
+            Message(
+                role=Role.system,
+                content=PLANNER_SYSTEM_PROMPT
+                + "\n\nA checkpoint sub-goal has just been completed and verified -- "
+                "nothing failed. Use what its work actually discovered to plan the "
+                "concrete next steps that continue the plan from here.",
+            ),
+            Message(
+                role=Role.user,
+                content=(
+                    f"Overall goal: {plan.goal}\n\n"
+                    f"Ancestor chain (root goal down to this checkpoint):\n{chain}\n\n"
+                    f"This checkpoint's sub-goal (now complete): {checkpoint.description}\n\n"
+                    f"What the checkpoint's own work actually discovered:\n{evidence or '(no evidence recorded)'}\n\n"
+                    "Using what was learned above, output a revised JSON array of the "
+                    "concrete next steps that continue the plan from here. Do not repeat "
+                    "exploration that is already done above -- plan real, grounded steps "
+                    "(implementation steps where the evidence above supports them), not "
+                    "another round of the same exploration."
+                ),
+            ),
+        ]
+        response = await self._complete(
+            CompletionRequest(messages=messages, temperature=0.0, max_tokens=self._PLANNING_MAX_TOKENS),
+            activity="continuing from checkpoint",
+        )
+        steps = self._normalize_steps(plan.goal, self._parse_steps(response.message.content))
+        for step in steps:
+            step.continues_node_id = None
+        return steps
+
+    async def expand_spliced_steps(self, plan: Plan, steps: list[PlanNode]) -> None:
+        """Runs freshly-spliced continuation steps (already attached to the
+        tree with real `.parent` links by the caller) through the same
+        atomicity-check/classification pipeline any other generated step
+        goes through, recursing into any that get classified as an
+        ordinary branch. A spliced step declared a further checkpoint is
+        left alone here (it stays lazily unexpanded, same as any other
+        checkpoint) -- except a lone spliced checkpoint with no sibling
+        work, which the pass-through guard demotes."""
+        self._demote_pass_through_checkpoint(steps)
+        await self._classify_children(plan.goal, steps)
+        convergence = _ConvergenceTracker(subtree_label="checkpoint continuation")
+        for step in steps:
+            if step.requested_branch and not step.is_checkpoint:
+                ancestors = self._ancestor_descriptions(step)
+                await self._expand_node(
+                    step,
+                    ancestors=ancestors,
+                    task=plan.goal,
+                    repo_context="",
+                    planning_facts=None,
+                    is_root=False,
+                    depth=len(ancestors) + 1,
+                    convergence=convergence,
+                )
+
     async def verify_step(
         self,
         plan: Plan,
@@ -901,6 +1043,20 @@ class Planner:
         return StepVerdict.not_complete, reason or "Could not parse verifier response"
 
     async def update_plan(self, plan: Plan, failure_context: str) -> Plan:
+        non_completed = {
+            s.node_id: s for s in plan.steps if s.status != StepStatus.completed
+        }
+        continuation_hint = ""
+        if non_completed:
+            lines = [
+                f"- [{node_id}] {node.description}" for node_id, node in non_completed.items()
+            ]
+            continuation_hint = (
+                "\n\nThese steps have not completed yet:\n" + "\n".join(lines) +
+                "\n\nIf a revised step is essentially the same underlying work as one of these "
+                '(even reworded), tag it with "continues_node_id": "<that id>" so its prior '
+                'progress carries forward. Omit the tag (or use null) for a genuinely new step.'
+            )
         messages = [
             Message(
                 role=Role.system,
@@ -911,7 +1067,8 @@ class Planner:
                 role=Role.user,
                 content=f"Original goal: {plan.goal}\n\n"
                 f"Current progress:\n{self._format_plan(plan)}\n\n"
-                f"Failure context:\n{failure_context}\n\n"
+                f"Failure context:\n{failure_context}"
+                f"{continuation_hint}\n\n"
                 f"Output a revised JSON array of remaining steps.",
             ),
         ]
@@ -926,11 +1083,24 @@ class Planner:
         for s in plan.steps:
             if s.status == StepStatus.completed:
                 revised_steps.append(s)
+        claimed_ids: set[str] = set()
         for s in steps:
             if not any(
                 existing.description == s.description
                 for existing in revised_steps
             ):
+                continued = non_completed.get(s.continues_node_id or "")
+                if continued is not None and continued.node_id not in claimed_ids:
+                    claimed_ids.add(continued.node_id)
+                    s.node_id = continued.node_id
+                    s.status = StepStatus.pending
+                elif s.continues_node_id:
+                    logger.debug(
+                        "update_plan: continues_node_id %r on step %r did not match an "
+                        "unclaimed non-completed node -- treating as a new node",
+                        s.continues_node_id,
+                        s.description,
+                    )
                 s.index = len(revised_steps) + 1
                 revised_steps.append(s)
         revised.steps = revised_steps
@@ -984,6 +1154,8 @@ class Planner:
                     index=len(normalized) + 1,
                     requested_branch=step.requested_branch,
                     flagged=step.flagged,
+                    continues_node_id=step.continues_node_id,
+                    declared_type=step.declared_type,
                 )
             )
 
@@ -996,6 +1168,8 @@ class Planner:
                 index=i + 1,
                 requested_branch=step.requested_branch,
                 flagged=step.flagged,
+                continues_node_id=step.continues_node_id,
+                declared_type=step.declared_type,
             )
             for i, step in enumerate(steps)
             if cls._clean_description(step.description)
@@ -1097,18 +1271,27 @@ class Planner:
                         item = unwrapped
                 if isinstance(item, dict):
                     description = self._clean_description(item.get("description", str(item)))
-                    requested_branch = str(item.get("type", "leaf")).strip().lower() == "branch"
+                    type_str = str(item.get("type", "leaf")).strip().lower()
+                    declared_type = type_str if type_str in {"leaf", "branch", "checkpoint"} else "leaf"
+                    requested_branch = declared_type == "branch"
                     flagged = bool(item.get("uncertain", False))
+                    continues_node_id = item.get("continues_node_id") or None
+                    if not isinstance(continues_node_id, str):
+                        continues_node_id = None
                 else:
                     description = self._clean_description(item)
                     requested_branch = False
                     flagged = False
+                    continues_node_id = None
+                    declared_type = "leaf"
                 steps.append(
                     PlanNode(
                         description=description,
                         index=i + 1,
                         requested_branch=requested_branch,
                         flagged=flagged,
+                        continues_node_id=continues_node_id,
+                        declared_type=declared_type,
                     )
                 )
             return steps

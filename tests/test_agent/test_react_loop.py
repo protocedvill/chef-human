@@ -2594,7 +2594,7 @@ class TestCheckpointOrchestration:
             planner=planner,
             config=ReActConfig(),
         )
-        loop._checkpoint_chain_streak[plan.root.node_id] = (
+        loop._checkpoint_chain_streak[checkpoint.node_id] = (
             loop._CHECKPOINT_CHAIN_STREAK_LIMIT - 1
         )
         next_checkpoint = PlanNode(description="Explore some more", declared_type="checkpoint")
@@ -2610,7 +2610,8 @@ class TestCheckpointOrchestration:
 
         assert next_checkpoint.is_checkpoint is False
         assert next_checkpoint.requested_branch is False
-        assert loop._checkpoint_chain_streak[plan.root.node_id] == 0
+        assert checkpoint.node_id not in loop._checkpoint_chain_streak
+        assert next_checkpoint.node_id not in loop._checkpoint_chain_streak
 
     @pytest.mark.asyncio
     async def test_checkpoint_chain_streak_resets_on_real_work(self, tmp_path):
@@ -2627,7 +2628,7 @@ class TestCheckpointOrchestration:
             planner=planner,
             config=ReActConfig(),
         )
-        loop._checkpoint_chain_streak[plan.root.node_id] = 5
+        loop._checkpoint_chain_streak[checkpoint.node_id] = 5
         real_step = PlanNode(description="Implement the Flask app")
         planner.continue_from_checkpoint = AsyncMock(return_value=[real_step])
         planner.expand_spliced_steps = AsyncMock(return_value=None)
@@ -2639,7 +2640,8 @@ class TestCheckpointOrchestration:
             step_override=checkpoint_child,
         )
 
-        assert plan.root.node_id not in loop._checkpoint_chain_streak
+        assert checkpoint.node_id not in loop._checkpoint_chain_streak
+        assert real_step.node_id not in loop._checkpoint_chain_streak
 
     @pytest.mark.asyncio
     async def test_continuation_evidence_includes_files_read_and_children_reasoning(self, tmp_path):
@@ -2674,6 +2676,269 @@ class TestCheckpointOrchestration:
         evidence_arg = call.args[2]
         assert read_path in evidence_arg
         assert "Read app.py" in evidence_arg
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_chain_streak_bounds_rollup_failure_replans(self, tmp_path):
+        """The path that actually produced the original incident: a
+        checkpoint's rollup keeps getting rejected, and each replan
+        regenerates it with another checkpoint child instead of real work.
+        This must be bounded by the same streak the continuation-success
+        path uses, keyed by the checkpoint's own node_id -- not left
+        unbounded because it never touches `_fire_checkpoint_continuation`.
+
+        Drives `_replan_failing_node` for real, `_CHECKPOINT_CHAIN_STREAK_LIMIT`
+        times in a row, on the *same* checkpoint object each round (as the
+        real call sequence does -- `replan_subtree` regenerates a node's
+        children in place, never swapping its identity) rather than
+        pre-seeding `_checkpoint_chain_streak` directly, so this actually
+        exercises the streak accumulating across rounds instead of just the
+        force-demotion branch in isolation."""
+        planner = _make_mock_planner()
+        plan, checkpoint, child = self._checkpoint_plan()
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        def _replan(plan_arg, node, failure_context, **kwargs):
+            next_checkpoint = PlanNode(
+                description="Explore even more", declared_type="checkpoint"
+            )
+            node.set_children([next_checkpoint])
+            return None
+
+        planner.replan_subtree = AsyncMock(side_effect=_replan)
+
+        for round_num in range(loop._CHECKPOINT_CHAIN_STREAK_LIMIT):
+            loop._last_failed_node = checkpoint
+            await loop._replan_failing_node(plan, f"rollup rejected the checkpoint (round {round_num})")
+            if round_num < loop._CHECKPOINT_CHAIN_STREAK_LIMIT - 1:
+                assert checkpoint.children[0].is_checkpoint is True
+
+        assert checkpoint.children[0].is_checkpoint is False
+        assert checkpoint.children[0].requested_branch is False
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_chain_streak_not_bounded_when_replan_yields_real_work(
+        self, tmp_path
+    ):
+        planner = _make_mock_planner()
+        plan, checkpoint, child = self._checkpoint_plan()
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+        loop._checkpoint_chain_streak[checkpoint.node_id] = (
+            loop._CHECKPOINT_CHAIN_STREAK_LIMIT - 1
+        )
+
+        def _replan(plan_arg, node, failure_context, **kwargs):
+            real_leaf = PlanNode(description="Implement the endpoint")
+            node.set_children([real_leaf])
+            return None
+
+        planner.replan_subtree = AsyncMock(side_effect=_replan)
+        loop._last_failed_node = checkpoint
+
+        await loop._replan_failing_node(plan, "rollup rejected the checkpoint")
+
+        assert checkpoint.node_id not in loop._checkpoint_chain_streak
+
+    @pytest.mark.asyncio
+    async def test_rollup_replan_preserves_discarded_evidence_in_failure_context(
+        self, tmp_path
+    ):
+        """Ticket 02: before a rollup-triggered replan discards a
+        checkpoint's descendant evidence, a snapshot of what it already
+        found (files read + child verdict reasoning) must reach the replan
+        prompt via `failure_context`, not just the rejection reason."""
+        planner = _make_mock_planner()
+        plan, checkpoint, child = self._checkpoint_plan()
+        child.last_verdict_reason = "README describes a Flask app with no auth layer yet"
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+        read_path = str(tmp_path / "README.md")
+        loop._step_evidence_for(child).merge_turn({}, [], {read_path})
+        loop._last_failed_node = checkpoint
+        planner.replan_subtree = AsyncMock(return_value=None)
+
+        await loop._replan_failing_node(plan, "rollup rejected: no architecture summary evidenced")
+
+        call = planner.replan_subtree.await_args
+        failure_context_arg = call.args[2]
+        assert "rollup rejected: no architecture summary evidenced" in failure_context_arg
+        assert read_path in failure_context_arg
+        assert "README describes a Flask app with no auth layer yet" in failure_context_arg
+        # Structured evidence is still cleared afterward -- only the prompt
+        # text changes.
+        assert child.node_id not in loop._step_evidence
+
+    @pytest.mark.asyncio
+    async def test_rollup_replan_with_no_prior_evidence_is_unaffected(self, tmp_path):
+        planner = _make_mock_planner()
+        leaf = PlanNode(index=1, description="Implement the widget")
+        plan = Plan(goal="Build a widget", steps=[leaf])
+        context = self._context_rooted_at(tmp_path)
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+        loop._last_failed_node = leaf
+        planner.replan_subtree = AsyncMock(return_value=None)
+
+        await loop._replan_failing_node(plan, "verification failed")
+
+        call = planner.replan_subtree.await_args
+        failure_context_arg = call.args[2]
+        assert failure_context_arg == "verification failed"
+
+
+class TestRollupRejectStreak:
+    """Ticket 03: a separate counter tracking consecutive not_complete
+    rollup verdicts for the exact same node, distinct from
+    `_subtree_replan_streak` and `_checkpoint_chain_streak`."""
+
+    def _context_rooted_at(self, tmp_path):
+        context = _make_mock_context()
+        context.workspace.resolve = MagicMock(side_effect=lambda p: tmp_path / p)
+        return context
+
+    def _make_loop(self, planner, tmp_path):
+        return ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=self._context_rooted_at(tmp_path),
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_streak_increments_on_rejection_and_message_pressures_at_limit(
+        self, tmp_path
+    ):
+        planner = _make_mock_planner()
+        planner.verify_rollup = AsyncMock(
+            return_value=(StepVerdict.not_complete, "still missing something")
+        )
+        leaf = PlanNode(index=1, description="Do the thing", status=StepStatus.completed)
+        branch = PlanNode(description="Build the subsystem")
+        branch.set_children([leaf])
+        plan = Plan(goal="Task", steps=[branch])
+        loop = self._make_loop(planner, tmp_path)
+
+        message = None
+        for _ in range(loop._ROLLUP_REJECT_STREAK_LIMIT):
+            message = await loop._process_rollups(plan)
+
+        assert loop._rollup_reject_streak[branch.node_id] == loop._ROLLUP_REJECT_STREAK_LIMIT
+        assert message is not None
+        assert f"{loop._ROLLUP_REJECT_STREAK_LIMIT} times in a row" in message
+        assert "Converge on something concrete" in message
+
+    @pytest.mark.asyncio
+    async def test_streak_increments_when_verifier_raises_not_just_on_not_complete(
+        self, tmp_path
+    ):
+        """A rollup verifier call that keeps raising is just as stuck as one
+        that keeps returning not_complete -- must count toward the same
+        streak, not be exempt from the convergence pressure."""
+        planner = _make_mock_planner()
+        planner.verify_rollup = AsyncMock(side_effect=RuntimeError("malformed response"))
+        leaf = PlanNode(index=1, description="Do the thing", status=StepStatus.completed)
+        branch = PlanNode(description="Build the subsystem")
+        branch.set_children([leaf])
+        plan = Plan(goal="Task", steps=[branch])
+        loop = self._make_loop(planner, tmp_path)
+
+        message = None
+        for _ in range(loop._ROLLUP_REJECT_STREAK_LIMIT):
+            message = await loop._process_rollups(plan)
+
+        assert loop._rollup_reject_streak[branch.node_id] == loop._ROLLUP_REJECT_STREAK_LIMIT
+        assert message is not None
+        assert f"{loop._ROLLUP_REJECT_STREAK_LIMIT} times in a row" in message
+        assert "Converge on something concrete" in message
+
+    @pytest.mark.asyncio
+    async def test_streak_resets_only_when_this_node_passes(self, tmp_path):
+        planner = _make_mock_planner()
+        leaf = PlanNode(index=1, description="Do the thing", status=StepStatus.completed)
+        branch = PlanNode(description="Build the subsystem")
+        branch.set_children([leaf])
+        plan = Plan(goal="Task", steps=[branch])
+        loop = self._make_loop(planner, tmp_path)
+
+        planner.verify_rollup = AsyncMock(
+            return_value=(StepVerdict.not_complete, "still missing something")
+        )
+        await loop._process_rollups(plan)
+        await loop._process_rollups(plan)
+        assert loop._rollup_reject_streak[branch.node_id] == 2
+
+        planner.verify_rollup = AsyncMock(return_value=(StepVerdict.complete, "looks done"))
+        await loop._process_rollups(plan)
+        assert branch.node_id not in loop._rollup_reject_streak
+
+    @pytest.mark.asyncio
+    async def test_applies_to_ordinary_branch_not_only_checkpoints(self, tmp_path):
+        planner = _make_mock_planner()
+        planner.verify_rollup = AsyncMock(
+            return_value=(StepVerdict.not_complete, "still missing something")
+        )
+        leaf = PlanNode(index=1, description="Do the thing", status=StepStatus.completed)
+        branch = PlanNode(description="An ordinary (non-checkpoint) branch")
+        assert not branch.is_checkpoint
+        branch.set_children([leaf])
+        plan = Plan(goal="Task", steps=[branch])
+        loop = self._make_loop(planner, tmp_path)
+
+        for _ in range(loop._ROLLUP_REJECT_STREAK_LIMIT):
+            await loop._process_rollups(plan)
+
+        assert loop._rollup_reject_streak[branch.node_id] == loop._ROLLUP_REJECT_STREAK_LIMIT
+
+    @pytest.mark.asyncio
+    async def test_streak_dict_is_independent_of_other_two_streaks(self, tmp_path):
+        planner = _make_mock_planner()
+        planner.verify_rollup = AsyncMock(
+            return_value=(StepVerdict.not_complete, "still missing something")
+        )
+        leaf = PlanNode(index=1, description="Do the thing", status=StepStatus.completed)
+        branch = PlanNode(description="Build the subsystem")
+        branch.set_children([leaf])
+        plan = Plan(goal="Task", steps=[branch])
+        loop = self._make_loop(planner, tmp_path)
+
+        loop._subtree_replan_streak[branch.node_id] = 7
+        loop._checkpoint_chain_streak[branch.node_id] = 9
+
+        await loop._process_rollups(plan)
+
+        assert loop._rollup_reject_streak[branch.node_id] == 1
+        # Resetting the rollup-reject streak (via a subsequent pass) must
+        # not touch the other two dicts' entries for the same node_id.
+        planner.verify_rollup = AsyncMock(return_value=(StepVerdict.complete, "done"))
+        await loop._process_rollups(plan)
+        assert branch.node_id not in loop._rollup_reject_streak
+        assert loop._subtree_replan_streak[branch.node_id] == 7
+        assert loop._checkpoint_chain_streak[branch.node_id] == 9
 
 
 class TestCheckpointFullLifecycleIntegration:
@@ -5735,8 +6000,11 @@ class TestSubtreeReplanAndEvidence:
     @pytest.mark.asyncio
     async def test_leaf_directly_under_root_is_not_widened(self):
         """A leaf with no real containing branch (its parent is the plan's
-        synthetic root) has nowhere to widen scope to -- the streak
-        mechanism must leave it alone and keep targeting the leaf itself."""
+        synthetic root) has nowhere to widen scope to -- the target stays
+        the leaf itself on every call. The streak bookkeeping still
+        increments for this case (fixed: it used to silently no-op), but
+        that's observable only via the counter resetting to 0 once the
+        limit is crossed, not via any change in widening behavior."""
         planner = _make_mock_planner()
         loop = self._make_loop(planner)
 
@@ -5744,10 +6012,18 @@ class TestSubtreeReplanAndEvidence:
         plan = Plan(goal="Task", steps=[leaf])
 
         loop._last_failed_node = leaf
-        for _ in range(loop._SUBTREE_REPLAN_STREAK_LIMIT + 2):
+        for i in range(loop._SUBTREE_REPLAN_STREAK_LIMIT):
             await loop._replan_failing_node(plan, "still stuck")
             assert planner.replan_subtree.await_args.args[1] is leaf
-        assert not loop._subtree_replan_streak
+            loop._last_failed_node = leaf
+        # Streak crossed the limit on the call above and was reset to 0 --
+        # confirming the bookkeeping actually ran for this root-parented
+        # case, even though widening itself never had anywhere to go.
+        assert loop._subtree_replan_streak.get(plan.root.node_id, 0) == 0
+
+        await loop._replan_failing_node(plan, "still stuck")
+        assert planner.replan_subtree.await_args.args[1] is leaf
+        assert loop._subtree_replan_streak.get(plan.root.node_id, 0) == 1
 
     @pytest.mark.asyncio
     async def test_branch_rollup_rejection_targets_the_branch_not_current_leaf(self):

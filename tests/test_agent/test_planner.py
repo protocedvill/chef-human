@@ -1363,6 +1363,111 @@ class TestCheckpointPromptGuidance:
         assert "Example 2" in system_content
 
 
+class TestNearbyNodeContextInPlanningCalls:
+    """Ticket 04: `_expand_node`/`replan_subtree`/`continue_from_checkpoint`
+    must see nearby sibling/cousin plan structure (status-annotated), not
+    just the bare ancestor chain the atomicity check already had -- so a
+    decomposition can notice a nearby node already covered the same
+    ground."""
+
+    def _tree_with_completed_sibling(self):
+        root = PlanNode(description="root")
+        completed_sibling = PlanNode(
+            index=1, description="Read the config loader", status=StepStatus.completed
+        )
+        target = PlanNode(index=2, description="Explore the auth flow")
+        root.set_children([completed_sibling, target])
+        return root, completed_sibling, target
+
+    def test_build_expand_messages_includes_nearby_tree_with_status(self):
+        root, completed_sibling, target = self._tree_with_completed_sibling()
+
+        messages = Planner._build_expand_messages(
+            task="Add a web interface",
+            repo_context="",
+            ancestors=[],
+            node=target,
+            is_root=False,
+        )
+        user_content = messages[1].content
+
+        assert completed_sibling.description in user_content
+        assert "[completed]" in user_content
+
+    def test_build_replan_messages_includes_nearby_tree_for_failure(self):
+        root, completed_sibling, target = self._tree_with_completed_sibling()
+
+        messages = Planner._build_replan_messages(
+            goal="Add a web interface",
+            ancestors=[],
+            node=target,
+            failure_context="verification failed",
+            is_failure=True,
+        )
+        user_content = messages[1].content
+
+        assert completed_sibling.description in user_content
+        assert "[completed]" in user_content
+
+    def test_build_replan_messages_includes_nearby_tree_for_reviewer_guidance(self):
+        root, completed_sibling, target = self._tree_with_completed_sibling()
+
+        messages = Planner._build_replan_messages(
+            goal="Add a web interface",
+            ancestors=[],
+            node=target,
+            failure_context="use a different approach",
+            is_failure=False,
+        )
+        user_content = messages[1].content
+
+        assert completed_sibling.description in user_content
+        assert "[completed]" in user_content
+
+    @pytest.mark.asyncio
+    async def test_continue_from_checkpoint_includes_nearby_tree(self, monkeypatch):
+        root = PlanNode(description="root")
+        completed_sibling = PlanNode(
+            index=1, description="Read the config loader", status=StepStatus.completed
+        )
+        checkpoint = PlanNode(
+            index=2, description="Explore the auth flow", declared_type="checkpoint"
+        )
+        root.set_children([completed_sibling, checkpoint])
+        plan = Plan(goal="Add a web interface", steps=[completed_sibling, checkpoint])
+        plan.root.set_children([completed_sibling, checkpoint])
+
+        captured = {}
+
+        async def fake_complete(request, activity=""):
+            captured["messages"] = request.messages
+            return CompletionResponse(
+                message=Message(role=Role.assistant, content=json.dumps(["Implement the endpoint"]))
+            )
+
+        mock_llm = MagicMock()
+        planner = Planner(mock_llm)
+        monkeypatch.setattr(planner, "_complete", fake_complete)
+
+        await planner.continue_from_checkpoint(plan, checkpoint, evidence="found the auth module")
+
+        user_content = captured["messages"][1].content
+        assert completed_sibling.description in user_content
+        assert "[completed]" in user_content
+
+    def test_atomicity_check_render_unchanged_no_status(self):
+        """The pre-existing atomicity-check render must not gain a status
+        suffix -- only the three new call sites above do."""
+        root, completed_sibling, target = self._tree_with_completed_sibling()
+        nearby = Planner._collect_nearby_nodes(
+            target, limit=Planner._ATOMICITY_TREE_CONTEXT_LIMIT
+        )
+        rendered = Planner._render_nearby_tree(target, nearby)
+
+        assert completed_sibling.description in rendered
+        assert "[completed]" not in rendered
+
+
 class TestCheckpointParsing:
     def test_type_checkpoint_parses_as_checkpoint_not_branch(self):
         planner = Planner(MagicMock())

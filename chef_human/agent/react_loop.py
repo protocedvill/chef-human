@@ -650,6 +650,16 @@ class ReActLoop:
         # turns via _process_rollups). Reset whenever a splice includes at
         # least one non-checkpoint step.
         self._checkpoint_chain_streak: dict[str, int] = {}
+        # Per-branch streak of consecutive not_complete rollup verdicts for
+        # that exact node (any branch, not just checkpoints), keyed by the
+        # branch's own node_id. A distinct axis from _subtree_replan_streak
+        # (ancestor-widening pressure) and _checkpoint_chain_streak
+        # (children-shape signal): this one tracks straight repeated
+        # rejection of the same sub-goal's rollup, regardless of what its
+        # replans produce. Reset to 0 only when that same node's own rollup
+        # subsequently passes -- not by unrelated progress elsewhere in the
+        # tree.
+        self._rollup_reject_streak: dict[str, int] = {}
         # RetryManager for the run currently in progress -- lives on the
         # instance (not a `_execute` local) so `resolve_escalation`'s resume
         # reuses it instead of resetting every node's failure/replan counters.
@@ -809,13 +819,25 @@ class ReActLoop:
         under the plan root (no real containing branch) is returned as-is;
         this mechanism only widens scope when there is an actual branch to
         widen to, leaving RetryManager's ordinary per-node retry/replan/
-        escalate path in charge of that case."""
+        escalate path in charge of that case. A root-parented node's streak
+        still increments now (previously this silently no-op'd for that
+        case) -- but there is still nowhere bigger to widen a node whose
+        parent is already `plan.root`, so the returned target for that case
+        is unchanged either way."""
         ancestor = target.parent
-        if ancestor is None or ancestor is plan.root:
+        if ancestor is None:
             return target
         streak = self._subtree_replan_streak.get(ancestor.node_id, 0) + 1
         self._subtree_replan_streak[ancestor.node_id] = streak
         if streak < self._SUBTREE_REPLAN_STREAK_LIMIT:
+            return target
+        if ancestor is plan.root:
+            # Nowhere bigger to widen to -- the streak bookkeeping above
+            # still ran (it used to silently no-op here), but there's no
+            # containing branch above plan.root for the caller to replan
+            # instead. RetryManager's existing retry/replan/escalate caps
+            # remain what eventually surfaces a stuck top-level node.
+            self._subtree_replan_streak[ancestor.node_id] = 0
             return target
         logger.warning(
             "Subtree under node %s has needed %d consecutive progress-free "
@@ -835,7 +857,11 @@ class ReActLoop:
         whole-plan replan only when no specific node can be identified.
         Widens to the containing branch instead, per
         `_widen_stuck_replan_target`, once that branch has needed too many
-        consecutive progress-free replans in a row."""
+        consecutive progress-free replans in a row. Before the target's
+        descendant evidence is discarded, a snapshot of what it already
+        found is folded into `failure_context` (see `_subtree_evidence_snapshot`)
+        so a rollup-triggered replan builds on known findings instead of
+        rediscovering them from scratch."""
         target = self._last_failed_node or plan.current_leaf()
         if target is None:
             return await self._planner.update_plan(plan, failure_context=failure_context)
@@ -847,9 +873,17 @@ class ReActLoop:
                 "without making progress -- replan the whole sub-goal below, not just its "
                 "most recently failing piece."
             )
+        snapshot = self._subtree_evidence_snapshot(target)
+        if snapshot:
+            failure_context = (
+                f"{failure_context}\n\nWhat this sub-goal's own prior work already found "
+                f"(preserved from before this replan, so don't re-derive it):\n{snapshot}"
+            )
         self._discard_subtree_evidence(target)
         target.status = StepStatus.pending
         await self._planner.replan_subtree(plan, target, failure_context)
+        if target.is_checkpoint:
+            self._bound_checkpoint_chain(target, target.children)
         self._rebuild_ancestor_evidence(target)
         self._last_failed_node = None
         return plan
@@ -2145,25 +2179,48 @@ class ReActLoop:
                 # this rollup) -- otherwise a subsequent REPLAN would target
                 # the wrong node and discard already-correct work.
                 self._last_failed_node = branch
-                return (
+                # A verifier call that keeps raising is just as stuck as one
+                # that keeps returning not_complete -- counts toward the same
+                # streak so a persistently-erroring rollup still eventually
+                # gets the "converge on something concrete" pressure.
+                reject_streak = self._rollup_reject_streak.get(branch.node_id, 0) + 1
+                self._rollup_reject_streak[branch.node_id] = reject_streak
+                message = (
                     f"Branch '{branch.description}' could not be verified due to an "
                     f"error ({exc}); it will be re-checked next turn."
                 )
+                if reject_streak >= self._ROLLUP_REJECT_STREAK_LIMIT:
+                    message += (
+                        f"\n\nThis sub-goal has now failed rollup verification {reject_streak} "
+                        "times in a row. Converge on something concrete now, even if partial -- "
+                        "do not keep proposing another round of the same shape of attempt."
+                    )
+                return message
             logger.debug(
                 "Branch %r rollup verdict: %s (%s)", branch.description, verdict.value, reason
             )
             if verdict != StepVerdict.complete:
                 branch.last_verdict_reason = reason
                 self._last_failed_node = branch
-                return (
+                reject_streak = self._rollup_reject_streak.get(branch.node_id, 0) + 1
+                self._rollup_reject_streak[branch.node_id] = reject_streak
+                message = (
                     f"Branch '{branch.description}' is not fully done yet ({verdict.value}): "
                     f"{reason or 'insufficient evidence that the sub-goal was achieved'}. "
                     "All of its individual steps were marked complete, but the sub-goal as a "
                     "whole is not -- the decomposition may have missed something; keep "
                     "working on this part of the plan."
                 )
+                if reject_streak >= self._ROLLUP_REJECT_STREAK_LIMIT:
+                    message += (
+                        f"\n\nThis sub-goal has now failed rollup verification {reject_streak} "
+                        "times in a row. Converge on something concrete now, even if partial -- "
+                        "do not keep proposing another round of the same shape of attempt."
+                    )
+                return message
             branch.status = StepStatus.completed
             branch.last_verdict_reason = reason
+            self._rollup_reject_streak.pop(branch.node_id, None)
             self._reset_subtree_replan_streak(branch)
             # This branch is done -- clear the stale reference so a later
             # rollup failure higher in the tree (or the exception path
@@ -2179,10 +2236,10 @@ class ReActLoop:
         below), plan and splice in what comes next -- as fresh sibling
         nodes immediately following the checkpoint in its own parent's
         children list, not nested deeper under it."""
-        evidence = self._checkpoint_continuation_evidence(checkpoint)
+        evidence = self._subtree_evidence_snapshot(checkpoint)
         new_nodes = await self._planner.continue_from_checkpoint(plan, checkpoint, evidence)
         parent = checkpoint.parent or plan.root
-        self._bound_checkpoint_chain(parent, new_nodes)
+        self._bound_checkpoint_chain(checkpoint, new_nodes)
         if not new_nodes:
             return
         idx = next(
@@ -2194,75 +2251,106 @@ class ReActLoop:
         parent.set_children(updated_children)
         await self._planner.expand_spliced_steps(plan, new_nodes)
 
-    def _checkpoint_continuation_evidence(self, checkpoint: PlanNode) -> str:
-        """Evidence for the continuation call: files read by the
-        checkpoint's own descendants (not just files written -- checkpoints
-        are typically exploration-heavy) plus each descendant's own
-        recorded verification reasoning, alongside the same current-disk-
-        contents evidence an ordinary rollup check gets."""
+    def _subtree_evidence_snapshot(self, node: PlanNode) -> str:
+        """Evidence snapshot for `node`'s own subtree: files read by its
+        descendants (not just files written -- exploration-heavy sub-goals
+        like checkpoints are the main case, but this applies to any node)
+        plus each descendant's own recorded verification reasoning,
+        alongside the same current-disk-contents evidence an ordinary
+        rollup check gets. Used both for a checkpoint's continuation call
+        (once its rollup passes) and, folded into `failure_context`, ahead
+        of a rollup-triggered replan that's about to discard this same
+        evidence -- so the replan builds on what was already found instead
+        of rediscovering it."""
         files_read: list[str] = []
         seen_reads: set[str] = set()
         reasoning_lines: list[str] = []
 
-        def walk(node: PlanNode) -> None:
-            for path_str in sorted(self._step_evidence_for(node).files_read):
+        def walk(n: PlanNode) -> None:
+            for path_str in sorted(self._step_evidence_for(n).files_read):
                 if path_str not in seen_reads:
                     seen_reads.add(path_str)
                     files_read.append(path_str)
-            if node is not checkpoint and node.last_verdict_reason:
-                reasoning_lines.append(f"- {node.description}: {node.last_verdict_reason}")
-            for child in node.children:
+            if n is not node and n.last_verdict_reason:
+                reasoning_lines.append(f"- {n.description}: {n.last_verdict_reason}")
+            for child in n.children:
                 walk(child)
 
-        walk(checkpoint)
+        walk(node)
 
         parts: list[str] = []
         if files_read:
             parts.append(
-                "Files read during this checkpoint's work:\n"
+                "Files read during this sub-goal's work:\n"
                 + "\n".join(f"- {p}" for p in files_read)
             )
         if reasoning_lines:
-            parts.append("What each of the checkpoint's own steps found:\n" + "\n".join(reasoning_lines))
-        written_evidence = self._rollup_evidence(checkpoint)
+            parts.append("What each of the sub-goal's own steps found:\n" + "\n".join(reasoning_lines))
+        written_evidence = self._rollup_evidence(node)
         if written_evidence:
             parts.append(written_evidence)
         return "\n\n".join(parts)
 
-    # A checkpoint's continuation splicing in nothing but further
-    # checkpoints, this many times in a row under the same parent, with no
-    # real (non-checkpoint) work happening in between, is a pathological
-    # chain -- bounded here rather than left to run unbounded.
+    # A checkpoint chain producing nothing but further checkpoints, this
+    # many times in a row with no real (non-checkpoint) work happening in
+    # between, is pathological -- bounded here rather than left to run
+    # unbounded. Reachable from both the rollup-success continuation path
+    # (_fire_checkpoint_continuation) and the rollup-failure replan path
+    # (_replan_failing_node regenerating the same checkpoint's children in
+    # place) -- the incident this exists to catch used the latter, which
+    # never touched this counter before it was unified across both paths.
     _CHECKPOINT_CHAIN_STREAK_LIMIT = 3
 
-    def _bound_checkpoint_chain(self, parent: PlanNode, new_nodes: list[PlanNode]) -> None:
-        """Tracks, per parent node, how many consecutive checkpoint splices
-        produced no real work -- only further checkpoints. Once the streak
-        crosses the limit, force-demotes any checkpoint among `new_nodes`
-        to an ordinary leaf so the chain can't continue unbounded, and
-        resets the streak. A splice that includes any non-checkpoint step
-        resets the streak to 0 (real progress happened)."""
+    # Consecutive not_complete rollup verdicts on the exact same node before
+    # `_process_rollups` starts telling the model explicitly to converge on
+    # something concrete -- see `_rollup_reject_streak`'s docstring in
+    # __init__ for how this differs from the two streaks above.
+    _ROLLUP_REJECT_STREAK_LIMIT = 3
+
+    def _bound_checkpoint_chain(self, checkpoint: PlanNode, new_nodes: list[PlanNode]) -> None:
+        """Tracks how many consecutive checkpoint-only outcomes a chain has
+        produced, keyed by the checkpoint node that most recently resolved
+        (completed via continuation, or replanned via rollup-failure) --
+        not by its parent, so the streak carries forward from one
+        checkpoint in the chain to the next regardless of which path
+        produced it. `new_nodes` is whatever that resolution produced (new
+        sibling steps on the continuation path, or the checkpoint's own
+        freshly-replanned children on the failure path). If `new_nodes` is
+        entirely further checkpoints, the streak is inherited onto each of
+        them (so the *next* resolution in the chain can look it up by its
+        own node_id); once the inherited streak crosses the limit, every
+        checkpoint among `new_nodes` is force-demoted to an ordinary leaf
+        instead, and the streak stops there. Any non-checkpoint step in
+        `new_nodes` means real progress happened -- the streak is dropped,
+        not carried forward. Also re-stored under `checkpoint`'s own
+        node_id (not just the new nodes'): the rollup-failure replan path
+        re-invokes this with the *same* checkpoint object every round
+        (`replan_subtree` regenerates its children in place, the node_id
+        never changes), so without this the streak written onto the
+        previous round's discarded children would never be read back and
+        would never actually accumulate past 1."""
+        prior_streak = self._checkpoint_chain_streak.pop(checkpoint.node_id, 0)
         if not new_nodes:
             return
         all_checkpoints = all(n.is_checkpoint for n in new_nodes)
         if not all_checkpoints:
-            self._checkpoint_chain_streak.pop(parent.node_id, None)
             return
-        streak = self._checkpoint_chain_streak.get(parent.node_id, 0) + 1
-        self._checkpoint_chain_streak[parent.node_id] = streak
+        streak = prior_streak + 1
         if streak < self._CHECKPOINT_CHAIN_STREAK_LIMIT:
+            self._checkpoint_chain_streak[checkpoint.node_id] = streak
+            for node in new_nodes:
+                self._checkpoint_chain_streak[node.node_id] = streak
             return
         logger.warning(
-            "Checkpoint chain under node %s has produced %d consecutive "
-            "checkpoint-only splices with no real work in between; forcing "
+            "Checkpoint chain rooted at node %s has produced %d consecutive "
+            "checkpoint-only outcomes with no real work in between; forcing "
             "further checkpoints in this splice to ordinary leaves",
-            parent.node_id,
+            checkpoint.node_id,
             streak,
         )
         for node in new_nodes:
             node.declared_type = "leaf"
             node.requested_branch = False
-        self._checkpoint_chain_streak[parent.node_id] = 0
 
     def _rollup_evidence(self, branch: PlanNode) -> str:
         """Ground-truth evidence for a branch's own sub-goal: current

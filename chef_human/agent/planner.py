@@ -590,17 +590,25 @@ class Planner:
         return collected
 
     @staticmethod
-    def _render_nearby_tree(node: PlanNode, nearby: list[PlanNode]) -> str:
+    def _render_nearby_tree(
+        node: PlanNode, nearby: list[PlanNode], *, show_status: bool = False
+    ) -> str:
         """Renders `nearby` (from `_collect_nearby_nodes`) as an indented
         tree, marking `node` inline. A node whose parent fell outside the
         BFS ball becomes a top-level entry in the render (the ball's
-        boundary), not nested under a parent that isn't shown."""
+        boundary), not nested under a parent that isn't shown. `show_status`
+        appends each node's status (e.g. `[completed]`) inline -- used by
+        the newer expand/replan/continue-from-checkpoint call sites so a
+        decomposition can notice a nearby node already covered the same
+        ground; the original atomicity-check render leaves this off."""
         nearby_ids = {n.node_id for n in nearby}
         roots = [n for n in nearby if n.parent is None or n.parent.node_id not in nearby_ids]
         lines: list[str] = []
 
         def label(n: PlanNode) -> str:
             text = "(overall task)" if n.description == "root" else n.description
+            if show_status and n.description != "root":
+                text = f"{text} [{n.status.value}]"
             return f"{text}  <-- the step being checked" if n.node_id == node.node_id else text
 
         def render(n: PlanNode, depth: int) -> None:
@@ -678,12 +686,21 @@ class Planner:
             if node.atomicity_reason
             else ""
         )
+        nearby = Planner._collect_nearby_nodes(node, limit=Planner._ATOMICITY_TREE_CONTEXT_LIMIT)
+        tree_context = Planner._render_nearby_tree(node, nearby, show_status=True)
+        nearby_line = (
+            f"\n\nNearby plan structure (siblings/cousins and their status, so you don't "
+            f"repeat work already covered elsewhere):\n{tree_context}\n"
+            if tree_context
+            else ""
+        )
         messages.append(
             Message(
                 role=Role.user,
                 content=(
                     f"Overall goal: {task}\n\n"
-                    f"Ancestor chain (root goal down to this sub-goal):\n{chain}\n\n"
+                    f"Ancestor chain (root goal down to this sub-goal):\n{chain}\n"
+                    f"{nearby_line}\n"
                     "Break the following sub-goal down into its own immediate next steps "
                     "(do not re-plan the overall goal, only this sub-goal):\n"
                     f"{node.description}"
@@ -807,12 +824,21 @@ class Planner:
             Message(role=Role.system, content=PLANNER_SYSTEM_PROMPT + system_suffix)
         ]
         chain = "\n".join(f"- {d}" for d in ([goal] + ancestors))
+        nearby = Planner._collect_nearby_nodes(node, limit=Planner._ATOMICITY_TREE_CONTEXT_LIMIT)
+        tree_context = Planner._render_nearby_tree(node, nearby, show_status=True)
+        nearby_line = (
+            f"\n\nNearby plan structure (siblings/cousins and their status, so you don't "
+            f"repeat work already covered elsewhere):\n{tree_context}\n"
+            if tree_context
+            else ""
+        )
         messages.append(
             Message(
                 role=Role.user,
                 content=(
                     f"Overall goal: {goal}\n\n"
-                    f"Ancestor chain (root goal down to this sub-goal):\n{chain}\n\n"
+                    f"Ancestor chain (root goal down to this sub-goal):\n{chain}\n"
+                    f"{nearby_line}\n"
                     f"{situation_line}\n"
                     f"{node.description}\n\n"
                     f"{context_label}:\n{failure_context}\n\n"
@@ -883,6 +909,14 @@ class Planner:
         `expand_spliced_steps` for classification/further expansion."""
         ancestors = self._ancestor_descriptions(checkpoint)
         chain = "\n".join(f"- {d}" for d in ([plan.goal] + ancestors))
+        nearby = self._collect_nearby_nodes(checkpoint, limit=self._ATOMICITY_TREE_CONTEXT_LIMIT)
+        tree_context = self._render_nearby_tree(checkpoint, nearby, show_status=True)
+        nearby_line = (
+            f"\n\nNearby plan structure (siblings/cousins and their status, so you don't "
+            f"repeat work already covered elsewhere):\n{tree_context}\n"
+            if tree_context
+            else ""
+        )
         messages = [
             Message(
                 role=Role.system,
@@ -895,7 +929,8 @@ class Planner:
                 role=Role.user,
                 content=(
                     f"Overall goal: {plan.goal}\n\n"
-                    f"Ancestor chain (root goal down to this checkpoint):\n{chain}\n\n"
+                    f"Ancestor chain (root goal down to this checkpoint):\n{chain}\n"
+                    f"{nearby_line}\n"
                     f"This checkpoint's sub-goal (now complete): {checkpoint.description}\n\n"
                     f"What the checkpoint's own work actually discovered:\n{evidence or '(no evidence recorded)'}\n\n"
                     "Using what was learned above, output a revised JSON array of the "

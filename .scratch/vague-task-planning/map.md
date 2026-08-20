@@ -83,6 +83,20 @@ benchmark run, not just a design spec. Tickets do real work, not just decide.
   Either enrichment's fix is not reliable/deterministic across runs, or something about a fresh worktree
   checkout differs from the run ticket 01/02's evidence was captured against -- not yet isolated further.
   See ticket 10's Answer for the run's specifics (kept workspace: `benchmark-runs/20260820-024854/`).
+- Re-ran the same case with `CHEF_OLLAMA_THINK=true` (2026-08-20, user asked to change the standing
+  guidance to run with think-mode on despite `project_thinkmode_quality_drop`'s earlier false-escalation
+  finding). Result: timed out at the benchmark harness's 600s case timeout, `steps=?` -- the run never
+  got past plan generation. `agent.log` shows zero step-verification lines at all; the only substantive
+  signal is `Planner`'s own convergence-safety-net warning firing mid-generation ("Decomposition ...
+  has not converged to leaves after depth=5, node_count=22"), then more planning HTTP calls until the
+  timeout hit. So with think-mode on, this case's failure mode is neither the stuck-replan-loop (ticket
+  02/03) nor the explore-only-plan (ticket 01/think-off run above) -- it's plan generation itself taking
+  too long to converge (each of the many expansion/atomicity-check LLM calls costs extra wall-clock for
+  the model's reasoning trace) to even reach execution within the case's time budget. Not yet clear
+  whether this is a hard blocker (decomposition genuinely doesn't converge) or just needs more wall-clock
+  than 600s gives it with think-mode's slower calls -- would need either a longer `--timeout` or the
+  actual node count/depth this run reached before its clock ran out (not captured beyond the one
+  threshold-crossing warning) to tell apart.
 
 ## Not yet specified
 

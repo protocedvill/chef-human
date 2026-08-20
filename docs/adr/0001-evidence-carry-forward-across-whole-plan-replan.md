@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: partially implemented
 ---
 
 # Evidence carry-forward across a whole-plan replan
@@ -54,3 +54,19 @@ Two changes, decided together:
 
 See `CLAUDE.md`'s "Step verification" section for the historical false-escalation bugs that first
 surfaced the evidence-keying problem this decision closes the remaining gap on.
+
+## Implementation status
+
+Item 2 (`continues_node_id` tagging in `update_plan()`) is implemented: `PlanNode.continues_node_id`
+carries the tag through `_parse_steps`/`_normalize_steps`, and `update_plan()` reuses a matching
+unclaimed non-completed node's `node_id` (resetting `status` to `pending`), falling back to a fresh
+node on any malformed/unmatched/double-claimed tag (debug-logged). Diagnosed and fixed via a real
+`frontier/vague_feature_request_real_repo` benchmark run that got stuck alternating between "Read
+docs/source/software.rst" and "Use the read tool on docs/source/software.rst" for 25 replans straight,
+losing the prior read's evidence each time; regression test:
+`tests/test_agent/test_planner.py::TestUpdatePlan::test_reworded_pending_step_keeps_node_id_via_continues_node_id`.
+
+Item 1 (widening `_replan_failing_node`'s target lookup to catch an `in_progress` node before falling
+back to `update_plan()`) remains unimplemented — it wasn't the mechanism behind the observed bug (the
+stuck node was `pending`, so `plan.current_leaf()` already found it and routed through `replan_subtree`
+correctly); it's a separate, still-theoretical gap.

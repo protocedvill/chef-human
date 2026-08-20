@@ -55,6 +55,9 @@ pyright
 Ollama must be running locally (`ollama serve`) with the configured model pulled
 (default `qwen2.5-coder:7b`) for anything that actually calls the LLM.
 
+Always run the agent and benchmark with thinking mode enabled: `CHEF_OLLAMA_THINK=true` (there is no
+CLI flag for it). Set this by default, not just when a task seems to need it.
+
 ### Environment on this machine
 
 The working Python venv is `/home/louis/chef-human/.env` (note: `.env`, not `.venv`) — already has
@@ -142,9 +145,10 @@ rejecting already-correct work until `RetryManager`'s 5-consecutive-failure cap 
   turn's tool call produced a visible change.
 
 Evidence is now keyed by stable `PlanNode.node_id` rather than description text, which closed most of
-the false-escalation surface above. A narrower gap remains in `update_plan()`'s whole-plan replan
-fallback — see `docs/adr/0001-evidence-carry-forward-across-whole-plan-replan.md` for the mechanism and
-the settled (not yet implemented) fix.
+the false-escalation surface above. `update_plan()`'s whole-plan replan fallback now carries a node's
+`node_id` forward when the LLM's revised step tags `continues_node_id` naming it — see
+`docs/adr/0001-evidence-carry-forward-across-whole-plan-replan.md` for the mechanism; that ADR's item 1
+(widening `_replan_failing_node`'s target lookup to catch `in_progress` nodes) is still unimplemented.
 
 ### Tools (`chef_human/tools/`)
 

@@ -1297,6 +1297,34 @@ class TestReplanSubtree:
         assert "rollup said no coverage" in user_msg
 
 
+class TestCheckpointPromptGuidance:
+    """Ticket 04: the planner's own system prompt must actively teach the
+    checkpoint mechanism -- not just support parsing it if the model
+    happens to emit it (TestCheckpointParsing below covers that seam)."""
+
+    def test_guidance_present_in_system_message_for_plan_generation(self):
+        messages = Planner._build_expand_messages(
+            task="Add a web interface",
+            repo_context="",
+            ancestors=[],
+            node=PlanNode(description="root"),
+            is_root=True,
+        )
+        system_content = messages[0].content
+
+        assert '"checkpoint"' in system_content
+        assert "don't know how to implement" in system_content
+        # Teaches resolving the unknown first, checkpoint second -- not a
+        # reflexive default, and not chained with no real work in between.
+        assert "reflexively" in system_content
+        assert "no real exploration or implementation work" in system_content
+        # A worked example of the exact failure mode this feature targets
+        # (explore collapsing into nothing) and of a checkpoint appearing
+        # mid-plan, not only as the opening move.
+        assert "Example 1" in system_content
+        assert "Example 2" in system_content
+
+
 class TestCheckpointParsing:
     def test_type_checkpoint_parses_as_checkpoint_not_branch(self):
         planner = Planner(MagicMock())

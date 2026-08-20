@@ -5027,6 +5027,74 @@ class TestSubtreeReplanAndEvidence:
         assert loop._last_failed_node is None
 
     @pytest.mark.asyncio
+    async def test_repeated_leaf_replans_under_same_branch_widen_to_the_branch(self):
+        """Ticket 10: a branch whose leaves keep getting individually
+        replanned into fresh, differently-worded leaves never accumulates
+        RetryManager pressure against a single node_id (each replan mints a
+        new one) -- ReActLoop's own streak counter must catch that and widen
+        the replan target to the containing branch once it happens too many
+        times in a row without progress."""
+        planner = _make_mock_planner()
+        loop = self._make_loop(planner)
+
+        branch = PlanNode(index=1, description="Explore the codebase")
+        plan = Plan(goal="Task", steps=[branch])
+
+        for i in range(loop._SUBTREE_REPLAN_STREAK_LIMIT - 1):
+            stuck_leaf = PlanNode(index=1, description=f"Explore attempt {i}")
+            branch.set_children([stuck_leaf])
+            loop._last_failed_node = stuck_leaf
+            await loop._replan_failing_node(plan, "still exploring")
+            assert planner.replan_subtree.await_args.args[1] is stuck_leaf
+
+        # One more progress-free replan crosses the streak limit: this
+        # time the branch itself, not the latest stuck leaf, is replanned.
+        final_stuck_leaf = PlanNode(index=1, description="Explore attempt final")
+        branch.set_children([final_stuck_leaf])
+        loop._last_failed_node = final_stuck_leaf
+        await loop._replan_failing_node(plan, "still exploring")
+
+        assert planner.replan_subtree.await_args.args[1] is branch
+        assert loop._subtree_replan_streak.get(branch.node_id, 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_progress_under_branch_resets_the_replan_streak(self):
+        planner = _make_mock_planner()
+        loop = self._make_loop(planner)
+
+        branch = PlanNode(index=1, description="Explore the codebase")
+        leaf = PlanNode(index=1, description="Explore attempt")
+        branch.set_children([leaf])
+        plan = Plan(goal="Task", steps=[branch])
+
+        loop._last_failed_node = leaf
+        await loop._replan_failing_node(plan, "still exploring")
+        assert loop._subtree_replan_streak.get(branch.node_id, 0) == 1
+
+        # The (replanned) leaf now completes -- real progress under branch.
+        new_leaf = branch.children[0] if branch.children else leaf
+        loop._reset_subtree_replan_streak(new_leaf)
+
+        assert branch.node_id not in loop._subtree_replan_streak
+
+    @pytest.mark.asyncio
+    async def test_leaf_directly_under_root_is_not_widened(self):
+        """A leaf with no real containing branch (its parent is the plan's
+        synthetic root) has nowhere to widen scope to -- the streak
+        mechanism must leave it alone and keep targeting the leaf itself."""
+        planner = _make_mock_planner()
+        loop = self._make_loop(planner)
+
+        leaf = PlanNode(index=1, description="Top-level step")
+        plan = Plan(goal="Task", steps=[leaf])
+
+        loop._last_failed_node = leaf
+        for _ in range(loop._SUBTREE_REPLAN_STREAK_LIMIT + 2):
+            await loop._replan_failing_node(plan, "still stuck")
+            assert planner.replan_subtree.await_args.args[1] is leaf
+        assert not loop._subtree_replan_streak
+
+    @pytest.mark.asyncio
     async def test_branch_rollup_rejection_targets_the_branch_not_current_leaf(self):
         planner = _make_mock_planner()
         loop = self._make_loop(planner)

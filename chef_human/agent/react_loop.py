@@ -615,6 +615,14 @@ class ReActLoop:
         # decision no one is there (headless) or ready (interactive) to make
         # the instant it happens.
         self._escalations: list[EscalationRecord] = []
+        # Per-branch streak of consecutive subtree replans scoped to one of
+        # that branch's descendants, keyed by the branch's own node_id --
+        # counts progress-free replan pressure that RetryManager's per-node
+        # cap can't see, since each subtree replan mints fresh node_ids for
+        # its new children (see ticket 10 in
+        # .scratch/planning-tree/issues/). Reset to 0 whenever any node
+        # under that branch actually completes.
+        self._subtree_replan_streak: dict[str, int] = {}
         # RetryManager for the run currently in progress -- lives on the
         # instance (not a `_execute` local) so `resolve_escalation`'s resume
         # reuses it instead of resetting every node's failure/replan counters.
@@ -748,14 +756,70 @@ class ReActLoop:
             self._step_evidence[self._step_evidence_key(ancestor)] = rebuilt
             ancestor = ancestor.parent
 
+    # A branch whose descendants have needed this many consecutive
+    # progress-free subtree replans gets its *own* replan widened to cover
+    # the whole branch instead of just the most recently failing leaf --
+    # see ticket 10 in .scratch/planning-tree/issues/. Deliberately lower
+    # than RetryManager's max_replans-per-node cap: this is catching a
+    # different failure mode (many distinct leaves under one branch each
+    # individually replanned once) that a per-node counter can't see.
+    _SUBTREE_REPLAN_STREAK_LIMIT = 3
+
+    def _reset_subtree_replan_streak(self, node: PlanNode) -> None:
+        """Call when `node` (leaf or branch) is marked complete -- clears
+        the progress-free replan streak for every ancestor branch above it,
+        since real progress happened somewhere under each of them."""
+        ancestor = node.parent
+        while ancestor is not None:
+            self._subtree_replan_streak.pop(ancestor.node_id, None)
+            ancestor = ancestor.parent
+
+    def _widen_stuck_replan_target(self, plan: Plan, target: PlanNode) -> PlanNode:
+        """Bumps `target`'s nearest branch ancestor's progress-free replan
+        streak and, once it crosses `_SUBTREE_REPLAN_STREAK_LIMIT`, returns
+        that ancestor instead of `target` so the caller replans the whole
+        branch -- otherwise returns `target` unchanged. A leaf directly
+        under the plan root (no real containing branch) is returned as-is;
+        this mechanism only widens scope when there is an actual branch to
+        widen to, leaving RetryManager's ordinary per-node retry/replan/
+        escalate path in charge of that case."""
+        ancestor = target.parent
+        if ancestor is None or ancestor is plan.root:
+            return target
+        streak = self._subtree_replan_streak.get(ancestor.node_id, 0) + 1
+        self._subtree_replan_streak[ancestor.node_id] = streak
+        if streak < self._SUBTREE_REPLAN_STREAK_LIMIT:
+            return target
+        logger.warning(
+            "Subtree under node %s has needed %d consecutive progress-free "
+            "replans; widening the next replan to the whole sub-goal "
+            "('%s') instead of just its most recently failing piece",
+            ancestor.node_id,
+            streak,
+            ancestor.description,
+        )
+        self._subtree_replan_streak[ancestor.node_id] = 0
+        return ancestor
+
     async def _replan_failing_node(self, plan: Plan, failure_context: str) -> Plan:
         """Scope a replan to whichever node most recently failed
         verification (leaf or rollup), preserving its node_id and touching
         no sibling/ancestor node elsewhere in the tree. Falls back to a
-        whole-plan replan only when no specific node can be identified."""
+        whole-plan replan only when no specific node can be identified.
+        Widens to the containing branch instead, per
+        `_widen_stuck_replan_target`, once that branch has needed too many
+        consecutive progress-free replans in a row."""
         target = self._last_failed_node or plan.current_leaf()
         if target is None:
             return await self._planner.update_plan(plan, failure_context=failure_context)
+        widened = self._widen_stuck_replan_target(plan, target)
+        if widened is not target:
+            target = widened
+            failure_context = (
+                f"{failure_context}\n\nThis part of the plan has needed repeated replans "
+                "without making progress -- replan the whole sub-goal below, not just its "
+                "most recently failing piece."
+            )
         self._discard_subtree_evidence(target)
         target.status = StepStatus.pending
         await self._planner.replan_subtree(plan, target, failure_context)
@@ -2002,7 +2066,7 @@ class ReActLoop:
                 continue
         return facts
 
-    async def _process_rollups(self, plan: Plan) -> str | None:
+    async def _process_rollups(self, plan: Plan, completed_node: PlanNode | None = None) -> str | None:
         """After a leaf is marked complete, walk any ancestor branches whose
         children are now all complete and run a rollup verification on each
         before marking the branch itself complete -- cascading upward as
@@ -2011,6 +2075,8 @@ class ReActLoop:
         decomposition can leave the sub-goal uncovered); on the first
         rejection, stop and return feedback for the model instead of
         continuing to roll up higher branches that depend on it."""
+        if completed_node is not None:
+            self._reset_subtree_replan_streak(completed_node)
         while True:
             ready = plan.ready_rollup_branches()
             if not ready:
@@ -2053,6 +2119,7 @@ class ReActLoop:
                 )
             branch.status = StepStatus.completed
             branch.last_verdict_reason = reason
+            self._reset_subtree_replan_streak(branch)
             # This branch is done -- clear the stale reference so a later
             # rollup failure higher in the tree (or the exception path
             # above, on a *different* branch) doesn't get attributed back
@@ -2225,7 +2292,7 @@ class ReActLoop:
                 )
                 step.status = StepStatus.completed
                 step.last_verdict_reason = "auto-completed: investigative step had tool evidence"
-                return await self._process_rollups(plan)
+                return await self._process_rollups(plan, step)
             else:
                 step.status = StepStatus.pending
                 return (
@@ -2252,7 +2319,7 @@ class ReActLoop:
                     )
                     step.status = StepStatus.completed
                     step.last_verdict_reason = f"auto-completed: {target_name} now exists on disk"
-                    return await self._process_rollups(plan)
+                    return await self._process_rollups(plan, step)
             for path_str in files_written_this_turn:
                 p = Path(path_str)
                 if p.name in target_names and p.exists() and p.stat().st_size > 0:
@@ -2267,7 +2334,7 @@ class ReActLoop:
                     )
                     step.status = StepStatus.completed
                     step.last_verdict_reason = f"auto-completed: {path_str} exists on disk"
-                    return await self._process_rollups(plan)
+                    return await self._process_rollups(plan, step)
 
         mutation_targets = _looks_like_file_mutation_step(step.description)
         if (
@@ -2292,7 +2359,7 @@ class ReActLoop:
             step.last_verdict_reason = (
                 f"auto-completed: successful command(s) {successful_commands_this_turn}"
             )
-            return await self._process_rollups(plan)
+            return await self._process_rollups(plan, step)
 
         if (
             _looks_like_execution_step(step.description)
@@ -2394,7 +2461,7 @@ class ReActLoop:
         if verdict == StepVerdict.complete:
             step.status = StepStatus.completed
             step.last_verdict_reason = reason
-            return await self._process_rollups(plan)
+            return await self._process_rollups(plan, step)
 
         step.status = StepStatus.pending
         return (

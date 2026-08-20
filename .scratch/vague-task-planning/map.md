@@ -68,13 +68,36 @@ benchmark run, not just a design spec. Tickets do real work, not just decide.
   ubertooth) in an empty, non-git directory instead of the real checkout. Fixed by resolving `workspace`
   once, up front. This affects every `workspace_kind="worktree"` case with a non-default `source_repo`,
   not just this one.
+- `.scratch/planning-tree/issues/04-evidence-propagation-and-subtree-replan.md` landed (found already
+  fully implemented and tested when checked, 2026-08-20 -- no code changes needed, just closed as `done`).
+  That unblocked graduating the mid-run-replan idea into a real ticket:
+  `.scratch/planning-tree/issues/10-subtree-replan-streak-escalation.md`, built and unit-tested per the
+  operational shape ticket 03 recorded (a per-branch streak of progress-free subtree replans, widening
+  the replan target to the whole branch once the streak crosses a threshold).
+- Ticket 10 does **not** turn this benchmark case green. A fresh benchmark run (2026-08-20,
+  `qwen3.6:35b-a3b`, think-mode off) shows the case failing for a *different* reason than ticket 02/03
+  diagnosed: the plan generated this time was a 7-leaf, entirely explore-only plan that finished in 8
+  steps with zero replans (every step individually verified complete first try) -- never a stuck-replan
+  loop at all, so ticket 10's mechanism never had anything to fire on. This is the *original*
+  explore-only-plan failure mode ticket 01 (repo-context enrichment) was supposed to have already fixed.
+  Either enrichment's fix is not reliable/deterministic across runs, or something about a fresh worktree
+  checkout differs from the run ticket 01/02's evidence was captured against -- not yet isolated further.
+  See ticket 10's Answer for the run's specifics (kept workspace: `benchmark-runs/20260820-024854/`).
 
 ## Not yet specified
 
-- Whatever mid-run-replan design/implementation tickets turn out to be needed, contingent on the
-  benchmark-run ticket's outcome (Deciding whether mid-run replan is still needed). Deliberately not
-  ticketed yet — can't specify the replan mechanism's scope precisely until there's failure evidence
-  from a benchmark run against the *enriched* planner to diagnose against.
+- Why repo-context enrichment (ticket 01, `done`) didn't produce a repo-specific, implementation-bearing
+  plan on the 2026-08-20 run the way ticket 02's evidence showed it did previously -- is this run-to-run
+  planner variance (despite temperature=0.0, the multi-call iterative decomposition has many LLM calls
+  that could each individually drift) or a real regression/environment difference? This is the actual
+  remaining blocker on this map's destination now, not mid-run replan (ticket 10 is done and validated
+  in isolation, just not sufficient alone). Not yet ticketed -- needs at least one more benchmark run
+  (maybe two, to check for run-to-run variance) with the *generated plan itself* logged before it's worth
+  a design ticket; currently `agent.log` only logs step-level verification, not the plan generation calls
+  or the rendered tree, which made this run harder to diagnose than it should have been. Also worth
+  ticketing: log `Planner.format_full_tree`'s output right after `generate_plan` returns, at DEBUG, so a
+  future kept workspace shows the actual plan without having to reconstruct it from step verification log
+  lines the way this investigation had to.
 
 ## Out of scope
 

@@ -257,8 +257,21 @@ class Plan:
         return next((n for n in self._leaves() if n.status == StepStatus.pending), None)
 
     def unresolved_steps(self) -> list[PlanNode]:
-        """Leaves that prevent a plan from being reported as complete."""
-        return [n for n in self._leaves() if n.status != StepStatus.completed]
+        """Nodes that prevent a plan from being reported as complete:
+        incomplete leaves, plus any branch (including a checkpoint) whose
+        own rollup verification hasn't passed even though its children have
+        all completed. Without the branch half of this, `is_complete()`
+        (which does check branches) and `unresolved_steps()` disagreed --
+        a checkpoint whose rollup verdict came back `not_complete` left its
+        children all `completed` with nothing pending, so this returned
+        `[]` and the `finish` tool's gate (keyed on this, not
+        `is_complete()`) let the agent finish before the checkpoint's
+        continuation into implementation steps ever fired. Observed live:
+        a real run finished after pure exploration with zero files
+        changed."""
+        unresolved = [n for n in self._leaves() if n.status != StepStatus.completed]
+        unresolved.extend(b for b in self._branches() if b.status != StepStatus.completed)
+        return unresolved
 
     def _branches(self) -> list[PlanNode]:
         """Every non-root node with children, post-order -- deepest branches

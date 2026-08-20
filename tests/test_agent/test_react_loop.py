@@ -26,6 +26,7 @@ from chef_human.llm.backend import (
     Role,
     ToolDefinition,
 )
+from chef_human.tools.diff import DiffStore, FileChange
 from chef_human.tools.filesystem import ReadTool, WriteTool
 from chef_human.tools.registry import ToolRegistry
 from chef_human.tools.user import FinishTool
@@ -835,6 +836,103 @@ class TestReActLoopRun:
         await loop.run("do something")
 
         bash_tool.run.assert_awaited_once_with(command="rm -rf /tmp/test")
+
+    @pytest.mark.asyncio
+    async def test_self_cleanup_rm_auto_approved_without_prompt(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "bash", "arguments": {"command": "rm -f scratch.py"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        bash_tool = MagicMock()
+        bash_tool.name = "bash"
+        bash_tool.parameters = {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        }
+        bash_tool.run = AsyncMock(return_value=MagicMock(output="ok", success=True, error=None))
+
+        diff_store = DiffStore()
+        diff_store.record_transaction(
+            [FileChange("scratch.py", None, "print(1)")], "write"
+        )
+        write_tool = MagicMock()
+        write_tool._diff_store = diff_store
+
+        registry.get.side_effect = lambda name: write_tool if name == "write" else bash_tool
+
+        ui = MagicMock(spec=NoopUI)
+        # If approval were requested, denying it would fail the assertion below --
+        # proves the auto-approve path is what let the command through.
+        ui.on_approval_request = AsyncMock(return_value=False)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, require_approval_for_destructive=True),
+            ui=ui,
+        )
+        await loop.run("do something")
+
+        bash_tool.run.assert_awaited_once_with(command="rm -f scratch.py")
+        ui.on_approval_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_self_cleanup_rm_still_gated_for_preexisting_file(self):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "bash", "arguments": {"command": "rm -f important.py"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = _make_default_plan()
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        bash_tool = MagicMock()
+        bash_tool.name = "bash"
+        bash_tool.parameters = {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        }
+        registry.get.return_value = bash_tool
+
+        diff_store = DiffStore()
+        # An edit to a file that already existed (old_content is not None) --
+        # not something the agent created, so cleanup on it must still be gated.
+        diff_store.record("important.py", "diff", "edit", old_content="x", new_content="y")
+        write_tool = MagicMock()
+        write_tool._diff_store = diff_store
+        registry.get.side_effect = lambda name: write_tool if name == "write" else bash_tool
+
+        ui = MagicMock(spec=NoopUI)
+        ui.on_approval_request = AsyncMock(return_value=False)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1, require_approval_for_destructive=True),
+            ui=ui,
+        )
+        await loop.run("do something")
+
+        bash_tool.run.assert_not_called()
+        ui.on_approval_request.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_non_destructive_command_passes_without_approval(self):
@@ -2942,6 +3040,61 @@ class TestInvestigativeStepBypassesVerification:
         )
         await loop.run("do something")
 
+        assert plan.steps[0].status == StepStatus.completed
+        planner.verify_step.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_named_file_with_directory_path_read_step_runs_through_verifier(self):
+        """Regression: a step naming a file by its directory-qualified path
+        (e.g. 'docs/source/plan.md', as real plans do) must recognize the
+        file as read once the agent reads that exact path -- it must not
+        stay stuck reporting "not been read yet this session" forever. The
+        named-files check used to compare the full path from the step
+        description against `_read_file_names`'s *basenames*-only set,
+        which can never match when the name has a directory component,
+        trapping the step in an infinite re-read loop no matter how many
+        times the file is actually read."""
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "read", "arguments": {"path": "docs/source/plan.md"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanNode(index=1, description="Read docs/source/plan.md for project overview", status=StepStatus.pending),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        read_tool = MagicMock()
+        read_tool.name = "read"
+        read_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        read_tool.run = AsyncMock(
+            return_value=MagicMock(output="# Plan\nSome real content", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"read": read_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        await loop.run("do something")
+
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert not any("not been read yet this session" in m for m in tool_msgs)
         assert plan.steps[0].status == StepStatus.completed
         planner.verify_step.assert_awaited_once()
 

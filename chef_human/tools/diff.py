@@ -225,6 +225,18 @@ class DiffStore:
     def get_all(self, path: str | None = None) -> list[DiffEntry]:
         return [e for e in self._entries if path is None or e.path == path]
 
+    def session_created_files(self) -> set[str]:
+        """Paths whose *first* recorded change this session had no prior
+        content -- i.e. the agent itself created the file, rather than
+        editing something that already existed. Used to scope auto-approval
+        of destructive cleanup commands (e.g. headless `rm` on a file the
+        agent just wrote) to files it can't be destroying pre-existing work
+        on."""
+        first_seen: dict[str, DiffEntry] = {}
+        for entry in self._entries:
+            first_seen.setdefault(entry.path, entry)
+        return {path for path, entry in first_seen.items() if entry.old_content is None}
+
     def last(self, path: str | None = None) -> DiffEntry | None:
         index = self._last_index(path)
         return self._entries[index] if index is not None else None

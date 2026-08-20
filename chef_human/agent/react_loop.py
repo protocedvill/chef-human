@@ -1455,18 +1455,26 @@ class ReActLoop:
                         self._config.require_approval_for_destructive
                         and tc.name == "bash"
                     ):
-                        if self._is_destructive_command(tc.arguments.get("command", "")):
-                            logger.info("Requesting approval for destructive command: %s", tc.arguments.get("command", "")[:200])
-                            approved = await self._request_approval(tc)
-                            logger.info("Approval result: %s", approved)
-                            if not approved:
-                                result = self._make_tool_error(
-                                    "Command rejected by user: destructive operation requires approval"
+                        command = tc.arguments.get("command", "")
+                        if self._is_destructive_command(command):
+                            if self._is_safe_self_cleanup(command):
+                                logger.info(
+                                    "Auto-approving destructive command as self-cleanup "
+                                    "(targets only files created this session): %s",
+                                    command[:200],
                                 )
-                                self._ui.on_tool_result(tc.name, result)
-                                tool_results.append(result)
-                                failed_calls += 1
-                                continue
+                            else:
+                                logger.info("Requesting approval for destructive command: %s", command[:200])
+                                approved = await self._request_approval(tc)
+                                logger.info("Approval result: %s", approved)
+                                if not approved:
+                                    result = self._make_tool_error(
+                                        "Command rejected by user: destructive operation requires approval"
+                                    )
+                                    self._ui.on_tool_result(tc.name, result)
+                                    tool_results.append(result)
+                                    failed_calls += 1
+                                    continue
 
                     parallel_candidates.append((tc, tool))
 
@@ -2304,7 +2312,18 @@ class ReActLoop:
         really finished yet, or None if it was marked complete."""
         step = step_override or plan.current_leaf()
         if step is None:
-            return None
+            # No leaf is pending, but that doesn't mean the plan is done --
+            # an ancestor branch (e.g. a checkpoint) can have every child
+            # leaf complete yet still be unresolved itself, if its rollup
+            # verification came back not_complete (or hasn't run yet).
+            # Retry the rollup on each otherwise-successful turn so evidence
+            # the model keeps gathering (per the "keep working on that
+            # sub-goal" prompt hint for exactly this state) eventually
+            # either passes it -- continuing a checkpoint into real
+            # implementation steps -- or produces fresh, visible rejection
+            # feedback, instead of leaving the model with no step and no
+            # feedback until max_steps silently runs out.
+            return await self._process_rollups(plan)
 
         step.status = StepStatus.in_progress
         # Set unconditionally, ahead of every failure-feedback return point
@@ -2375,7 +2394,16 @@ class ReActLoop:
                 # non-existent "file" is an impossible loop.
                 existing_named_files = []
                 for name in investigative_named_files:
-                    if name in investigative_read_names:
+                    # `investigative_read_names` holds basenames only (see
+                    # _read_file_names); `name` here is the *full* path text
+                    # matched out of the step description (e.g.
+                    # "docs/source/plan.md"), which never equals a bare
+                    # basename. Compare on Path(name).name so a named file
+                    # with a directory component can still match -- without
+                    # this, "read docs/source/plan.md" could never register
+                    # as read no matter how many times the file was read,
+                    # trapping the step in an infinite re-read loop.
+                    if Path(name).name in investigative_read_names:
                         existing_named_files.append(name)
                         continue
                     try:
@@ -2388,7 +2416,7 @@ class ReActLoop:
                 unread = [
                     name
                     for name in investigative_named_files
-                    if name not in investigative_read_names
+                    if Path(name).name not in investigative_read_names
                 ]
                 if unread:
                     step.status = StepStatus.pending
@@ -2714,6 +2742,56 @@ class ReActLoop:
             if stripped.startswith(prefix):
                 return True
         return False
+
+    def _is_safe_self_cleanup(self, command: str) -> bool:
+        """Whether a destructive command is a plain `rm` targeting only
+        files the agent itself created this session (per DiffStore -- a
+        first-recorded change with no prior content). Scoped deliberately
+        narrow: only bare `rm [-f|-r|-rf] <paths...>` with no shell
+        operators/wildcards/redirects, and every path must resolve to a
+        session-created file. This exists so headless runs (no TTY to
+        approve against, see `_request_approval`) aren't fatally blocked on
+        an agent cleaning up its own scratch/dead-end files, while still
+        hard-requiring approval for anything touching pre-existing files."""
+        import shlex
+
+        from chef_human.tools.diff import DiffStore
+
+        write_tool = self._tools.get("write")
+        diff_store = getattr(write_tool, "_diff_store", None) if write_tool else None
+        if not isinstance(diff_store, DiffStore):
+            return False
+
+        stripped = command.strip()
+        if any(op in stripped for op in ("&&", "||", ";", "|", "\n", ">", "<", "*", "?", "$", "`")):
+            return False
+
+        try:
+            tokens = shlex.split(stripped)
+        except ValueError:
+            return False
+        if not tokens or tokens[0] != "rm":
+            return False
+
+        paths = [t for t in tokens[1:] if not t.startswith("-")]
+        if not paths:
+            return False
+
+        created_keys: set[str] = set()
+        for raw in diff_store.session_created_files():
+            try:
+                created_keys.add(str(self._context.workspace.resolve(raw)))
+            except Exception:
+                continue
+
+        for raw_path in paths:
+            try:
+                resolved = self._context.workspace.resolve(raw_path)
+            except Exception:
+                return False
+            if str(resolved) not in created_keys:
+                return False
+        return True
 
     async def _request_approval(self, tool_call: ParsedToolCall) -> bool:
         result = await self._ui.on_approval_request(tool_call)

@@ -90,6 +90,44 @@ class TestPlan:
         assert steps[0].parent is plan.root
 
 
+class TestUnresolvedSteps:
+    def test_all_leaves_complete_but_branch_rollup_pending(self):
+        """Regression: a branch (e.g. a checkpoint) whose children are all
+        individually complete but whose own rollup verification hasn't
+        passed (or failed) must still block `unresolved_steps()` --
+        otherwise the `finish` tool's gate (which checks
+        `unresolved_steps()`, not `is_complete()`) lets the agent finish
+        with the branch's own sub-goal never actually verified, and for a
+        checkpoint specifically, its continuation into implementation steps
+        never fires. Observed live: a checkpoint's rollup verdict came back
+        `not_complete`, its children were all already `completed`, and
+        `unresolved_steps()` returned `[]` anyway -- the agent finished
+        after pure exploration with zero files changed."""
+        child_a = PlanNode(description="a", status=StepStatus.completed)
+        child_b = PlanNode(description="b", status=StepStatus.completed)
+        branch = PlanNode(description="branch", status=StepStatus.pending)
+        branch.set_children([child_a, child_b])
+        plan = Plan(goal="g", steps=[branch])
+
+        assert plan.current_leaf() is None
+        assert plan.unresolved_steps() == [branch]
+        assert plan.is_complete() is False
+
+    def test_all_leaves_and_branch_complete_is_resolved(self):
+        child = PlanNode(description="a", status=StepStatus.completed)
+        branch = PlanNode(description="branch", status=StepStatus.completed)
+        branch.set_children([child])
+        plan = Plan(goal="g", steps=[branch])
+
+        assert plan.unresolved_steps() == []
+        assert plan.is_complete() is True
+
+    def test_flat_plan_unaffected(self):
+        pending = PlanNode(index=1, description="do it", status=StepStatus.pending)
+        plan = Plan(goal="g", steps=[pending])
+        assert plan.unresolved_steps() == [pending]
+
+
 class TestReadyRollupBranches:
     def test_root_is_never_a_rollup_branch(self):
         """The root represents the whole plan, already gated by

@@ -314,11 +314,27 @@ def build_agent_prompt(
     tool_text = format_tool_definitions(tool_defs)
 
     step = plan.current_leaf()
-    current_step_text = (
-        f"Step {step.index}: {step.description}"
-        if step is not None
-        else "(All steps are complete -- call `finish`.)"
-    )
+    if step is not None:
+        current_step_text = f"Step {step.index}: {step.description}"
+    elif plan.is_complete():
+        current_step_text = "(All steps are complete -- call `finish`.)"
+    else:
+        # Every leaf is complete, but current_leaf() only looks at leaves --
+        # some ancestor branch (e.g. a checkpoint) hasn't itself passed
+        # rollup verification yet. Telling the model "all done, call
+        # finish" here (as this used to, unconditionally) is what let a
+        # real run finish after pure exploration: the checkpoint's rollup
+        # verdict was `not_complete`, its continuation into implementation
+        # steps never fired, and the model was still told everything was
+        # done.
+        pending = plan.unresolved_steps()
+        target = pending[0].description if pending else "a prior sub-goal"
+        current_step_text = (
+            "(All individual steps are complete, but the sub-goal "
+            f"'{target}' has not yet passed its own verification -- do not "
+            "call `finish` yet. Keep working on that sub-goal until its "
+            "verification result comes back.)"
+        )
 
     return AGENT_SYSTEM_PROMPT.format(
         current_step=current_step_text,

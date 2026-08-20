@@ -910,6 +910,13 @@ def run_case(
     agent_timeout: int,
     source_repo: Path | None = None,
 ) -> BenchmarkResult:
+    # Must be absolute before use: `_create_worktree` runs `git worktree add`
+    # with cwd=source_repo, so a relative `workspace` would be resolved
+    # against the *source repo's* directory instead of this process's cwd,
+    # landing the actual worktree somewhere entirely different from the path
+    # `--workspace` below (which resolves the same Path against this
+    # process's cwd) tells the agent to operate in.
+    workspace = workspace.resolve()
     if case.workspace_kind == "worktree":
         if case.source_repo:
             repo = Path(case.source_repo).expanduser().resolve()

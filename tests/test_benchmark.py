@@ -329,6 +329,29 @@ class TestWorktreeCase:
         assert not result.passed
         benchmark._prune_worktrees(source_repo)
 
+    def test_relative_workspace_resolves_against_process_cwd_not_source_repo(self, tmp_path, monkeypatch):
+        source_repo = _init_source_repo(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        def fake_run(command, *, cwd, timeout, env=None):
+            assert (cwd / "existing.py").read_text() == "x = 1\n"
+            return _completed(command, stdout='{"success": true, "message": "found nothing"}')
+
+        monkeypatch.setattr(benchmark, "_run_process", fake_run)
+        relative_workspace = Path("nested") / "workspace"
+        result = benchmark.run_case(
+            _review_case(),
+            relative_workspace,
+            model=None,
+            agent_timeout=60,
+            source_repo=source_repo,
+        )
+
+        assert result.passed
+        assert (tmp_path / "nested" / "workspace" / "existing.py").exists()
+        assert not (source_repo / "nested").exists()
+        benchmark._prune_worktrees(source_repo)
+
     def test_worktree_checks_out_the_requested_ref(self, tmp_path, monkeypatch):
         source_repo = _init_source_repo(tmp_path)
         (source_repo / "existing.py").write_text("x = 2\n")

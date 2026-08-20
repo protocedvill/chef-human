@@ -727,6 +727,142 @@ CASES: tuple[BenchmarkCase, ...] = (
         workspace_kind="worktree",
     ),
     BenchmarkCase(
+        case_id="vague_feature_request_small_repo",
+        level="frontier",
+        title="Vague feature request against a small unfamiliar codebase (fast checkpoint smoke test)",
+        # Same shape and intent as vague_feature_request_real_repo below --
+        # a bare, scope-free request against existing code the planner has
+        # never seen, meant to reproduce the explore-only-collapse failure
+        # and exercise the checkpoint mechanism -- but against a tiny seeded
+        # project instead of a full external git worktree checkout, so a
+        # run finishes in a couple of minutes of wall-clock exploration
+        # instead of a large real C/host codebase. Use this to shake out
+        # checkpoint bugs cheaply before spending a full
+        # vague_feature_request_real_repo run.
+        #
+        # First cut of this case named "a browser" directly in the task and
+        # seeded a single flat notes.py -- against qwen3.6:35b-a3b it
+        # planned straight to "Implement a Flask web interface" without
+        # ever considering a checkpoint (confirmed via agent.log: the model's
+        # own reasoning explicitly said "I don't need a checkpoint here. I
+        # know what to do"). That's a real, valid outcome (checkpoints are
+        # for genuine uncertainty, not mandatory), but it means that version
+        # exercised no checkpoint code at all. This version widens the
+        # ambiguity on both axes real vague tasks actually have: the task
+        # names no implementation shape (web app? REST API? shared server?
+        # sync tool?), and the seed is now four small interdependent modules
+        # (storage backend, core notes, tag filtering, CLI) that must be
+        # read together to know what "notes" even means structurally before
+        # picking an approach -- closer to the real case's need to explore
+        # multiple files before implementing.
+        task=(
+            "Let's make this something the whole team can actually use "
+            "together, not just from the command line."
+        ),
+        seed_files={
+            "storage.py": (
+                '"""Pluggable storage backends for notes."""\n'
+                "import json\n"
+                "from pathlib import Path\n\n\n"
+                "class JSONFileStore:\n"
+                '    def __init__(self, path="notes.json"):\n'
+                "        self.path = Path(path)\n\n"
+                "    def load(self):\n"
+                "        if self.path.exists():\n"
+                "            return json.loads(self.path.read_text())\n"
+                "        return []\n\n"
+                "    def save(self, notes):\n"
+                "        self.path.write_text(json.dumps(notes, indent=2))\n"
+            ),
+            "notes.py": (
+                '"""Core note operations, backed by a pluggable storage backend."""\n'
+                "from storage import JSONFileStore\n\n"
+                "_store = JSONFileStore()\n\n\n"
+                "def add_note(text, tags=None):\n"
+                "    notes = _store.load()\n"
+                '    notes.append({"text": text, "tags": tags or []})\n'
+                "    _store.save(notes)\n\n\n"
+                "def list_notes():\n"
+                "    return _store.load()\n\n\n"
+                "def remove_note(index):\n"
+                "    notes = _store.load()\n"
+                "    del notes[index]\n"
+                "    _store.save(notes)\n"
+            ),
+            "tags.py": (
+                '"""Helpers for filtering notes by tag."""\n'
+                "from notes import list_notes\n\n\n"
+                "def notes_with_tag(tag):\n"
+                '    return [n for n in list_notes() if tag in n.get("tags", [])]\n'
+            ),
+            "cli.py": (
+                '"""Command-line entry point for the notes tool."""\n'
+                "import sys\n\n"
+                "from notes import add_note, list_notes, remove_note\n"
+                "from tags import notes_with_tag\n\n\n"
+                "def main():\n"
+                "    if len(sys.argv) < 2:\n"
+                '        print("Usage: cli.py [add TEXT | list | remove INDEX | tag TAG]")\n'
+                "        return\n"
+                "    command = sys.argv[1]\n"
+                '    if command == "add":\n'
+                '        add_note(" ".join(sys.argv[2:]))\n'
+                '    elif command == "list":\n'
+                "        for i, note in enumerate(list_notes()):\n"
+                '            print(f"{i}: {note[\'text\']} {note.get(\'tags\', [])}")\n'
+                '    elif command == "remove":\n'
+                "        remove_note(int(sys.argv[2]))\n"
+                '    elif command == "tag":\n'
+                "        for note in notes_with_tag(sys.argv[2]):\n"
+                '            print(note["text"])\n'
+                "    else:\n"
+                '        print(f"Unknown command: {command}")\n\n\n'
+                'if __name__ == "__main__":\n'
+                "    main()\n"
+            ),
+            "README.md": (
+                "# notes\n\n"
+                "A small command-line note-taking tool with tag support.\n\n"
+                "Usage:\n\n"
+                '    python cli.py add "buy milk"\n'
+                "    python cli.py list\n"
+                "    python cli.py remove 0\n"
+                "    python cli.py tag groceries\n\n"
+                "Notes are stored via a pluggable storage backend (see storage.py); "
+                "the default backend keeps everything in notes.json in the current "
+                "directory.\n"
+            ),
+        },
+        verification=Verification(
+            # Mirrors vague_feature_request_real_repo's "did the agent do
+            # anything beyond exploring" check, but this workspace is a
+            # plain seed dir (workspace_kind="seed"), not a git worktree --
+            # no `git status` available. Instead, name every known seed
+            # file explicitly and check for any other real file outside
+            # .chef-human/ (this harness's own log/session directory) --
+            # notes.json and __pycache__ are also excluded even though
+            # neither is a seed file: they're both side effects of merely
+            # running the seeded code to understand it (a completely
+            # legitimate way to explore -- `python cli.py list` writes
+            # notes.json and leaves .pyc files behind), and a pure-
+            # exploration run must not look like it did real implementation
+            # work just because it ran the existing program.
+            command=(
+                "sh",
+                "-c",
+                "find . -mindepth 1 "
+                "\\( -path './.chef-human' -o -path './.chef-human/*' "
+                "-o -path './__pycache__' -o -path './__pycache__/*' \\) -prune -o "
+                "-type f -not -name 'storage.py' -not -name 'notes.py' "
+                "-not -name 'tags.py' -not -name 'cli.py' -not -name 'README.md' "
+                "-not -name 'notes.json' "
+                "-print | grep -q .",
+            ),
+            timeout_seconds=15,
+        ),
+        max_steps=25,
+    ),
+    BenchmarkCase(
         case_id="vague_feature_request_real_repo",
         level="frontier",
         title="Vague feature request against an unfamiliar real codebase",

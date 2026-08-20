@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,7 +26,9 @@ from chef_human.llm.backend import (
     Role,
     ToolDefinition,
 )
+from chef_human.tools.filesystem import ReadTool, WriteTool
 from chef_human.tools.registry import ToolRegistry
+from chef_human.tools.user import FinishTool
 from chef_human.ui.protocol import NoopUI, PlanReviewAction
 
 
@@ -2573,6 +2576,130 @@ class TestCheckpointOrchestration:
         evidence_arg = call.args[2]
         assert read_path in evidence_arg
         assert "Read app.py" in evidence_arg
+
+
+class TestCheckpointFullLifecycleIntegration:
+    """Every other checkpoint test above mocks the Planner (or the whole
+    ReActLoop) and drives one seam at a time -- necessary for isolating
+    each piece, but none of them proves the *real* Planner, wired into a
+    *real* ReActLoop with real tools acting on a real filesystem, actually
+    carries a checkpoint through its full lifecycle: declared at generation
+    time, lazily expanded, its leaf executed and verified, its rollup
+    verified, a continuation spliced in, and that spliced step executed to
+    a real `finish`. This forces that exact scenario deterministically via
+    a scripted LLM backend (never relying on a live model happening to
+    choose "type": "checkpoint") -- a single scripted `mock_llm.complete`
+    routes each call to a canned response based on what kind of call it
+    structurally is (main-loop reasoning call vs. one of the Planner's
+    distinct call shapes), the same technique TestVerifierSeesFileContents
+    below uses for a single verifier call, just covering every call shape
+    a checkpoint's lifecycle touches."""
+
+    @staticmethod
+    def _msg(content: str) -> CompletionResponse:
+        return CompletionResponse(message=Message(role=Role.assistant, content=content))
+
+    def _make_router(self):
+        # Each queue holds responses for one structurally distinct kind of
+        # LLM call, in the order that kind of call actually happens across
+        # the run -- see the method's own trace of the scenario below.
+        expand_node_responses = iter([
+            # 1) generate_plan's root call: the whole task collapses to one
+            #    checkpoint -- nothing about implementation is decided yet.
+            self._msg(json.dumps([
+                {
+                    "description": "Explore the notes tool codebase first",
+                    "type": "checkpoint",
+                }
+            ])),
+            # 2) expand_checkpoint's lazy decomposition, first execution
+            #    reaches the checkpoint: a single concrete exploration leaf.
+            self._msg(json.dumps(["Read README.md"])),
+        ])
+        atomicity_response = self._msg("VERDICT: ATOMIC\nREASON: single concrete action")
+        step_verify_response = self._msg(
+            "VERDICT: COMPLETE\nREASON: README.md was read this turn"
+        )
+        rollup_verify_response = self._msg(
+            "VERDICT: COMPLETE\nREASON: exploration sub-goal achieved"
+        )
+        # 3) continue_from_checkpoint, fired once the checkpoint's rollup
+        #    passes: a real implementation step, grounded in what the
+        #    checkpoint's own child read.
+        continuation_response = self._msg(
+            json.dumps(["Create web.py with a simple HTTP server for the notes tool"])
+        )
+        main_loop_responses = iter([
+            # Turn 1: work the checkpoint's own spliced-in exploration leaf.
+            '<tool_call>{"name": "read", "arguments": {"path": "README.md"}}</tool_call>',
+            # Turn 2: work the continuation's spliced-in implementation leaf.
+            '<tool_call>{"name": "write", "arguments": '
+            '{"path": "web.py", "content": "print(\\"serving notes\\")\\n"}}</tool_call>',
+            # Turn 3: plan is fully complete -- finish.
+            '<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>',
+        ])
+
+        async def router(request):
+            if request.tools:
+                return self._msg(next(main_loop_responses))
+            all_content = "\n".join(m.content for m in request.messages)
+            if "checking whether a single planned step is small enough" in all_content:
+                return atomicity_response
+            if "checkpoint sub-goal has just been completed and verified" in all_content:
+                return continuation_response
+            if "Branch (sub-goal) to verify:" in all_content:
+                return rollup_verify_response
+            if "Step to verify:" in all_content:
+                return step_verify_response
+            return next(expand_node_responses)
+
+        return router
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_carried_through_full_lifecycle_to_finish(self, tmp_path):
+        (tmp_path / "README.md").write_text(
+            "# notes\n\nA tiny command-line note-taking tool.\n"
+        )
+        workspace = WorkspaceManager(root=str(tmp_path))
+        registry = ToolRegistry()
+        registry.register(ReadTool(workspace))
+        registry.register(WriteTool(workspace))
+        registry.register(FinishTool())
+
+        backend = MagicMock(spec=LLMBackend)
+        backend.complete = AsyncMock(side_effect=self._make_router())
+        backend.model_name = "mock-model"
+        backend.context_length = 4096
+
+        planner = Planner(backend)
+        context = _make_mock_context()
+        context.workspace = workspace
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=10),
+        )
+
+        result = await loop.run("Let's improve this notes tool")
+
+        assert result.success is True
+        # The checkpoint node itself survived to the end of the run, marked
+        # complete -- not removed or replaced by its own continuation.
+        checkpoint = next(s for s in result.plan.steps if s.is_checkpoint)
+        assert checkpoint.status == StepStatus.completed
+        assert [c.description for c in checkpoint.children] == ["Read README.md"]
+        # The continuation's step was spliced in as checkpoint's sibling,
+        # not nested underneath it, and made it to completion too.
+        continuation_step = next(s for s in result.plan.steps if s is not checkpoint)
+        assert continuation_step.description == (
+            "Create web.py with a simple HTTP server for the notes tool"
+        )
+        assert continuation_step.status == StepStatus.completed
+        assert (tmp_path / "web.py").exists()
+        assert "serving notes" in (tmp_path / "web.py").read_text()
 
 
 class TestVerifierSeesFileContents:

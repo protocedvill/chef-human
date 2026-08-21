@@ -570,3 +570,45 @@ class TestPlannerCase:
         payload = json.loads(trace_path.read_text())
         assert payload["plan"] is None
         assert payload["llm_calls"][0]["response"]["thinking"] == "partial reasoning"
+        assert payload["tree_snapshots"] == []
+
+    def test_checkpoint_replay_timeout_writes_seed_tree_snapshot(self, tmp_path, monkeypatch):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / ".chef-human").mkdir()
+
+        class FakePlanner:
+            def __init__(self):
+                self._complete = None
+
+            async def continue_from_checkpoint(self, plan, checkpoint, evidence):
+                raise TimeoutError("checkpoint continuation timed out")
+
+            async def expand_spliced_steps(self, plan, steps):
+                raise AssertionError("expand_spliced_steps should not run")
+
+        class FakeLoop:
+            def __init__(self):
+                self._planner = FakePlanner()
+                self._total_prompt_tokens = 0
+                self._total_completion_tokens = 0
+
+        monkeypatch.setattr(
+            "chef_human.agent.create_agent",
+            lambda max_steps, workspace_root, settings: (FakeLoop(), None),
+        )
+
+        case = next(c for c in CASES if c.case_id == "vague_feature_request_checkpoint_replay")
+
+        with pytest.raises(TimeoutError):
+            benchmark._run_planner_case(
+                case,
+                workspace,
+                model=None,
+                timeout_seconds=1,
+            )
+
+        payload = json.loads((workspace / ".chef-human" / "planner-trace.json").read_text())
+        assert payload["plan"]["steps"][5]["type"] == "checkpoint"
+        assert payload["tree_snapshots"][0]["phase"] == "seeded_checkpoint_state"
+        assert payload["tree_snapshots"][0]["plan"]["steps"][5]["type"] == "checkpoint"

@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "passed": 5,
+  "total": 5,
+  "score_percent": 100.0,
+  "results": [
+    {
+      "case_id": "hello_world",
+      "level": "smoke",
+      "title": "Create and run one file",
+      "passed": true,
+      "agent_success": true,
+      "verifier_success": true,
+      "integrity_success": true,
+      "agent_exit_code": 0,
+      "duration_seconds": 53.22,
+      "steps_taken": 2,
+      "prompt_tokens": 22881,
+      "completion_tokens": 1161,
+      "changed_files": [
+        "hello.py"
+      ],
+      "verifier_output": "Hello, world!",
+      "agent_message": "Task complete: Created hello.py with `print('Hello, world!')` and verified it prints exactly \"Hello, world!\" followed by a newline when run with Python.",
+      "error": null,
+      "workspace": "/home/louis/chef-human/benchmark-runs/20260820-172453/hello_world"
+    },
+    {
+      "case_id": "slugify_contract",
+      "level": "core",
+      "title": "Implement a tested contract",
+      "passed": true,
+      "agent_success": true,
+      "verifier_success": true,
+      "integrity_success": true,
+      "agent_exit_code": 0,
+      "duration_seconds": 130.64,
+      "steps_taken": 4,
+      "prompt_tokens": 43080,
+      "completion_tokens": 2835,
+      "changed_files": [
+        "slugify.py"
+      ],
+      "verifier_output": "test_collapses_separators (test_slugify.SlugifyTests.test_collapses_separators) ... ok\ntest_keeps_digits (test_slugify.SlugifyTests.test_keeps_digits) ... ok\ntest_rejects_empty_result (test_slugify.SlugifyTests.test_rejects_empty_result) ... ok\ntest_words_and_punctuation (test_slugify.SlugifyTests.test_words_and_punctuation) ... ok\n\n----------------------------------------------------------------------\nRan 4 tests in 0.000s\n\nOK",
+      "agent_message": "Task complete: Implemented `slugify()` in `slugify.py` per the spec. The function trims whitespace, lowercases the input, replaces runs of non-alphanumeric characters with a single hyphen, strips leading/trailing hyphens, and raises ValueError for empty results. All 4 tests pass.",
+      "error": null,
+      "workspace": "/home/louis/chef-human/benchmark-runs/20260820-172453/slugify_contract"
+    },
+    {
+      "case_id": "inventory_refactor",
+      "level": "stretch",
+      "title": "Repair and extend a multi-file program",
+      "passed": true,
+      "agent_success": true,
+      "verifier_success": true,
+      "integrity_success": true,
+      "agent_exit_code": 0,
+      "duration_seconds": 631.265,
+      "steps_taken": 21,
+      "prompt_tokens": 296766,
+      "completion_tokens": 26829,
+      "changed_files": [
+        "inventory.py",
+        "report.py"
+      ],
+      "verifier_output": "test_add_accumulates (test_inventory.InventoryTests.test_add_accumulates) ... ok\ntest_empty_report (test_inventory.InventoryTests.test_empty_report) ... ok\ntest_remove_and_delete_zero (test_inventory.InventoryTests.test_remove_and_delete_zero) ... ok\ntest_report_is_sorted (test_inventory.InventoryTests.test_report_is_sorted) ... ok\ntest_validation (test_inventory.InventoryTests.test_validation) ... ok\n\n----------------------------------------------------------------------\nRan 5 tests in 0.000s\n\nOK",
+      "agent_message": "Task complete: Completed all requirements from SPEC.md:\n\n- Fixed inventory.py: add() accumulates quantities with validation (rejects non-positive-integers including booleans), remove() validates quantity, raises KeyError for missing/insufficient stock, deletes zero-stock items.\n- Created report.py: inventory_report() returns sorted \"name: qty\" lines or \"(empty)\".\n- Full test suite confirmed: 5/5 tests pass.",
+      "error": null,
+      "workspace": "/home/louis/chef-human/benchmark-runs/20260820-172453/inventory_refactor"
+    },
+    {
+      "case_id": "lru_cache_repair",
+      "level": "expert",
+      "title": "Diagnose and fix a subtle ordering bug",
+      "passed": true,
+      "agent_success": true,
+      "verifier_success": true,
+      "integrity_success": true,
+      "agent_exit_code": 0,
+      "duration_seconds": 64.505,
+      "steps_taken": 7,
+      "prompt_tokens": 81193,
+      "completion_tokens": 5032,
+      "changed_files": [
+        "lru_cache.py"
+      ],
+      "verifier_output": "test_eviction_order_respects_gets (test_lru_cache.LRUCacheTests.test_eviction_order_respects_gets) ... ok\ntest_get_missing_raises (test_lru_cache.LRUCacheTests.test_get_missing_raises) ... ok\ntest_len_never_exceeds_capacity (test_lru_cache.LRUCacheTests.test_len_never_exceeds_capacity) ... ok\ntest_put_and_get (test_lru_cache.LRUCacheTests.test_put_and_get) ... ok\ntest_put_updates_existing_key_order (test_lru_cache.LRUCacheTests.test_put_updates_existing_key_order) ... ok\ntest_rejects_nonpositive_capacity (test_lru_cache.LRUCacheTests.test_rejects_nonpositive_capacity) ... ok\n\n----------------------------------------------------------------------\nRan 6 tests in 0.000s\n\nOK",
+      "agent_message": "Task complete: Fixed two bugs in lru_cache.py that caused `test_put_updates_existing_key_order` to fail:\n\n1. **`get()` didn't update recency** \u2014 Added pop-and-reinsert logic so accessing a key moves it to the most-recently-used position.\n2. **`put()` on an existing key didn't update recency** \u2014 Added a check to pop the key before re-inserting when updating, ensuring it moves to the most-recently-used position.\n\nAll 6 tests now pass.",
+      "error": null,
+      "workspace": "/home/louis/chef-human/benchmark-runs/20260820-172453/lru_cache_repair"
+    },
+    {
+      "case_id": "scroll_grid_navigation_repair",
+      "level": "expert",
+      "title": "Diagnose a directional-navigation bug in a larger module",
+      "passed": true,
+      "agent_success": true,
+      "verifier_success": true,
+      "integrity_success": true,
+      "agent_exit_code": 0,
+      "duration_seconds": 53.408,
+      "steps_taken": 5,
+      "prompt_tokens": 88376,
+      "completion_tokens": 3064,
+      "changed_files": [
+        "scroll_grid.py"
+      ],
+      "verifier_output": "test_column_switch_clamps_remembered_row_to_shorter_column (test_scroll_grid.BasicFocusTests.test_column_switch_clamps_remembered_row_to_shorter_column) ... ok\ntest_column_switch_remembers_row (test_scroll_grid.BasicFocusTests.test_column_switch_remembers_row) ... ok\ntest_empty_grid_has_no_focus (test_scroll_grid.BasicFocusTests.test_empty_grid_has_no_focus) ... ok\ntest_first_window_added_becomes_focused (test_scroll_grid.BasicFocusTests.test_first_window_added_becomes_focused) ... ok\ntest_focus_down_at_bottom_of_column_fails (test_scroll_grid.BasicFocusTests.test_focus_down_at_bottom_of_column_fails) ... ok\ntest_focus_down_within_column (test_scroll_grid.BasicFocusTests.test_focus_down_within_column) ... ok\ntest_focus_left_and_right (test_scroll_grid.BasicFocusTests.test_focus_left_and_right) ... ok\ntest_focus_left_at_leftmost_column_fails (test_scroll_grid.BasicFocusTests.test_focus_left_at_leftmost_column_fails) ... ok\ntest_focus_up_at_top_of_column_fails (test_scroll_grid.BasicFocusTests.test_focus_up_at_top_of_column_fails) ... ok\ntest_focus_up_within_column (test_scroll_grid.BasicFocusTests.test_focus_up_within_column) ... ok\ntest_fails_at_bottom_of_leftmost_column (test_scroll_grid.DownOrColumnLeftTests.test_fails_at_bottom_of_leftmost_column) ... ok\ntest_falls_through_to_column_left_at_bottom_of_column (test_scroll_grid.DownOrColumnLeftTests.test_falls_through_to_column_left_at_bottom_of_column) ... ok\ntest_moves_down_within_column_when_possible (test_scroll_grid.DownOrColumnLeftTests.test_moves_down_within_column_when_possible) ... ok\ntest_remove_active_window_clamps_row (test_scroll_grid.RemoveWindowTests.test_remove_active_window_clamps_row) ... ok\ntest_remove_all_windows_clears_focus (test_scroll_grid.RemoveWindowTests.test_remove_all_windows_clears_focus) ... ok\ntest_remove_column_after_active_column_keeps_active_index (test_scroll_grid.RemoveWindowTests.test_remove_column_after_active_column_keeps_active_index) ... ok\ntest_remove_last_window_in_column_deletes_column (test_scroll_grid.RemoveWindowTests.test_remove_last_window_in_column_deletes_column) ... ok\ntest_remove_non_active_window_keeps_focus (test_scroll_grid.RemoveWindowTests.test_remove_non_active_window_keeps_focus) ... ok\ntest_fails_at_top_of_rightmost_column (test_scroll_grid.UpOrColumnRightTests.test_fails_at_top_of_rightmost_column) ... ok\ntest_falls_through_to_column_right_at_top_of_column (test_scroll_grid.UpOrColumnRightTests.test_falls_through_to_column_right_at_top_of_column) ... ok\ntest_falls_through_to_column_right_not_left (test_scroll_grid.UpOrColumnRightTests.test_falls_through_to_column_right_not_left) ... ok\ntest_moves_up_within_column_when_possible (test_scroll_grid.UpOrColumnRightTests.test_moves_up_within_column_when_possible) ... ok\n\n----------------------------------------------------------------------\nRan 22 tests in 0.001s\n\nOK",
+      "agent_message": "Task complete: Fixed `focus_up_or_column_right()` in scroll_grid.py: changed the fallback from `self.focus_left()` to `self.focus_right()`. This made the method symmetric with its sibling `focus_down_or_column_left()` (which correctly falls through to `focus_left()`). All 22 tests now pass.",
+      "error": null,
+      "workspace": "/home/louis/chef-human/benchmark-runs/20260820-172453/scroll_grid_navigation_repair"
+    }
+  ]
+}

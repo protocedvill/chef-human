@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "passed": 0,
+  "total": 1,
+  "score_percent": 0.0,
+  "results": [
+    {
+      "case_id": "vague_feature_request_small_repo",
+      "level": "frontier",
+      "title": "Vague feature request against a small unfamiliar codebase (fast checkpoint smoke test)",
+      "passed": false,
+      "agent_success": false,
+      "verifier_success": true,
+      "integrity_success": true,
+      "agent_exit_code": 1,
+      "duration_seconds": 892.281,
+      "steps_taken": null,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "changed_files": [
+        "notes.db",
+        "notes.py",
+        "requirements.txt",
+        "sqlite_store.py",
+        "storage.py",
+        "web.py"
+      ],
+      "verifier_output": "",
+      "agent_message": null,
+      "error": "Agent did not emit a JSON result; Agent exited with 1: Aborted!",
+      "workspace": "/home/louis/chef-human/benchmark-runs/20260820-172315/vague_feature_request_small_repo"
+    }
+  ]
+}

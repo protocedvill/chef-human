@@ -1216,8 +1216,33 @@ def _run_planner_case(
     trace_path = (workspace / ".chef-human" / "planner-trace.json").resolve()
     llm_calls: list[dict[str, Any]] = []
     original_complete = planner._complete
+    original_tree_update = getattr(planner, "on_tree_update", None)
     result_plan: Plan | None = None
     message: str | None = None
+    tree_snapshots: list[dict[str, Any]] = []
+
+    def write_trace(*, current_plan: Plan | None, current_message: str | None) -> None:
+        trace_payload = {
+            "task": case.task,
+            "planner_operation": case.planner_operation,
+            "planner_state": case.planner_state,
+            "plan": current_plan.to_dict() if current_plan is not None else None,
+            "llm_calls": llm_calls,
+            "message": current_message,
+            "tree_snapshots": tree_snapshots,
+        }
+        trace_path.write_text(json.dumps(trace_payload, indent=2) + "\n", encoding="utf-8")
+
+    def record_tree_snapshot(phase: str) -> None:
+        if result_plan is None:
+            return
+        tree_snapshots.append(
+            {
+                "phase": phase,
+                "plan": result_plan.to_dict(),
+            }
+        )
+        write_trace(current_plan=result_plan, current_message=message)
 
     async def traced_complete(request, activity="planning"):
         response = await original_complete(request, activity)
@@ -1238,52 +1263,79 @@ def _run_planner_case(
         )
         return response
 
-    planner._complete = traced_complete
-    try:
+    async def run_planner_flow() -> None:
+        nonlocal result_plan, message
         if case.planner_operation == "continue_from_checkpoint":
             state = case.planner_state or {}
             root_steps = [_plan_node_from_data(step) for step in state.get("steps", [])]
             plan = Plan(goal=case.task, steps=root_steps)
+            result_plan = plan
+            tree_snapshots.append(
+                {
+                    "phase": "seeded_checkpoint_state",
+                    "plan": plan.to_dict(),
+                }
+            )
+            write_trace(current_plan=plan, current_message="Seeded replay state")
             checkpoint = plan.steps[int(state["checkpoint_index"])]
-            continued_steps = asyncio.run(
-                asyncio.wait_for(
-                    planner.continue_from_checkpoint(
-                        plan,
-                        checkpoint,
-                        evidence=str(state.get("evidence", "")),
-                    ),
-                    timeout=timeout_seconds,
-                )
+            continued_steps = await asyncio.wait_for(
+                planner.continue_from_checkpoint(
+                    plan,
+                    checkpoint,
+                    evidence=str(state.get("evidence", "")),
+                ),
+                timeout=timeout_seconds,
             )
             plan.root.set_children(plan.steps + continued_steps)
-            asyncio.run(
-                asyncio.wait_for(
-                    planner.expand_spliced_steps(plan, continued_steps),
-                    timeout=timeout_seconds,
-                )
+            result_plan = plan
+            tree_snapshots.append(
+                {
+                    "phase": "checkpoint_continuation_spliced",
+                    "plan": plan.to_dict(),
+                }
+            )
+            write_trace(
+                current_plan=plan,
+                current_message=(
+                    "Checkpoint continuation returned "
+                    f"{len(continued_steps)} step(s) before recursive expansion"
+                ),
+            )
+            await asyncio.wait_for(
+                planner.expand_spliced_steps(plan, continued_steps),
+                timeout=timeout_seconds,
             )
             result_plan = plan
             message = (
                 "Planner replayed checkpoint continuation and produced "
                 f"{len(continued_steps)} continuation step(s)"
             )
-        else:
-            plan = asyncio.run(
-                asyncio.wait_for(loop._plan_task(case.task), timeout=timeout_seconds)
+            tree_snapshots.append(
+                {
+                    "phase": "checkpoint_continuation_expanded",
+                    "plan": result_plan.to_dict(),
+                }
             )
-            result_plan = plan
-            message = f"Planner produced {len(plan.steps)} top-level step(s)"
+            return
+
+        plan = await asyncio.wait_for(loop._plan_task(case.task), timeout=timeout_seconds)
+        result_plan = plan
+        message = f"Planner produced {len(plan.steps)} top-level step(s)"
+        tree_snapshots.append(
+            {
+                "phase": "generate_plan_complete",
+                "plan": result_plan.to_dict(),
+            }
+        )
+
+    planner._complete = traced_complete
+    planner.on_tree_update = record_tree_snapshot
+    try:
+        asyncio.run(run_planner_flow())
     finally:
         planner._complete = original_complete
-        trace_payload = {
-            "task": case.task,
-            "planner_operation": case.planner_operation,
-            "planner_state": case.planner_state,
-            "plan": result_plan.to_dict() if result_plan is not None else None,
-            "llm_calls": llm_calls,
-            "message": message,
-        }
-        trace_path.write_text(json.dumps(trace_payload, indent=2) + "\n", encoding="utf-8")
+        planner.on_tree_update = original_tree_update
+        write_trace(current_plan=result_plan, current_message=message)
     return {
         "success": True,
         "steps_taken": len(result_plan.steps),

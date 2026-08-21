@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "passed": 0,
+  "total": 1,
+  "score_percent": 0.0,
+  "results": [
+    {
+      "case_id": "vague_feature_request_real_repo",
+      "level": "frontier",
+      "title": "Vague feature request against an unfamiliar real codebase",
+      "passed": false,
+      "agent_success": true,
+      "verifier_success": false,
+      "integrity_success": true,
+      "agent_exit_code": 0,
+      "duration_seconds": 180.229,
+      "steps_taken": 14,
+      "prompt_tokens": 357220,
+      "completion_tokens": 9236,
+      "changed_files": [],
+      "verifier_output": "",
+      "agent_message": "Task complete: Completed exploration of the host/ directory:\n\n**CLI Tools Found** (in host/ubertooth-tools/src/):\n- `ubertooth-afh` \u2014 Passive AFH channel map detection\n- `ubertooth-btle` \u2014 BLE tool\n- `ubertooth-debug` \u2014 CC2400 register read/debug utility\n- `ubertooth-dfu` \u2014 Firmware update via DFU (with CRC32 signature verification, upload/download/reset)\n- `ubertooth-ducky` \u2014 Rubber Ducky key injection\n- `ubertooth-dump` \u2014 Continuous bitstream dump (GnuRadio-style output)\n- `ubertooth-ego` \u2014 EGO tool\n- `ubertooth-follow` \u2014 Piconet follower\n- `ubertooth-rx` \u2014 Receive packets\n- `ubertooth-scan` \u2014 Bluetooth device scan\n- `ubertooth-specan` \u2014 Spectrum analyzer\n- `ubertooth-tx` \u2014 Transmit test\n- `ubertooth-util` \u2014 General utility (LEDs, PA level, channel, squelch, range test, board ID, serial number, etc.)\n\n**Device Communication:**\n- All tools use **libusb** for USB communication\n- Device lifecycle managed via `ubertooth_start()` / `ubertooth_stop()` returning a `ubertooth_t*` struct (containing `devh` \u2014 the libusb_device_handle)\n- Commands sent via `cmd_*` functions (e.g., `cmd_read_register`, `cmd_set_channel`, `cmd_reset`, `cmd_flash`, `cmd_led_specan`)\n- DFU mode uses direct libusb control transfers (`libusb_control_transfer`) with REQ_GETSTATE, REQ_DNLOAD, REQ_UPLOAD, etc.\n- All tools accept `-U <0-7>` to select which Ubertooth device to use",
+      "error": "External verifier failed",
+      "workspace": "/home/louis/chef-human/benchmark-runs/20260820-232549/vague_feature_request_real_repo"
+    }
+  ]
+}

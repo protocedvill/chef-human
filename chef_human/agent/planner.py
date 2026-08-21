@@ -402,6 +402,9 @@ class Planner:
         # main-loop's own on_reasoning_start/on_reasoning pair.
         self.on_llm_start: Callable[[str], None] | None = None
         self.on_llm_end: Callable[[], None] | None = None
+        # Optional observer used by benchmark/debug harnesses that want to
+        # persist the in-progress plan tree as decomposition proceeds.
+        self.on_tree_update: Callable[[str], None] | None = None
 
     async def _complete(
         self, request: CompletionRequest, activity: str = "planning"
@@ -482,6 +485,8 @@ class Planner:
         # atomicity check needs real .parent/.children links to see nearby
         # tree structure, which only exist once set_children() has run.
         node.set_children(children)
+        if self.on_tree_update is not None:
+            self.on_tree_update("children_attached")
         if node.atomicity_reason and len(children) == 1:
             # `node` itself is a branch only because the atomicity check
             # reclassified it (not because the generation call explicitly
@@ -501,6 +506,8 @@ class Planner:
             children[0].requested_branch = False
         else:
             await self._classify_children(task, children)
+        if self.on_tree_update is not None:
+            self.on_tree_update("children_classified")
         convergence.record(depth=depth + 1, new_nodes=len(children))
 
         child_ancestors = ancestors if is_root else ancestors + [node.description]

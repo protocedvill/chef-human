@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "passed": 0,
+  "total": 1,
+  "score_percent": 0.0,
+  "results": [
+    {
+      "case_id": "vague_feature_request_real_repo",
+      "level": "frontier",
+      "title": "Vague feature request against an unfamiliar real codebase",
+      "passed": false,
+      "agent_success": false,
+      "verifier_success": false,
+      "integrity_success": true,
+      "agent_exit_code": null,
+      "duration_seconds": 600.153,
+      "steps_taken": null,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "changed_files": [],
+      "verifier_output": "",
+      "agent_message": null,
+      "error": "Agent exceeded the 600s case timeout; External verifier failed",
+      "workspace": "/home/louis/chef-human/benchmark-runs/20260821-000632/vague_feature_request_real_repo"
+    }
+  ]
+}

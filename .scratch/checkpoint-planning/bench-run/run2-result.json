@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "passed": 0,
+  "total": 1,
+  "score_percent": 0.0,
+  "results": [
+    {
+      "case_id": "vague_feature_request_real_repo",
+      "level": "frontier",
+      "title": "Vague feature request against an unfamiliar real codebase",
+      "passed": false,
+      "agent_success": false,
+      "verifier_success": true,
+      "integrity_success": true,
+      "agent_exit_code": 1,
+      "duration_seconds": 542.553,
+      "steps_taken": 40,
+      "prompt_tokens": 1126665,
+      "completion_tokens": 32399,
+      "changed_files": [
+        "docs/source/software.rst",
+        "host/web/requirements.txt"
+      ],
+      "verifier_output": "",
+      "agent_message": "Max steps exceeded. The task may be incomplete.",
+      "error": "Agent exited with 1",
+      "workspace": "/home/louis/chef-human/benchmark-runs/20260820-225614/vague_feature_request_real_repo"
+    }
+  ]
+}

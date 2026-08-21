@@ -102,8 +102,11 @@ _FILE_TARGET_RE = re.compile(
 # exist on disk, is it non-empty) -- no LLM judgment needed. Steps that
 # merely mention a filename without one of these (e.g. "Test that
 # hello_world.py runs correctly") still need real judgment, so they're
-# deliberately excluded.
-_FILE_CREATION_VERBS = ("create", "write", "make", "add", "generate")
+# deliberately excluded. These are bare imperative stems -- matching is
+# done via `_verb_pattern` below, not bare substring containment, so
+# conjugated forms ("creating", "initializes") are covered without listing
+# each one out by hand.
+_FILE_CREATION_VERBS = ("create", "write", "make", "add", "generate", "initialize")
 _FILE_MUTATION_VERBS = (
     *_FILE_CREATION_VERBS,
     "implement", "edit", "update", "modify", "change", "refactor",
@@ -113,9 +116,54 @@ _EXECUTION_STEP_KEYWORDS = ("run", "test", "verify", "execute", "check")
 _DIRECT_READ_PREFIX_RE = re.compile(r"^\s*read\b", re.IGNORECASE)
 
 
+def _regular_conjugations(verb: str) -> tuple[str, ...]:
+    """The bare stem plus its regular -s/-ing/-ed conjugations, following
+    English's e-drop-before-vowel-suffix spelling rule ("write" ->
+    "writing", not "writeing"; "create" -> "created", not "createed").
+    Irregular verbs ("write"/"wrote", "make"/"made") are deliberately not
+    derived -- not needed for this codebase's actual vocabulary, where
+    plan-step wording overwhelmingly uses gerund ("creating") or bare
+    imperative ("create") forms, never past tense; a stemmer or lookup
+    table would be overkill for a vocabulary this codebase fully controls
+    (see `_FILE_CREATION_VERBS`/`_FILE_MUTATION_VERBS` above)."""
+    forms = {verb, verb + "s"}
+    if verb.endswith("e") and not verb.endswith("ee"):
+        stem = verb[:-1]
+        forms.add(stem + "ing")
+        forms.add(verb + "d")
+    else:
+        forms.add(verb + "ing")
+        forms.add(verb + "ed")
+    return tuple(forms)
+
+
+def _verb_pattern(verbs: tuple[str, ...]) -> re.Pattern[str]:
+    """Word-boundary regex matching any of `verbs` or their regular
+    conjugations. Word-boundary anchoring (`\\b`), not bare substring
+    containment, is the point: a naive `"add" in description.lower()`
+    also matches inside "addition", "additional", etc. -- this doesn't,
+    since matching a *known conjugated form* in full, at a word boundary,
+    can't accidentally land mid-word the way an unanchored substring
+    check can."""
+    all_forms = sorted(
+        {form for verb in verbs for form in _regular_conjugations(verb)},
+        key=len,
+        reverse=True,
+    )
+    return re.compile(
+        r"\b(?:" + "|".join(re.escape(f) for f in all_forms) + r")\b",
+        re.IGNORECASE,
+    )
+
+
+_FILE_CREATION_VERB_RE = _verb_pattern(_FILE_CREATION_VERBS)
+_FILE_MUTATION_VERB_RE = _verb_pattern(_FILE_MUTATION_VERBS)
+
+
 def _mentions_mutation_verb(description: str) -> bool:
-    """Whether `description` contains any word from `_FILE_MUTATION_VERBS`,
-    independent of whether it also names a concrete filename. Distinct from
+    """Whether `description` contains any word (or regular conjugation --
+    see `_verb_pattern`) from `_FILE_MUTATION_VERBS`, independent of
+    whether it also names a concrete filename. Distinct from
     `_looks_like_file_mutation_step`, whose return value is empty (falsy)
     whenever no literal filename is present in the wording even if a
     mutation verb matched -- callers that need "does this step read as
@@ -126,9 +174,15 @@ def _mentions_mutation_verb(description: str) -> bool:
     `_looks_investigative` (it contains "reading" at the very end) and was
     wrongly treated as *not* mutation-shaped, since it names no literal
     file, and got its `write` call blocked by the investigative-step
-    mutation guard below -- observed live in benchmark run 20260821-130618."""
-    lowered = description.lower()
-    return any(v in lowered for v in _FILE_MUTATION_VERBS)
+    mutation guard below -- observed live in benchmark run 20260821-130618.
+    A related, since-fixed gap: bare-substring matching against
+    `_FILE_MUTATION_VERBS` also missed gerund forms entirely ("creating"
+    doesn't contain "create" as a substring) and the vocabulary was
+    missing "initialize" -- observed live in the same benchmark run's
+    "Initialize the Python web scaffold by creating requirements.txt..."
+    step, which matched neither the old substring check nor its
+    conjugations."""
+    return bool(_FILE_MUTATION_VERB_RE.search(description))
 
 
 def _looks_like_file_creation_step(description: str) -> set[str]:
@@ -136,8 +190,7 @@ def _looks_like_file_creation_step(description: str) -> set[str]:
     a file" -- empty set otherwise. A false negative here just means normal
     LLM verification runs (today's behavior), so this is purely additive,
     never a regression."""
-    lowered = description.lower()
-    if not any(v in lowered for v in _FILE_CREATION_VERBS):
+    if not _FILE_CREATION_VERB_RE.search(description):
         return set()
     return {m.group(1) for m in _FILE_TARGET_RE.finditer(description)}
 
@@ -146,8 +199,7 @@ def _looks_like_file_mutation_step(description: str) -> set[str]:
     """Filenames this step names, if the step reads like it should leave a
     durable file artifact behind. Used to prevent reasoning-only turns from
     hallucinating progress on implementation/edit steps."""
-    lowered = description.lower()
-    if not any(v in lowered for v in _FILE_MUTATION_VERBS):
+    if not _FILE_MUTATION_VERB_RE.search(description):
         return set()
     return {m.group(1) for m in _FILE_TARGET_RE.finditer(description)}
 

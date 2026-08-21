@@ -5090,6 +5090,74 @@ class TestInvestigativeStepMutationGuard:
         write_tool.run.assert_awaited_once()
 
 
+class TestMutationVerbMatching:
+    """`_mentions_mutation_verb`/`_looks_like_file_mutation_step`/
+    `_looks_like_file_creation_step` used to do bare `substring in
+    description.lower()` checks against `_FILE_CREATION_VERBS`/
+    `_FILE_MUTATION_VERBS` -- missing conjugated forms and over-matching
+    unrelated words containing a verb stem as a substring. Reproduces a
+    real benchmark run (workspace 20260821-130618): "Initialize the
+    Python web scaffold by creating requirements.txt and a basic server
+    entry point" matched neither the old substring check (no bare
+    "create"/"initialize" appears -- only "creating", and "initialize"
+    wasn't even in the vocabulary) nor its regular conjugations, so the
+    reasoning-only mutation stall guard never fired across 5 consecutive
+    no-tool-call turns on that step."""
+
+    def test_gerund_form_matches(self):
+        from chef_human.agent.react_loop import _mentions_mutation_verb
+        assert _mentions_mutation_verb(
+            "Initialize the Python web scaffold by creating "
+            "requirements.txt and a basic server entry point"
+        ) is True
+
+    def test_bare_imperative_form_still_matches(self):
+        from chef_human.agent.react_loop import _mentions_mutation_verb
+        assert _mentions_mutation_verb("Create a new file named foo.py") is True
+
+    def test_past_tense_and_third_person_forms_match(self):
+        from chef_human.agent.react_loop import _mentions_mutation_verb
+        assert _mentions_mutation_verb("The file was created yesterday") is True
+        assert _mentions_mutation_verb("This step updates the config") is True
+
+    def test_no_mutation_verb_present(self):
+        from chef_human.agent.react_loop import _mentions_mutation_verb
+        assert _mentions_mutation_verb("Read the README and summarize it") is False
+
+    def test_word_boundary_prevents_substring_over_match(self):
+        """"add" is a real mutation verb, but must not match inside
+        "addition"/"additional" -- the old bare-substring check did."""
+        from chef_human.agent.react_loop import _mentions_mutation_verb
+        assert _mentions_mutation_verb(
+            "In addition to the existing config, note the caveat"
+        ) is False
+        assert _mentions_mutation_verb(
+            "Review the additional requirements before proceeding"
+        ) is False
+
+    def test_edit_word_boundary_prevents_editorial_over_match(self):
+        from chef_human.agent.react_loop import _mentions_mutation_verb
+        assert _mentions_mutation_verb(
+            "Read the editorial guidelines before publishing"
+        ) is False
+
+    def test_looks_like_file_mutation_step_extracts_target_with_gerund_verb(self):
+        """Once the verb matches, the existing filename-extraction behavior
+        is unaffected -- this just confirms the gerund fix actually reaches
+        real callers, not only the boolean helper."""
+        from chef_human.agent.react_loop import _looks_like_file_mutation_step
+        assert _looks_like_file_mutation_step(
+            "Initialize the Python web scaffold by creating "
+            "requirements.txt and a basic server entry point"
+        ) == {"requirements.txt"}
+
+    def test_looks_like_file_creation_step_matches_initialize(self):
+        from chef_human.agent.react_loop import _looks_like_file_creation_step
+        assert _looks_like_file_creation_step(
+            "Initialize config.yaml with default settings"
+        ) == {"config.yaml"}
+
+
 class TestLooksInvestigative:
     def test_read_step(self):
         from chef_human.agent.react_loop import _looks_investigative

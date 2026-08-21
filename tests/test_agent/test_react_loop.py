@@ -4993,6 +4993,32 @@ class TestInvestigativeStepMutationGuard:
         write_tool.run.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_write_on_implementation_step_with_no_named_file_is_allowed(self):
+        """Regression: the exemption for mutation-shaped steps must check
+        whether the wording mentions a mutation verb at all
+        (`_mentions_mutation_verb`), not whether `_looks_like_file_mutation_step`
+        returns a non-empty set -- that function's contract is "filenames
+        this step names, if it reads as mutation", so it returns an empty
+        (falsy) set whenever the step never names a literal filename, even
+        when a mutation verb clearly matched. Using it as a plain boolean
+        wrongly blocked a real benchmark step: 'Implement the process
+        spawning mechanism: Create the UbertoothProcessManager class and
+        add methods to initialize and spawn the Ubertooth CLI tool using
+        subprocess.Popen, capturing both stdout and stderr for reading.'
+        -- genuinely an implementation step, no filename named anywhere in
+        it, and it also happens to match `_looks_investigative` purely
+        because it ends in 'reading'."""
+        loop, write_tool, context = self._make_write_call_setup(
+            "Implement the process spawning mechanism: Create the "
+            "UbertoothProcessManager class and add methods to initialize "
+            "and spawn the Ubertooth CLI tool using subprocess.Popen, "
+            "capturing both stdout and stderr for reading."
+        )
+        await loop.run("Add a web interface")
+
+        write_tool.run.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_write_on_non_investigative_step_is_allowed(self):
         loop, write_tool, context = self._make_write_call_setup(
             "Write the Flask application to host/web/app.py"

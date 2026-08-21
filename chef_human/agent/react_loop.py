@@ -113,6 +113,24 @@ _EXECUTION_STEP_KEYWORDS = ("run", "test", "verify", "execute", "check")
 _DIRECT_READ_PREFIX_RE = re.compile(r"^\s*read\b", re.IGNORECASE)
 
 
+def _mentions_mutation_verb(description: str) -> bool:
+    """Whether `description` contains any word from `_FILE_MUTATION_VERBS`,
+    independent of whether it also names a concrete filename. Distinct from
+    `_looks_like_file_mutation_step`, whose return value is empty (falsy)
+    whenever no literal filename is present in the wording even if a
+    mutation verb matched -- callers that need "does this step read as
+    mutation-shaped at all" (not "and also, what files does it name") must
+    use this, not `bool(_looks_like_file_mutation_step(...))`. Using the
+    latter as that proxy was a real bug: "Implement the process spawning
+    mechanism: Create the UbertoothProcessManager class..." matches
+    `_looks_investigative` (it contains "reading" at the very end) and was
+    wrongly treated as *not* mutation-shaped, since it names no literal
+    file, and got its `write` call blocked by the investigative-step
+    mutation guard below -- observed live in benchmark run 20260821-130618."""
+    lowered = description.lower()
+    return any(v in lowered for v in _FILE_MUTATION_VERBS)
+
+
 def _looks_like_file_creation_step(description: str) -> set[str]:
     """Filenames this step names, if the step also reads like "create/write
     a file" -- empty set otherwise. A false negative here just means normal
@@ -1608,7 +1626,7 @@ class ReActLoop:
                             tc.name in ("write", "edit", "patch")
                             and current is not None
                             and _looks_investigative(current.description)
-                            and not _looks_like_file_mutation_step(current.description)
+                            and not _mentions_mutation_verb(current.description)
                         ):
                             # Reproduces a real benchmark run: mid-"explore
                             # the firmware/ directory" (purely investigative,

@@ -3937,6 +3937,163 @@ class TestInvestigativeStepBypassesVerification:
         assert any("still needs real tool evidence" in m for m in tool_msgs)
 
 
+class TestInvestigativeStepEvidenceRelevanceHeuristic:
+    """Reproduces a concern raised about a real benchmark run
+    (vague_feature_request_real_repo, workspace 20260821-135206): an
+    investigative step with no named file ("Identify core data structures
+    and state management in the host code...") auto-completes on *any*
+    successful investigative-tool call, with no check that what was
+    actually read has anything to do with the step. In that run the model
+    happened to read genuinely relevant C source files, but nothing
+    guaranteed that -- an arbitrary read (e.g. of COPYING) would have
+    auto-completed the step identically."""
+
+    @pytest.mark.asyncio
+    async def test_irrelevant_evidence_does_not_auto_complete(self):
+        planner = _make_mock_planner()
+        planner.verify_step = AsyncMock(
+            return_value=(StepVerdict.not_complete, "evidence does not address the step's own subject")
+        )
+        step = PlanNode(
+            index=1,
+            description=(
+                "Identify core data structures and state management in the "
+                "host code to define what endpoints or UI components are "
+                "required."
+            ),
+            status=StepStatus.pending,
+        )
+        plan = Plan(goal="Add a web interface", steps=[step])
+        context = _make_mock_context()
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._verify_and_mark_step(
+            plan,
+            evidence=(
+                "GNU GENERAL PUBLIC LICENSE\nVersion 2, June 1991\n"
+                "Copyright (C) 1989, 1991 Free Software Foundation, Inc."
+            ),
+            has_tool_evidence=True,
+            step_override=step,
+        )
+
+        assert step.status != StepStatus.completed
+        planner.verify_step.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_relevant_evidence_still_auto_completes_without_verifier_call(self):
+        """The heuristic must stay permissive on the common case: real,
+        on-topic evidence still takes the cheap auto-complete path, no LLM
+        verifier call needed -- this is the behavior the original
+        no-named-file bypass existed to preserve."""
+        planner = _make_mock_planner()
+        step = PlanNode(
+            index=1,
+            description=(
+                "Identify core data structures and state management in the "
+                "host code to define what endpoints or UI components are "
+                "required."
+            ),
+            status=StepStatus.pending,
+        )
+        plan = Plan(goal="Add a web interface", steps=[step])
+        context = _make_mock_context()
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._verify_and_mark_step(
+            plan,
+            evidence=(
+                "struct ubertooth_state {\n  int channel;\n  int gain;\n};\n"
+                "Manages device state and packet data structures."
+            ),
+            has_tool_evidence=True,
+            step_override=step,
+        )
+
+        assert step.status == StepStatus.completed
+        planner.verify_step.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_step_with_no_distinctive_words_still_auto_completes(self):
+        """A step too generic to have any distinctive vocabulary at all
+        (after stopword filtering) must not get stuck -- the heuristic is
+        permissive by design; nothing to check against means it passes."""
+        planner = _make_mock_planner()
+        step = PlanNode(
+            index=1,
+            description="Check it now",
+            status=StepStatus.pending,
+        )
+        plan = Plan(goal="Add a web interface", steps=[step])
+        context = _make_mock_context()
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+
+        await loop._verify_and_mark_step(
+            plan,
+            evidence="Anything at all.",
+            has_tool_evidence=True,
+            step_override=step,
+        )
+
+        assert step.status == StepStatus.completed
+        planner.verify_step.assert_not_awaited()
+
+
+class TestDistinctiveStepWordsAndEvidenceRelevance:
+    def test_extracts_content_words_filters_stopwords_and_short_words(self):
+        from chef_human.agent.react_loop import _distinctive_step_words
+        words = _distinctive_step_words(
+            "Identify core data structures and state management in the "
+            "host code to define what endpoints are required."
+        )
+        assert "data" in words
+        assert "structures" in words
+        assert "state" in words
+        assert "management" in words
+        assert "endpoints" in words
+        # stopwords/short words filtered out
+        assert "the" not in words
+        assert "and" not in words
+        assert "in" not in words
+        assert "to" not in words
+
+    def test_evidence_relevant_on_shared_word(self):
+        from chef_human.agent.react_loop import _evidence_looks_relevant
+        assert _evidence_looks_relevant(
+            "Identify core data structures in the host code",
+            "The relevant data structures are defined in host.h",
+        ) is True
+
+    def test_evidence_not_relevant_with_no_shared_words(self):
+        from chef_human.agent.react_loop import _evidence_looks_relevant
+        assert _evidence_looks_relevant(
+            "Identify core data structures and state management",
+            "GNU GENERAL PUBLIC LICENSE Version 2",
+        ) is False
+
+    def test_no_distinctive_words_is_always_relevant(self):
+        from chef_human.agent.react_loop import _evidence_looks_relevant
+        assert _evidence_looks_relevant("Check it now", "Anything at all") is True
+
+
 class TestAskUserVagueQuestionGuard:
     @pytest.mark.asyncio
     async def test_vague_question_blocked_with_active_step(self):

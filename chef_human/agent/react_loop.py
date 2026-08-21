@@ -525,6 +525,66 @@ def _looks_investigative(description: str) -> bool:
     return any(kw in lowered for kw in _INVESTIGATIVE_KEYWORDS)
 
 
+# Common function words filtered out of a step description before checking
+# it for overlap with this turn's tool evidence (see
+# `_evidence_looks_relevant`) -- what's left is the vocabulary actually
+# specific to what the step is about, not connective tissue every
+# description shares. Not exhaustive; a false negative here just means an
+# extra word gets checked for overlap, which is harmless (it simply won't
+# match anything in the evidence).
+_STEP_DESCRIPTION_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "that", "this", "what", "how", "are",
+    "was", "were", "will", "from", "into", "onto", "your", "their",
+    "step", "when", "then", "than", "have", "has", "had", "not", "you",
+    "can", "should", "would", "could", "which", "where", "these", "those",
+    "some", "such", "also", "using", "used", "use",
+    # The investigative keywords themselves (see _looks_investigative)
+    # aren't subject-matter content -- "check"/"read"/"review"/"explore"
+    # tell you a step is investigative, not what it's investigating.
+    # Filtering them out means the relevance check compares against what
+    # the step is actually *about*, and also means a step that's nothing
+    # but a bare investigative verb ("Check it now") correctly has no
+    # distinctive words at all, rather than trivially "matching itself"
+    # against evidence text that happens to also contain "check".
+    "read", "identify", "check", "review", "analyze", "analyse", "analyzing",
+    "examine", "inspect", "explore", "understand", "look", "list", "find",
+    "search", "locate",
+})
+
+
+def _distinctive_step_words(description: str) -> set[str]:
+    """Content words from a step description -- filters out short words
+    and common function words (`_STEP_DESCRIPTION_STOPWORDS`), leaving
+    the vocabulary that's actually specific to what the step is about.
+    Used by `_evidence_looks_relevant` for a lightweight relevance check
+    on investigative steps that name no specific file, where nothing else
+    validates that the turn's tool evidence has anything to do with what
+    the step actually asked about."""
+    words = re.findall(r"[a-zA-Z]+", description.lower())
+    return {w for w in words if len(w) >= 4 and w not in _STEP_DESCRIPTION_STOPWORDS}
+
+
+def _evidence_looks_relevant(description: str, evidence: str) -> bool:
+    """Whether `evidence` (this turn's tool-call output text) shares at
+    least one distinctive word with the step's own description.
+    Deliberately permissive -- a single shared word is enough, and a step
+    with no distinctive words at all (e.g. "Look into this more") always
+    passes -- because the goal is only to catch the egregious case
+    (evidence with *no* apparent connection to what the step asked for,
+    e.g. reading COPYING for a step about "data structures and state
+    management"), not to fully judge relevance. That judgment is what the
+    LLM verifier fallback is for; failing this check routes there
+    (`investigative_needs_verifier = True`) rather than rejecting outright,
+    so a false negative here costs one extra verifier call, not a stuck
+    step -- avoids reintroducing the re-read loop a stricter check would
+    risk (see `_INVESTIGATIVE_KEYWORDS`'s docstring)."""
+    words = _distinctive_step_words(description)
+    if not words:
+        return True
+    lowered_evidence = evidence.lower()
+    return any(w in lowered_evidence for w in words)
+
+
 # Phrases indicating the model itself believes it deliberately introduced a
 # security problem -- self-reported, not detected by scanning code, since
 # that's the failure mode observed: the model wrote a hardcoded-credential
@@ -2739,6 +2799,18 @@ class ReActLoop:
                     )
                 # All named files were read and this turn produced real tool
                 # evidence: validate via the verifier instead of auto-completing.
+                investigative_needs_verifier = True
+            elif has_tool_evidence and not _evidence_looks_relevant(step.description, evidence):
+                # Real investigative-tool evidence exists, but it shares
+                # nothing with what this step's own wording is actually
+                # about (e.g. a `read` on COPYING for a step asking to
+                # "Identify core data structures and state management") --
+                # don't auto-complete on faith. Route through the same
+                # verifier fallback the named-files branch above already
+                # uses instead of the fast path below, rather than
+                # rejecting outright: a false negative here (a genuinely
+                # relevant read whose wording just doesn't overlap) costs
+                # one extra verifier call, not a stuck step.
                 investigative_needs_verifier = True
             elif has_tool_evidence or (
                 _looks_like_execution_step(step.description)

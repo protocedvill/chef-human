@@ -622,8 +622,18 @@ class TestToDict:
             "plan": {
                 "goal": "test goal",
                 "steps": [
-                    {"index": 1, "description": "step one", "status": "completed"},
-                    {"index": 2, "description": "step two", "status": "pending"},
+                    {
+                        "index": 1,
+                        "description": "step one",
+                        "status": "completed",
+                        "type": "leaf",
+                    },
+                    {
+                        "index": 2,
+                        "description": "step two",
+                        "status": "pending",
+                        "type": "leaf",
+                    },
                 ],
             },
             "escalations": [],
@@ -641,8 +651,18 @@ class TestToDict:
         assert d == {
             "goal": "my goal",
             "steps": [
-                {"index": 1, "description": "first", "status": "completed"},
-                {"index": 2, "description": "second", "status": "pending"},
+                {
+                    "index": 1,
+                    "description": "first",
+                    "status": "completed",
+                    "type": "leaf",
+                },
+                {
+                    "index": 2,
+                    "description": "second",
+                    "status": "pending",
+                    "type": "leaf",
+                },
             ],
         }
 
@@ -653,6 +673,22 @@ class TestToDict:
             "index": 1,
             "description": "do something",
             "status": "in_progress",
+            "type": "leaf",
+        }
+
+    def test_checkpoint_step_to_dict(self):
+        step = PlanNode(
+            index=1,
+            description="Explore the repo first",
+            status=StepStatus.pending,
+            declared_type="checkpoint",
+        )
+
+        assert step.to_dict() == {
+            "index": 1,
+            "description": "Explore the repo first",
+            "status": "pending",
+            "type": "checkpoint",
         }
 
     def test_agent_result_to_dict_no_steps(self):

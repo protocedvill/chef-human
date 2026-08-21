@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
@@ -56,6 +58,15 @@ class BenchmarkCase:
     # benchmarks that exercise chef-human against its own, much larger,
     # codebase rather than a small synthetic project.
     workspace_kind: Literal["seed", "worktree"] = "seed"
+    # "agent" runs the full ReAct loop via `chef_human run`; "planner"
+    # only executes the planning phase and returns its plan/trace.
+    runner_kind: Literal["agent", "planner"] = "agent"
+    # Planner-only cases can either exercise the initial task planning call
+    # (`generate_plan`) or replay a later planner seam from a real run
+    # (`continue_from_checkpoint`).
+    planner_operation: Literal["generate_plan", "continue_from_checkpoint"] = "generate_plan"
+    # Optional serialized planner state for planner-only replay cases.
+    planner_state: dict[str, Any] | None = None
     worktree_ref: str = "HEAD"
     # Absolute path to an external repo to worktree instead of this one.
     # None (default) means "this repository" (chef-human itself), resolved
@@ -89,6 +100,9 @@ class BenchmarkResult:
     changed_files: list[str]
     verifier_output: str
     agent_message: str | None = None
+    planner_plan: dict[str, Any] | None = None
+    planner_llm_calls: list[dict[str, Any]] = field(default_factory=list)
+    planner_trace_file: str | None = None
     error: str | None = None
     workspace: str | None = None
 
@@ -863,6 +877,106 @@ CASES: tuple[BenchmarkCase, ...] = (
         max_steps=25,
     ),
     BenchmarkCase(
+        case_id="vague_feature_request_real_repo_planner",
+        level="frontier",
+        title="Planner-only vague web interface request against an unfamiliar real codebase",
+        task="Let's add a web interface to this project",
+        seed_files={},
+        verification=None,
+        protect_all_existing_files=True,
+        max_steps=40,
+        workspace_kind="worktree",
+        runner_kind="planner",
+        source_repo="~/ubertooth",
+        worktree_ref="master",
+    ),
+    BenchmarkCase(
+        case_id="vague_feature_request_checkpoint_replay",
+        level="frontier",
+        title="Planner-only replay of the vague web-interface checkpoint continuation",
+        task="Let's add a web interface to this project",
+        seed_files={
+            "README.md": (
+                "# Ubertooth\n\n"
+                "Bluetooth experimentation platform with CLI host tools and firmware.\n"
+            ),
+            "docs/software.rst": (
+                "Host tools include ubertooth-rx for packet capture/decoding and "
+                "ubertooth-specan for spectrum analysis.\n"
+            ),
+            "host/CMakeLists.txt": (
+                "option(ENABLE_PYTHON \"Enable Python support\" ON)\n"
+                "add_subdirectory(ubertooth-tools)\n"
+            ),
+            "host/ubertooth-tools/ubertooth-rx.c": (
+                "/* CLI packet capture and decode tool */\n"
+                "int main(void) { return 0; }\n"
+            ),
+            "host/ubertooth-tools/ubertooth-specan.c": (
+                "/* CLI spectrum analyzer tool */\n"
+                "int main(void) { return 0; }\n"
+            ),
+            "host/libubertooth/ubertooth.h": (
+                "/* libubertooth USB communication API */\n"
+            ),
+        },
+        verification=None,
+        protect_all_existing_files=True,
+        max_steps=40,
+        runner_kind="planner",
+        planner_operation="continue_from_checkpoint",
+        planner_state={
+            "steps": [
+                {
+                    "description": "Read the README.md for project overview and architecture",
+                    "status": "completed",
+                    "type": "leaf",
+                },
+                {
+                    "description": "List the host/ directory contents to understand existing host-side software",
+                    "status": "completed",
+                    "type": "leaf",
+                },
+                {
+                    "description": "Read key files in host/ (e.g., any main programs or library code)",
+                    "status": "completed",
+                    "type": "leaf",
+                },
+                {
+                    "description": "Read docs/software.rst to understand what host tools are provided",
+                    "status": "completed",
+                    "type": "leaf",
+                },
+                {
+                    "description": "Check if there's any existing web-related code or configuration",
+                    "status": "completed",
+                    "type": "leaf",
+                },
+                {
+                    "description": "Explore the codebase to learn what it does and how it's structured, so the shape of a web interface can be decided from what's actually there rather than guessed",
+                    "status": "completed",
+                    "type": "checkpoint",
+                },
+            ],
+            "checkpoint_index": 5,
+            "evidence": (
+                "The exploration phase established the following grounded facts from the repo:\n"
+                "- Project: Ubertooth, a Bluetooth sniffer/decoder platform for a USB device.\n"
+                "- Languages/build: primarily C with a CMake build; ENABLE_PYTHON is available.\n"
+                "- Key host tools: ubertooth-rx for passive Bluetooth discovery/decode and "
+                "ubertooth-specan for spectrum analysis.\n"
+                "- Existing capabilities: live USB capture, file-based capture/export, survey "
+                "mode, and configuration via CLI arguments.\n"
+                "- Existing infrastructure: libubertooth handles USB communication; host-side "
+                "tools expose capture modes and runtime parameters that a web interface would "
+                "need to mirror.\n"
+                "- Implication for web architecture: browsers cannot access the USB device "
+                "directly, so a local server bridge is required; the previous run chose a Python "
+                "web server plus WebSocket streaming as the natural continuation."
+            ),
+        },
+    ),
+    BenchmarkCase(
         case_id="vague_feature_request_real_repo",
         level="frontier",
         title="Vague feature request against an unfamiliar real codebase",
@@ -944,6 +1058,16 @@ def _repo_root() -> Path:
     return Path(result.stdout.strip())
 
 
+def _resolve_source_repo_path(source_repo: str) -> Path:
+    candidate = Path(source_repo).expanduser()
+    if candidate.exists():
+        return candidate.resolve()
+    if source_repo.startswith("~/"):
+        real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        return (real_home / source_repo[2:]).resolve()
+    return candidate.resolve()
+
+
 def _create_worktree(source_repo: Path, workspace: Path, ref: str) -> None:
     """Check out a detached-HEAD git worktree of `source_repo` at `workspace`.
 
@@ -1003,6 +1127,7 @@ def _prepare_agent_path() -> dict[str, str]:
     # silently no-ops when `ruff` isn't findable.
     venv_bin = str(Path(sys.executable).parent)
     env["PATH"] = f"{shim_dir}:{venv_bin}:{env.get('PATH', '')}"
+    env["CHEF_OLLAMA_THINK"] = "true"
     return env
 
 
@@ -1038,6 +1163,137 @@ def _run_process(
     )
 
 
+def _serialize_messages(messages: Sequence[Any]) -> list[dict[str, str]]:
+    serialized: list[dict[str, str]] = []
+    for message in messages:
+        role = getattr(message, "role", "")
+        serialized.append(
+            {
+                "role": getattr(role, "value", str(role)),
+                "content": getattr(message, "content", ""),
+            }
+        )
+    return serialized
+
+
+def _plan_node_from_data(data: dict[str, Any]):
+    from chef_human.agent.planner import PlanNode, StepStatus
+
+    node = PlanNode(
+        index=int(data.get("index", 0)),
+        description=str(data["description"]),
+        status=StepStatus(str(data.get("status", "pending"))),
+        declared_type=str(data.get("type", "leaf")),
+    )
+    children = [_plan_node_from_data(child) for child in data.get("children", [])]
+    if children:
+        node.set_children(children)
+    return node
+
+
+def _run_planner_case(
+    case: BenchmarkCase,
+    workspace: Path,
+    *,
+    model: str | None,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    from chef_human import config
+    from chef_human.agent import create_agent
+    from chef_human.agent.planner import Plan
+
+    settings = replace(
+        config.settings,
+        ollama_model=model or config.settings.ollama_model,
+        ollama_think=True,
+    )
+    loop, _ = create_agent(
+        max_steps=case.max_steps,
+        workspace_root=str(workspace),
+        settings=settings,
+    )
+    planner = loop._planner
+    trace_path = (workspace / ".chef-human" / "planner-trace.json").resolve()
+    llm_calls: list[dict[str, Any]] = []
+    original_complete = planner._complete
+
+    async def traced_complete(request, activity="planning"):
+        response = await original_complete(request, activity)
+        llm_calls.append(
+            {
+                "activity": activity,
+                "request": {
+                    "messages": _serialize_messages(request.messages),
+                    "temperature": request.temperature,
+                    "max_tokens": request.max_tokens,
+                },
+                "response": {
+                    "content": response.message.content,
+                    "thinking": response.thinking,
+                    "usage": response.usage,
+                },
+            }
+        )
+        return response
+
+    planner._complete = traced_complete
+    try:
+        if case.planner_operation == "continue_from_checkpoint":
+            state = case.planner_state or {}
+            root_steps = [_plan_node_from_data(step) for step in state.get("steps", [])]
+            plan = Plan(goal=case.task, steps=root_steps)
+            checkpoint = plan.steps[int(state["checkpoint_index"])]
+            continued_steps = asyncio.run(
+                asyncio.wait_for(
+                    planner.continue_from_checkpoint(
+                        plan,
+                        checkpoint,
+                        evidence=str(state.get("evidence", "")),
+                    ),
+                    timeout=timeout_seconds,
+                )
+            )
+            plan.root.set_children(plan.steps + continued_steps)
+            asyncio.run(
+                asyncio.wait_for(
+                    planner.expand_spliced_steps(plan, continued_steps),
+                    timeout=timeout_seconds,
+                )
+            )
+            result_plan = plan
+            message = (
+                "Planner replayed checkpoint continuation and produced "
+                f"{len(continued_steps)} continuation step(s)"
+            )
+        else:
+            plan = asyncio.run(
+                asyncio.wait_for(loop._plan_task(case.task), timeout=timeout_seconds)
+            )
+            result_plan = plan
+            message = f"Planner produced {len(plan.steps)} top-level step(s)"
+    finally:
+        planner._complete = original_complete
+
+    trace_payload = {
+        "task": case.task,
+        "planner_operation": case.planner_operation,
+        "planner_state": case.planner_state,
+        "plan": result_plan.to_dict(),
+        "llm_calls": llm_calls,
+    }
+    trace_path.write_text(json.dumps(trace_payload, indent=2) + "\n", encoding="utf-8")
+    return {
+        "success": True,
+        "steps_taken": len(result_plan.steps),
+        "total_prompt_tokens": loop._total_prompt_tokens,
+        "total_completion_tokens": loop._total_completion_tokens,
+        "message": message,
+        "planner_plan": result_plan.to_dict(),
+        "planner_llm_calls": llm_calls,
+        "planner_trace_file": str(trace_path),
+    }
+
+
 def run_case(
     case: BenchmarkCase,
     workspace: Path,
@@ -1055,7 +1311,7 @@ def run_case(
     workspace = workspace.resolve()
     if case.workspace_kind == "worktree":
         if case.source_repo:
-            repo = Path(case.source_repo).expanduser().resolve()
+            repo = _resolve_source_repo_path(case.source_repo)
         else:
             repo = source_repo or _repo_root()
         _create_worktree(repo, workspace, case.worktree_ref)
@@ -1073,50 +1329,64 @@ def run_case(
         protected = dict(before)
     else:
         protected = {name: before[name] for name in case.protected_files}
-    command = [
-        sys.executable,
-        "-m",
-        "chef_human",
-        "run",
-        case.task,
-        "--headless",
-        "--no-stream",
-        "--workspace",
-        str(workspace.resolve()),
-        "--max-steps",
-        str(case.max_steps),
-        "--log-file",
-        # Inside .chef-human/, not the workspace root: WorkspaceManager's
-        # IGNORE_PATTERNS already excludes that directory from the repo map
-        # the agent's own planner sees. A log file sitting in the workspace
-        # root instead makes an otherwise-empty greenfield workspace look
-        # like "an existing codebase" to the planner, which then applies the
-        # system prompt's mandatory explore-before-implementing rule and
-        # (observed against qwen3.6:35b-a3b) collapses the whole plan into a
-        # single unproductive "explore the project structure" step.
-        str((workspace / ".chef-human" / "agent.log").resolve()),
-    ]
-    if model:
-        command.extend(("--model", model))
-
     started = time.monotonic()
     agent_exit_code: int | None = None
     agent_data: dict[str, Any] = {}
     errors: list[str] = []
     try:
-        agent = _run_process(command, cwd=workspace, timeout=agent_timeout, env=agent_env)
-        agent_exit_code = agent.returncode
-        agent_data = _parse_agent_json(agent.stdout)
-        if not agent_data:
-            errors.append("Agent did not emit a JSON result")
-        if agent.returncode != 0:
-            detail = agent.stderr.strip().splitlines()
-            errors.append(
-                f"Agent exited with {agent.returncode}"
-                + (f": {detail[-1]}" if detail else "")
+        if case.runner_kind == "planner":
+            agent_data = _run_planner_case(
+                case,
+                workspace,
+                model=model,
+                timeout_seconds=agent_timeout,
             )
+            agent_exit_code = 0
+        else:
+            command = [
+                sys.executable,
+                "-m",
+                "chef_human",
+                "run",
+                case.task,
+                "--headless",
+                "--no-stream",
+                "--workspace",
+                str(workspace.resolve()),
+                "--max-steps",
+                str(case.max_steps),
+                "--log-file",
+                # Inside .chef-human/, not the workspace root:
+                # WorkspaceManager's IGNORE_PATTERNS already excludes that
+                # directory from the repo map the agent's own planner sees.
+                # A log file sitting in the workspace root instead makes an
+                # otherwise-empty greenfield workspace look like "an existing
+                # codebase" to the planner, which then applies the system
+                # prompt's mandatory explore-before-implementing rule and
+                # (observed against qwen3.6:35b-a3b) collapses the whole plan
+                # into a single unproductive "explore the project structure"
+                # step.
+                str((workspace / ".chef-human" / "agent.log").resolve()),
+            ]
+            if model:
+                command.extend(("--model", model))
+            agent = _run_process(command, cwd=workspace, timeout=agent_timeout, env=agent_env)
+            agent_exit_code = agent.returncode
+            agent_data = _parse_agent_json(agent.stdout)
+            if not agent_data:
+                errors.append("Agent did not emit a JSON result")
+            if agent.returncode != 0:
+                detail = agent.stderr.strip().splitlines()
+                errors.append(
+                    f"Agent exited with {agent.returncode}"
+                    + (f": {detail[-1]}" if detail else "")
+                )
     except subprocess.TimeoutExpired:
         errors.append(f"Agent exceeded the {agent_timeout}s case timeout")
+    except TimeoutError:
+        errors.append(f"Planner exceeded the {agent_timeout}s case timeout")
+    except Exception as exc:
+        errors.append(str(exc))
 
     verifier_output = ""
     verifier_success = True
@@ -1175,6 +1445,9 @@ def run_case(
         changed_files=changed_files,
         verifier_output=verifier_output[-4000:],
         agent_message=agent_message[-4000:] if isinstance(agent_message, str) else None,
+        planner_plan=agent_data.get("planner_plan"),
+        planner_llm_calls=agent_data.get("planner_llm_calls") or [],
+        planner_trace_file=agent_data.get("planner_trace_file"),
         error="; ".join(errors) or None,
         workspace=str(workspace),
     )
@@ -1195,7 +1468,7 @@ def select_cases(through: str, case_ids: Sequence[str]) -> list[BenchmarkCase]:
 def _report(results: Sequence[BenchmarkResult]) -> dict[str, Any]:
     passed = sum(result.passed for result in results)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "passed": passed,
         "total": len(results),
         "score_percent": round(100 * passed / len(results), 1) if results else 0.0,
@@ -1260,7 +1533,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     worktree_cases = [c for c in cases if c.workspace_kind == "worktree"]
     default_source_repo = _repo_root() if any(c.source_repo is None for c in worktree_cases) else None
     used_repos = {
-        Path(c.source_repo).expanduser().resolve() if c.source_repo else default_source_repo
+        _resolve_source_repo_path(c.source_repo) if c.source_repo else default_source_repo
         for c in worktree_cases
     }
     used_repos.discard(None)

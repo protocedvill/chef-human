@@ -185,6 +185,7 @@ class PlanNode:
             "index": self.index,
             "description": self.description,
             "status": self.status.value,
+            "type": self.declared_type,
         }
 
 

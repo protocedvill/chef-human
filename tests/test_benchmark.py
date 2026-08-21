@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import types
 import subprocess
 from pathlib import Path
 
@@ -47,6 +48,29 @@ class TestCaseSelection:
     def test_unknown_case_is_rejected(self):
         with pytest.raises(ValueError, match="Unknown benchmark"):
             benchmark.select_cases("smoke", ["missing"])
+
+
+class TestSourceRepoResolution:
+    def test_tilde_source_repo_falls_back_to_real_home_when_sandbox_home_differs(
+        self, tmp_path, monkeypatch
+    ):
+        sandbox_home = tmp_path / "sandbox-home"
+        real_home = tmp_path / "real-home"
+        sandbox_home.mkdir()
+        real_home.mkdir()
+        (real_home / "ubertooth").mkdir()
+        monkeypatch.setenv("HOME", str(sandbox_home))
+        monkeypatch.setattr(
+            benchmark,
+            "pwd",
+            types.SimpleNamespace(
+                getpwuid=lambda _uid: types.SimpleNamespace(pw_dir=str(real_home))
+            ),
+        )
+
+        resolved = benchmark._resolve_source_repo_path("~/ubertooth")
+
+        assert resolved == (real_home / "ubertooth").resolve()
 
 
 class TestRunCase:
@@ -246,6 +270,21 @@ def _review_case(**overrides) -> BenchmarkCase:
     return BenchmarkCase(**defaults)
 
 
+def _planner_case(**overrides) -> BenchmarkCase:
+    defaults = dict(
+        case_id="planner_case",
+        level="frontier",
+        title="Planner case",
+        task="Let's add a web interface to this project",
+        seed_files={"README.md": "# demo\n"},
+        verification=None,
+        protect_all_existing_files=True,
+        runner_kind="planner",
+    )
+    defaults.update(overrides)
+    return BenchmarkCase(**defaults)
+
+
 class TestWorktreeCase:
     def test_worktree_is_checked_out_from_source_repo(self, tmp_path, monkeypatch):
         source_repo = _init_source_repo(tmp_path)
@@ -381,3 +420,98 @@ class TestWorktreeCase:
 
         assert seen["content"] == "x = 1\n"
         benchmark._prune_worktrees(source_repo)
+
+
+class TestPlannerCase:
+    def test_prepare_agent_path_enables_think_mode(self):
+        env = benchmark._prepare_agent_path()
+
+        assert env["CHEF_OLLAMA_THINK"] == "true"
+
+    def test_plan_node_from_data_preserves_children_and_checkpoint_type(self):
+        node = benchmark._plan_node_from_data(
+            {
+                "index": 6,
+                "description": "Explore the repo first",
+                "status": "completed",
+                "type": "checkpoint",
+                "children": [
+                    {
+                        "index": 1,
+                        "description": "Read the README",
+                        "status": "completed",
+                        "type": "leaf",
+                    }
+                ],
+            }
+        )
+
+        assert node.declared_type == "checkpoint"
+        assert node.children[0].parent is node
+        assert node.children[0].description == "Read the README"
+
+    def test_planner_runner_returns_plan_and_llm_trace(self, tmp_path, monkeypatch):
+        captured = {}
+
+        def fake_run_planner_case(case, workspace, *, model, timeout_seconds):
+            captured["timeout_seconds"] = timeout_seconds
+            captured["workspace"] = workspace
+            return {
+                "success": True,
+                "steps_taken": 2,
+                "total_prompt_tokens": 11,
+                "total_completion_tokens": 7,
+                "message": "Planner produced 2 top-level step(s)",
+                "planner_plan": {
+                    "goal": case.task,
+                    "steps": [
+                        {
+                            "index": 1,
+                            "description": "Explore",
+                            "status": "pending",
+                            "type": "checkpoint",
+                        }
+                    ],
+                },
+                "planner_llm_calls": [
+                    {
+                        "activity": "planning",
+                        "request": {"messages": [{"role": "user", "content": case.task}]},
+                        "response": {"content": "[]", "thinking": "first think", "usage": None},
+                    }
+                ],
+                "planner_trace_file": str(workspace / ".chef-human" / "planner-trace.json"),
+            }
+
+        monkeypatch.setattr(benchmark, "_run_planner_case", fake_run_planner_case)
+        result = benchmark.run_case(
+            _planner_case(),
+            tmp_path / "workspace",
+            model="test-model",
+            agent_timeout=45,
+        )
+
+        assert result.passed
+        assert result.agent_success
+        assert result.steps_taken == 2
+        assert result.planner_plan == {
+            "goal": "Let's add a web interface to this project",
+            "steps": [
+                {
+                    "index": 1,
+                    "description": "Explore",
+                    "status": "pending",
+                    "type": "checkpoint",
+                }
+            ],
+        }
+        assert result.planner_llm_calls[0]["response"]["thinking"] == "first think"
+        assert result.planner_trace_file is not None
+        assert captured["timeout_seconds"] == 45
+
+    def test_replay_benchmark_case_is_registered(self):
+        case = next(c for c in CASES if c.case_id == "vague_feature_request_checkpoint_replay")
+
+        assert case.runner_kind == "planner"
+        assert case.planner_operation == "continue_from_checkpoint"
+        assert case.planner_state is not None

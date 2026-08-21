@@ -515,3 +515,58 @@ class TestPlannerCase:
         assert case.runner_kind == "planner"
         assert case.planner_operation == "continue_from_checkpoint"
         assert case.planner_state is not None
+
+    def test_planner_timeout_still_writes_trace_file(self, tmp_path, monkeypatch):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / ".chef-human").mkdir()
+
+        class FakePlanner:
+            def __init__(self):
+                self._complete = None
+
+        class FakeLoop:
+            def __init__(self):
+                self._planner = FakePlanner()
+                self._total_prompt_tokens = 3
+                self._total_completion_tokens = 4
+
+            async def _plan_task(self, task):
+                await self._planner._complete(
+                    types.SimpleNamespace(
+                        messages=[types.SimpleNamespace(role="user", content=task)],
+                        temperature=0.0,
+                        max_tokens=10,
+                    ),
+                    activity="planning",
+                )
+                raise TimeoutError("planner timed out")
+
+        async def fake_complete(request, activity="planning"):
+            return types.SimpleNamespace(
+                message=types.SimpleNamespace(content="[]"),
+                thinking="partial reasoning",
+                usage={"prompt_tokens": 1, "completion_tokens": 2},
+            )
+
+        fake_loop = FakeLoop()
+        fake_loop._planner._complete = fake_complete
+
+        monkeypatch.setattr(
+            "chef_human.agent.create_agent",
+            lambda max_steps, workspace_root, settings: (fake_loop, None),
+        )
+
+        with pytest.raises(TimeoutError):
+            benchmark._run_planner_case(
+                _planner_case(),
+                workspace,
+                model=None,
+                timeout_seconds=1,
+            )
+
+        trace_path = workspace / ".chef-human" / "planner-trace.json"
+        assert trace_path.exists()
+        payload = json.loads(trace_path.read_text())
+        assert payload["plan"] is None
+        assert payload["llm_calls"][0]["response"]["thinking"] == "partial reasoning"

@@ -1216,6 +1216,8 @@ def _run_planner_case(
     trace_path = (workspace / ".chef-human" / "planner-trace.json").resolve()
     llm_calls: list[dict[str, Any]] = []
     original_complete = planner._complete
+    result_plan: Plan | None = None
+    message: str | None = None
 
     async def traced_complete(request, activity="planning"):
         response = await original_complete(request, activity)
@@ -1273,15 +1275,15 @@ def _run_planner_case(
             message = f"Planner produced {len(plan.steps)} top-level step(s)"
     finally:
         planner._complete = original_complete
-
-    trace_payload = {
-        "task": case.task,
-        "planner_operation": case.planner_operation,
-        "planner_state": case.planner_state,
-        "plan": result_plan.to_dict(),
-        "llm_calls": llm_calls,
-    }
-    trace_path.write_text(json.dumps(trace_payload, indent=2) + "\n", encoding="utf-8")
+        trace_payload = {
+            "task": case.task,
+            "planner_operation": case.planner_operation,
+            "planner_state": case.planner_state,
+            "plan": result_plan.to_dict() if result_plan is not None else None,
+            "llm_calls": llm_calls,
+            "message": message,
+        }
+        trace_path.write_text(json.dumps(trace_payload, indent=2) + "\n", encoding="utf-8")
     return {
         "success": True,
         "steps_taken": len(result_plan.steps),

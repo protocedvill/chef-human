@@ -108,8 +108,7 @@ class PlanNode:
     `index` is purely a cosmetic display ordinal, not an identity.
 
     A node with no children is a leaf and must correspond to exactly one
-    tool call; a node with children is a branch. Only depth-1 trees (a root
-    with only leaf children) are produced today.
+    tool call; a node with children is a branch.
     """
 
     description: str
@@ -181,12 +180,15 @@ class PlanNode:
             child.parent = self
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "index": self.index,
             "description": self.description,
             "status": self.status.value,
             "type": self.declared_type,
         }
+        if self.children:
+            payload["children"] = [child.to_dict() for child in self.children]
+        return payload
 
 
 class Plan:
@@ -194,10 +196,9 @@ class Plan:
 
     `steps` is kept as a property (not a plain field) over the root's
     children, both so `Plan(goal=..., steps=[...])` construction still works
-    the way flat-plan callers expect, and so `plan.steps` stays valid --
-    today's trees are always depth-1 (a root with only leaf children), and
-    that coincidence is what makes `steps` and `root.children` the same
-    list."""
+    the way flat-plan callers expect, and so `plan.steps` stays valid. The
+    serialized shape intentionally keeps the legacy top-level `{goal, steps}`
+    contract while allowing each step to carry nested `children`."""
 
     def __init__(
         self,
@@ -216,10 +217,9 @@ class Plan:
         return self.goal == other.goal and self.root == other.root
 
     def to_dict(self) -> dict:
-        """Serializes as the same {goal, steps} shape flat plans used --
-        preserves the `chef-human run --headless --json` output contract.
-        Only depth-1 trees are produced today, so this is lossless; a real
-        decomposition ticket will need to widen this shape."""
+        """Serializes as the same top-level {goal, steps} shape existing
+        callers expect, with nested decomposition preserved recursively under
+        each step's optional `children` field."""
         return {
             "goal": self.goal,
             "steps": [s.to_dict() for s in self.steps],
@@ -227,9 +227,7 @@ class Plan:
 
     @property
     def steps(self) -> list[PlanNode]:
-        """The root's immediate children. Only depth-1 trees are produced
-        today, so this coincides with the flat leaf list; a future
-        real-decomposition ticket will need to stop relying on that."""
+        """The root's immediate children."""
         return self.root.children
 
     @steps.setter

@@ -30,7 +30,7 @@ default unit suite:
 
 ```bash
 ollama serve                       # if not already running as a service
-ollama pull qwen2.5-coder:7b       # default model
+ollama pull qwen3.8:27b            # default model
 ```
 
 Run `chef-human doctor` any time you want a quick read on whether your local environment (Python

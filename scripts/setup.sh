@@ -48,5 +48,5 @@ else
     echo "Ollama is not installed yet. Follow https://ollama.com/download before running an agent task."
 fi
 
-echo "Then pull the default model explicitly: ollama pull qwen2.5-coder:7b"
+echo "Then pull the default model explicitly: ollama pull qwen3.8:27b"
 echo "Experimental extras: pip install -e '.[indexing]', '.[rag]', or '.[llamacpp]'"

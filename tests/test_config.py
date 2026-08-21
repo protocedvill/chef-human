@@ -14,7 +14,7 @@ class TestSettings:
     def test_defaults(self):
         s = Settings()
         assert s.llm_backend == "ollama"
-        assert s.ollama_model == "qwen3.6:35b-a3b"
+        assert s.ollama_model == "qwen3.8:27b"
         assert s.ollama_host == "http://localhost:11434"
         assert s.llamacpp_model_path is None
         assert s.llamacpp_n_gpu_layers == 0

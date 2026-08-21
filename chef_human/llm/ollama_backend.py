@@ -21,7 +21,7 @@ from chef_human.llm.chatml import tool_to_dict
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "qwen2.5-coder:7b"
+DEFAULT_MODEL = "qwen3.8:27b"
 DEFAULT_CONTEXT_LENGTH = 32768
 
 # Every CompletionRequest in this codebase asks for temperature=0.0 (greedy

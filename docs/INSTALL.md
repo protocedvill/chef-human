@@ -24,7 +24,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 ### 2. Pull a model
 
 ```bash
-ollama pull qwen2.5-coder:7b
+ollama pull qwen3.8:27b
 ```
 
 ### 3. Create an environment and install Chef Human
@@ -101,7 +101,7 @@ Configuration is managed via `config.toml` in the project root:
 ```toml
 [chef_human]
 llm_backend = "ollama"
-ollama_model = "qwen2.5-coder:7b"
+ollama_model = "qwen3.8:27b"
 ollama_host = "http://localhost:11434"
 max_context_tokens = 32768
 temperature = 0.0
@@ -138,5 +138,5 @@ If the command is not found, install Ollama first (see step 1 above).
 Verify the model is pulled:
 
 ```bash
-ollama pull qwen2.5-coder:7b
+ollama pull qwen3.8:27b
 ```

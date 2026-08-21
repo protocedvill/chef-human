@@ -53,7 +53,7 @@ pyright
 ```
 
 Ollama must be running locally (`ollama serve`) with the configured model pulled
-(default `qwen2.5-coder:7b`) for anything that actually calls the LLM.
+(default `qwen3.8:27b`) for anything that actually calls the LLM.
 
 Always run the agent and benchmark with thinking mode enabled: `CHEF_OLLAMA_THINK=true` (there is no
 CLI flag for it). Set this by default, not just when a task seems to need it.
@@ -247,6 +247,11 @@ a topological-sort scheduler from a spec alone, no starter code) → `adversaria
 banned `time.sleep` call) → `marathon` (library_system, ~24-test multi-module system built from a large
 spec, no starter code — the largest-scope case, and the one that originally surfaced the false-
 escalation bugs described above since it needs the most turns).
+
+**Always pass `--keep-workspaces` when running a case you expect to diagnose (timeouts, failures).**
+Without it the disposable workspace is deleted after each case, taking the agent's `.chef-human/agent.log`
+and any planner traces with it — a timed-out run then has zero evidence left to investigate. With the flag
+each case's workspace (including the full agent log) survives under a `benchmark-runs/<timestamp>/` dir.
 
 Every case was validated against a hand-written reference solution (and, for bug-hunt cases, the exact
 buggy seed) before being wired in — confirm any new case fails/passes exactly as intended in isolation

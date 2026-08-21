@@ -3,7 +3,7 @@
 ## Running the Agent
 
 Once installed (`pip install -e .`) and with Ollama running locally (`ollama serve`, with the
-configured model pulled — default `qwen2.5-coder:7b`), run a task directly:
+configured model pulled — default `qwen3.8:27b`), run a task directly:
 
 ```bash
 chef-human "Add a docstring to the parse_config function"
@@ -216,7 +216,7 @@ You can explicitly choose a backend:
 
 ```python
 from chef_human.llm.ollama_backend import OllamaBackend
-backend = OllamaBackend(model="qwen2.5-coder:7b")
+backend = OllamaBackend(model="qwen3.8:27b")
 ```
 
 ```python
@@ -239,7 +239,7 @@ print(f"Vector dimension: {len(vec)}")  # 384 for bge-small
 ```python
 from chef_human.llm.tokenizer import create_tokenizer
 
-tok = create_tokenizer("qwen2.5-coder:7b")
+tok = create_tokenizer("qwen3.8:27b")
 print(tok.count("Hello, world!"))  # approximate token count
 ```
 

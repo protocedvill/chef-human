@@ -38,7 +38,7 @@ pytest -m 'rag or indexing'
 Ollama integration tests are opt-in and check both the server and configured model before running:
 
 ```bash
-ollama pull qwen2.5-coder:7b
+ollama pull qwen3.8:27b
 pytest -m integration_ollama
 ```
 

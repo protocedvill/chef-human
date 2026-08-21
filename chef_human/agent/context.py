@@ -81,15 +81,36 @@ class ContextManager:
 
     def _trim_if_needed(self) -> None:
         budget = self.config.max_tokens - self.config.max_response_tokens - self.config.summary_tokens
+        # Never pop past the last user (or system) message: the Qwen3.5/3.8
+        # chat template raises 'No user query found in messages' if every
+        # user message has been consumed, so at least one user (or the
+        # opening system prompt) must survive any trim pass.
         while self.token_count() > budget and len(self.messages) > 1:
-            if not self._summary and len(self.messages) > 3:
-                old = self.messages[:2]
-                self._summary = f"[Previous conversation: {len(old)} messages trimmed]"
-                self.messages = self.messages[2:]
-            elif len(self.messages) > 2:
-                self.messages.pop(0)
-            else:
+            idx = self._last_non_user_index()
+            if idx < 1:
                 break
+            if not self._summary and idx > 2:
+                old = self.messages[1 : idx + 1]
+                self._summary = (
+                    f"[Previous conversation: {len(old)} messages trimmed]"
+                )
+                self.messages = [self.messages[0]] + self.messages[idx + 1 :]
+            else:
+                self.messages.pop(1)
+
+    def _last_non_user_index(self) -> int:
+        """Index of the last message with a role other than `user`, or -1 if
+        none exists (i.e. only user messages remain). Popping past this
+        position would leave only user messages -- which is the shape the
+        Qwen3.5/3.8 template rejects -- so trims must stop at or before it.
+        The leading system message at index 0 is always preserved (idx>=1
+        above), which also keeps the guard happy since the template only
+        needs a single non-tool user or system message to render."""
+        last = -1
+        for i, m in enumerate(self.messages):
+            if m.role.value != "user":
+                last = i
+        return last
 
 
 class ContextAssembler:

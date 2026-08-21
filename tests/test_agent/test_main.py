@@ -676,6 +676,25 @@ class TestToDict:
             "type": "leaf",
         }
 
+    def test_branch_step_to_dict_includes_children(self):
+        step = PlanNode(index=1, description="do something bigger", status=StepStatus.pending)
+        step.set_children([PlanNode(index=1, description="first child")])
+
+        assert step.to_dict() == {
+            "index": 1,
+            "description": "do something bigger",
+            "status": "pending",
+            "type": "leaf",
+            "children": [
+                {
+                    "index": 1,
+                    "description": "first child",
+                    "status": "pending",
+                    "type": "leaf",
+                }
+            ],
+        }
+
     def test_checkpoint_step_to_dict(self):
         step = PlanNode(
             index=1,
@@ -689,6 +708,31 @@ class TestToDict:
             "description": "Explore the repo first",
             "status": "pending",
             "type": "checkpoint",
+        }
+
+    def test_plan_to_dict_preserves_nested_children(self):
+        branch = PlanNode(index=1, description="Implement backend", declared_type="branch")
+        branch.set_children([PlanNode(index=1, description="Write server.py")])
+        plan = Plan(goal="my goal", steps=[branch])
+
+        assert plan.to_dict() == {
+            "goal": "my goal",
+            "steps": [
+                {
+                    "index": 1,
+                    "description": "Implement backend",
+                    "status": "pending",
+                    "type": "branch",
+                    "children": [
+                        {
+                            "index": 1,
+                            "description": "Write server.py",
+                            "status": "pending",
+                            "type": "leaf",
+                        }
+                    ],
+                }
+            ],
         }
 
     def test_agent_result_to_dict_no_steps(self):

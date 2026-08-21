@@ -352,14 +352,24 @@ def _file_mutation_step_feedback(step: PlanNode, target_names: set[str]) -> str:
     )
 
 
-def _primary_mutation_target(step: PlanNode, target_names: set[str]) -> str:
+def _primary_mutation_target(step: PlanNode, target_names: set[str]) -> str | None:
+    """The single most useful filename to show as a concrete example, or
+    `None` when the step never named one -- e.g. "Create the web/
+    directory structure with subdirectories for static assets and
+    templates" reads as mutation-shaped (`_mentions_mutation_verb`) but
+    names no literal file, only directory-ish words. Returning `None` here
+    (rather than crashing on an empty `target_names`, as this used to)
+    lets `_file_mutation_no_tool_feedback` fall back to a path-agnostic
+    nudge instead of fabricating a made-up example path."""
     ordered = [name for name in _named_step_files(step.description) if name in target_names]
     for name in ordered:
         if not name.lower().endswith(_DOC_LIKE_SUFFIXES):
             return name
     if ordered:
         return ordered[0]
-    return sorted(target_names)[0]
+    if target_names:
+        return sorted(target_names)[0]
+    return None
 
 
 def _file_mutation_no_tool_feedback(
@@ -369,27 +379,42 @@ def _file_mutation_no_tool_feedback(
     consecutive_stalls: int,
 ) -> str:
     target = _primary_mutation_target(step, target_names)
-    example = (
-        '<tool_call>{ "name": "write", "arguments": '
-        f'{{ "path": "{target}", "content": "..." }}'
-        "}</tool_call>"
-    )
     prefix = (
         f"Step {step.index} ('{step.description}') still needs real file-change evidence. "
     )
+    if target is not None:
+        example = (
+            '<tool_call>{ "name": "write", "arguments": '
+            f'{{ "path": "{target}", "content": "..." }}'
+            "}</tool_call>"
+        )
+        target_clause = f"a single `write`/`edit` tool call for `{target}`. Example for `{target}`:\n{example}"
+        respond_clause = f"calling `write`/`edit` on `{target}` now. Example for `{target}`:\n{example}"
+    else:
+        # No literal filename was named in the step's own wording (e.g. a
+        # directory-structure step) -- don't fabricate one; point at
+        # whatever real mutating tool call (write/edit/bash) actually
+        # fulfills this step instead.
+        target_clause = (
+            "a real `write`/`edit`/`bash` tool call that actually creates what this "
+            "step describes -- not another turn of plain reasoning."
+        )
+        respond_clause = (
+            "calling `write`/`edit`/`bash` now to actually create what this step "
+            "describes -- not explaining it again."
+        )
     if consecutive_stalls >= 2:
         return (
             prefix
-            + 
+            +
             "You already tried reasoning without a tool on this same step. "
-            "Do not explain the plan again. Your next response must contain a single "
-            f"`write`/`edit` tool call for `{target}`. Example for `{target}`:\n{example}"
+            f"Do not explain the plan again. Your next response must contain {target_clause}"
         )
     return (
         prefix
         +
         "Reasoning alone does not count for a create/implement/edit step. "
-        f"Respond by calling `write`/`edit` on `{target}` now. Example for `{target}`:\n{example}"
+        f"Respond by {respond_clause}"
     )
 
 
@@ -1317,7 +1342,11 @@ class ReActLoop:
                                         Message(role=Role.tool, content=read_output)
                                     )
 
-                        if current is not None and mutation_targets:
+                        if (
+                            current is not None
+                            and not _looks_investigative(current.description)
+                            and _mentions_mutation_verb(current.description)
+                        ):
                             self._last_failed_node = current
                             stall_count = self._note_mutation_no_tool_stall(current)
                             mutation_feedback = _file_mutation_no_tool_feedback(

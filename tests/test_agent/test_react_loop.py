@@ -3819,6 +3819,68 @@ class TestInvestigativeStepBypassesVerification:
         assert any("must contain a single `write`/`edit` tool call" in m for m in tool_msgs)
 
     @pytest.mark.asyncio
+    async def test_reasoning_only_mutation_stall_with_no_named_file_does_not_crash(self):
+        """Regression: reproduces a real benchmark run (workspace
+        20260821-130618) where the current step -- "Create the web/
+        directory structure with subdirectories for static assets and
+        templates" -- is genuinely mutation-shaped (`_mentions_mutation_verb`
+        matches "Create") but names no literal filename, only directory-ish
+        words. Four consecutive reasoning-only turns went unnudged in that
+        run because the stall guard's gate used to be
+        `bool(_looks_like_file_mutation_step(...))`, which is empty (falsy)
+        whenever no filename is extracted -- so the guard silently never
+        fired at all. A naive fix that only swapped the gate to fire on any
+        mutation verb, without also handling the resulting empty
+        `target_names` set, would instead crash in
+        `_primary_mutation_target`'s `sorted(target_names)[0]`. This test
+        asserts the guard now fires *and* produces a path-agnostic nudge,
+        not a crash and not silence."""
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(side_effect=[
+            CompletionResponse(
+                message=Message(role=Role.assistant, content="Let me plan the directory layout."),
+            ),
+            CompletionResponse(
+                message=Message(role=Role.assistant, content="I'll create it next."),
+            ),
+        ])
+        planner = _make_mock_planner()
+        plan = Plan(goal="g", steps=[
+            PlanNode(
+                index=1,
+                description=(
+                    "Create the web/ directory structure with subdirectories "
+                    "for static assets and templates"
+                ),
+                status=StepStatus.pending,
+            ),
+        ])
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=2),
+        )
+        await loop.run("do something")  # must not raise
+
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("still needs real file-change evidence" in m for m in tool_msgs)
+        assert any(
+            "real `write`/`edit`/`bash` tool call that actually creates what this "
+            "step describes" in m
+            for m in tool_msgs
+        )
+
+    @pytest.mark.asyncio
     async def test_unrelated_successful_tool_call_does_not_auto_complete(self):
         """Regression test: a turn whose only tool call is unrelated to the
         step (e.g. ask_user) still "succeeds" from RetryManager's

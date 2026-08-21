@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from collections import deque
 
+import ollama
+
 
 from chef_human.agent.context import ContextAssembler
 from chef_human.agent.linter import (
@@ -666,6 +668,45 @@ class ReActLoop:
         # Reset to None at the top of every `run()`.
         self._retry_mgr: RetryManager | None = None
 
+    # Attempts (including the first) for a single reasoning-turn LLM call
+    # before giving up -- covers transient backend-side hiccups (e.g.
+    # Ollama's own tool-call parser choking mid-generation and surfacing an
+    # HTTP 500 as `ollama.ResponseError`), which were previously fully
+    # uncaught: they propagated straight out of `_execute`, killing the
+    # whole process and losing everything the run had accomplished so far.
+    # Deliberately small and local to one LLM call, not routed through
+    # RetryManager -- RetryManager's retry/replan/escalate budget exists to
+    # judge whether *the model's own output* solved a step, which has
+    # nothing to do with a raw transport/backend failure that produced no
+    # output to judge at all.
+    _LLM_CALL_MAX_ATTEMPTS = 3
+    _LLM_CALL_RETRY_BACKOFF_SECONDS = 1.0
+
+    async def _complete_with_retry(self, request: CompletionRequest) -> CompletionResponse:
+        """Wraps a single non-streaming `complete()` call with a small bounded
+        retry against backend-side response errors (currently
+        `ollama.ResponseError`, the only such exception type this codebase's
+        supported backends raise). Exhausts `_LLM_CALL_MAX_ATTEMPTS` attempts
+        with a short linear backoff between them, then re-raises the last
+        error for the caller to handle -- this method never silently drops
+        the failure, it only buys a couple of chances for a transient hiccup
+        to clear before that happens."""
+        last_exc: ollama.ResponseError | None = None
+        for attempt in range(1, self._LLM_CALL_MAX_ATTEMPTS + 1):
+            try:
+                return await self._llm.complete(request)
+            except ollama.ResponseError as exc:
+                last_exc = exc
+                if attempt == self._LLM_CALL_MAX_ATTEMPTS:
+                    break
+                logger.warning(
+                    "LLM backend call failed (attempt %d/%d): %s; retrying",
+                    attempt, self._LLM_CALL_MAX_ATTEMPTS, exc,
+                )
+                await asyncio.sleep(self._LLM_CALL_RETRY_BACKOFF_SECONDS * attempt)
+        assert last_exc is not None
+        raise last_exc
+
     def _record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
         self._total_prompt_tokens += prompt_tokens
         self._total_completion_tokens += completion_tokens
@@ -1122,7 +1163,7 @@ class ReActLoop:
                         if full_content:
                             response.message.content = full_content
                     else:
-                        response = await self._llm.complete(
+                        response = await self._complete_with_retry(
                             CompletionRequest(
                                 messages=messages,
                                 tools=self._tools.get_definitions(),
@@ -1130,6 +1171,23 @@ class ReActLoop:
                                 max_tokens=self._config.max_tokens_per_response,
                             )
                         )
+                except ollama.ResponseError as exc:
+                    # _complete_with_retry already exhausted its own budget
+                    # (the streaming path has no retry -- see that method's
+                    # docstring) -- this is not a step failure for
+                    # RetryManager to judge, it's the backend itself unable
+                    # to produce a response at all. Fail this run cleanly
+                    # instead of propagating an uncaught exception that
+                    # kills the whole process and loses every step of
+                    # progress made so far; `finally: self._save_conversation`
+                    # below still runs either way.
+                    logger.error("LLM backend call failed and exhausted retries: %s", exc)
+                    return self._make_result(
+                        plan=plan,
+                        steps_taken=steps_taken,
+                        message=f"The LLM backend failed and could not recover: {exc}",
+                        success=False,
+                    )
                 finally:
                     self._ui.on_llm_end()
                 if response is None:

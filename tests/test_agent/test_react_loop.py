@@ -306,6 +306,87 @@ class TestReActLoopRun:
         assert result.success is True
 
     @pytest.mark.asyncio
+    async def test_transient_backend_error_is_retried_not_crashed(self, monkeypatch):
+        """A backend-side hiccup (e.g. Ollama's own tool-call parser
+        choking mid-generation, surfaced as `ollama.ResponseError` -- see
+        `.chef-human`-adjacent benchmark run 20260821-015500, `qwen3.5 tool
+        call parsing failed error=EOF` -> HTTP 500) must not tear down the
+        whole run. Before the fix, `_execute`'s LLM-call site had no except
+        around `self._llm.complete()`, so this exception propagated straight
+        out of `run()` uncaught, killing the process and losing every step
+        of progress made so far in a real 20+ minute run."""
+        import ollama
+
+        monkeypatch.setattr(
+            "chef_human.agent.react_loop.ReActLoop._LLM_CALL_RETRY_BACKOFF_SECONDS", 0.0
+        )
+        backend = _make_mock_backend()
+        finish_response = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "finish", "arguments": {"summary": "done"}}</tool_call>',
+            )
+        )
+        backend.complete = AsyncMock(
+            side_effect=[ollama.ResponseError("EOF", 500), finish_response, finish_response]
+        )
+        planner = _make_mock_planner()
+        plan = _make_default_plan()
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        finish_tool = MagicMock()
+        finish_tool.name = "finish"
+        finish_tool.parameters = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+        }
+        finish_tool.run = AsyncMock(
+            return_value=MagicMock(output="Task complete: done", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"finish": finish_tool}.get(name)
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+        )
+        result = await loop.run("do something")
+
+        assert result.success is True
+        assert backend.complete.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_backend_error_exhausting_retries_fails_gracefully(self, monkeypatch):
+        """When every retry attempt also fails, the run must end with a
+        clean `AgentResult(success=False)`, not an uncaught exception."""
+        import ollama
+
+        monkeypatch.setattr(
+            "chef_human.agent.react_loop.ReActLoop._LLM_CALL_RETRY_BACKOFF_SECONDS", 0.0
+        )
+        backend = _make_mock_backend()
+        backend.complete = AsyncMock(side_effect=ollama.ResponseError("EOF", 500))
+        planner = _make_mock_planner()
+        plan = _make_default_plan()
+        planner.generate_plan.return_value = plan
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+        )
+        result = await loop.run("do something")
+
+        assert result.success is False
+        assert "EOF" in result.message
+        assert backend.complete.await_count == loop._LLM_CALL_MAX_ATTEMPTS
+
+    @pytest.mark.asyncio
     async def test_lint_runs_after_write_and_appends_result(self):
         """Lint runs automatically after successful write tool call."""
         backend = _make_mock_backend()

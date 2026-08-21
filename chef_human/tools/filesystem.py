@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import fnmatch
 import re
@@ -19,6 +20,8 @@ if TYPE_CHECKING:
 class ReadTool:
     name = "read"
     description = "Read file contents with optional line range"
+    MAX_OUTPUT_BYTES = 10 * 1024
+    MAX_SYMBOL_MAP_BYTES = 3 * 1024
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -36,6 +39,99 @@ class ReadTool:
     ) -> None:
         self._workspace = workspace
         self._file_context = file_context
+
+    @staticmethod
+    def _truncate_to_bytes(text: str, limit_bytes: int) -> str:
+        encoded = text.encode("utf-8")
+        if len(encoded) <= limit_bytes:
+            return text
+        truncated = encoded[:limit_bytes]
+        return truncated.decode("utf-8", errors="ignore")
+
+    @staticmethod
+    def _selected_line_span(offset: int, line_count: int) -> tuple[int, int]:
+        if line_count <= 0:
+            return offset, offset
+        start = max(offset, 1)
+        end = start + line_count - 1
+        return start, end
+
+    @staticmethod
+    def _node_kind(node: ast.AST) -> str:
+        if isinstance(node, ast.AsyncFunctionDef):
+            return "async def"
+        if isinstance(node, ast.FunctionDef):
+            return "def"
+        return "class"
+
+    @staticmethod
+    def _symbol_rank(node: ast.AST, lineno: int, name: str) -> tuple[int, int, int, str]:
+        kind_rank = 0 if isinstance(node, ast.ClassDef) else 1
+        visibility_rank = 1 if name.startswith("_") else 0
+        return (kind_rank, visibility_rank, lineno, name)
+
+    def _python_symbol_map(self, text: str, start_line: int, end_line: int) -> str:
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return "Symbol map: unavailable (file could not be parsed as Python).\n"
+
+        symbols: list[tuple[tuple[int, int, int, str], str]] = []
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            lineno = getattr(node, "lineno", None)
+            end_lineno = getattr(node, "end_lineno", lineno)
+            if lineno is None or end_lineno is None:
+                continue
+            if end_lineno < start_line or lineno > end_line:
+                continue
+            kind = self._node_kind(node)
+            docstring = ast.get_docstring(node)
+            line = f"- {kind} {node.name} @ lines {lineno}-{end_lineno}"
+            if docstring:
+                summary = docstring.splitlines()[0].strip()
+                if summary:
+                    line += f": {summary}"
+            symbols.append((self._symbol_rank(node, lineno, node.name), line))
+
+        if not symbols:
+            return "Symbol map: no Python functions/classes found in the selected range.\n"
+
+        entries = ["Top-level symbol map:"]
+        used = len("Top-level symbol map:\n".encode("utf-8"))
+        for _, line in sorted(symbols):
+            candidate = line + "\n"
+            candidate_bytes = len(candidate.encode("utf-8"))
+            if used + candidate_bytes > self.MAX_SYMBOL_MAP_BYTES:
+                break
+            entries.append(line)
+            used += candidate_bytes
+        return "\n".join(entries) + "\n"
+
+    def _build_truncated_output(
+        self,
+        path: str,
+        output: str,
+        offset: int,
+        line_count: int,
+    ) -> str:
+        start_line, end_line = self._selected_line_span(offset, line_count)
+        header = (
+            f"[read output truncated to {self.MAX_OUTPUT_BYTES} bytes]\n"
+            f"Path: {path}\n"
+            f"Selected lines: {start_line}-{end_line}\n"
+            f"Original selected size: {len(output.encode('utf-8'))} bytes\n"
+        )
+        symbol_map = self._python_symbol_map(output, start_line, end_line)
+        prelude = header + symbol_map + "\nExcerpt:\n"
+        remaining = self.MAX_OUTPUT_BYTES - len(prelude.encode("utf-8")) - len("\n".encode("utf-8"))
+        if remaining <= 0:
+            return self._truncate_to_bytes(prelude, self.MAX_OUTPUT_BYTES)
+        excerpt = self._truncate_to_bytes(output, remaining)
+        if not excerpt.endswith("\n"):
+            excerpt += "\n"
+        return prelude + excerpt
 
     async def run(self, path: str, offset: int = 1, limit: int | None = None) -> ToolResult:
         resolved = self._workspace.resolve(path)
@@ -77,6 +173,8 @@ class ReadTool:
         output = "".join(selected)
         if not output.endswith("\n"):
             output += "\n"
+        if len(output.encode("utf-8")) > self.MAX_OUTPUT_BYTES:
+            output = self._build_truncated_output(path, output, offset, len(selected))
 
         return ToolResult(output=output)
 

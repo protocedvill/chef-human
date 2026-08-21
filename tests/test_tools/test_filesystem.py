@@ -102,6 +102,57 @@ class TestReadTool:
         assert result.success
         assert "line1" in result.output
 
+    async def test_large_read_is_capped_to_10kb(self, read_tool, tmp_path):
+        content = ("0123456789abcdef\n" * 900)
+        create_file(tmp_path, "big.txt", content)
+
+        result = await read_tool.run(path="big.txt")
+
+        assert result.success
+        assert len(result.output.encode("utf-8")) <= ReadTool.MAX_OUTPUT_BYTES
+        assert "[read output truncated to 10240 bytes]" in result.output
+        assert "Original selected size:" in result.output
+        assert "Excerpt:" in result.output
+
+    async def test_large_python_read_includes_symbol_map(self, read_tool, tmp_path):
+        prefix = '"""module doc"""\n\n'
+        functions = []
+        for i in range(80):
+            functions.append(
+                f"def func_{i}():\n"
+                f'    """Function {i} doc."""\n'
+                f'    return "{("x" * 120)}"\n\n'
+            )
+        create_file(tmp_path, "big_module.py", prefix + "".join(functions))
+
+        result = await read_tool.run(path="big_module.py")
+
+        assert result.success
+        assert len(result.output.encode("utf-8")) <= ReadTool.MAX_OUTPUT_BYTES
+        assert "Top-level symbol map:" in result.output
+        assert "- def func_0 @ lines" in result.output
+        assert "Function 0 doc." in result.output
+
+    async def test_large_python_read_limits_symbol_map_budget(self, read_tool, tmp_path):
+        functions = []
+        for i in range(200):
+            functions.append(
+                f"class PublicClass{i}:\n"
+                f'    """Public class {i} summary that is intentionally verbose."""\n'
+                "    pass\n\n"
+            )
+        create_file(tmp_path, "huge_symbols.py", "".join(functions))
+
+        result = await read_tool.run(path="huge_symbols.py")
+
+        assert result.success
+        symbol_start = result.output.index("Top-level symbol map:\n")
+        excerpt_start = result.output.index("\nExcerpt:\n")
+        symbol_map = result.output[symbol_start:excerpt_start]
+        excerpt = result.output[excerpt_start + len("\nExcerpt:\n") :]
+        assert len(symbol_map.encode("utf-8")) <= ReadTool.MAX_SYMBOL_MAP_BYTES
+        assert len(excerpt.encode("utf-8")) > len(symbol_map.encode("utf-8"))
+
 
 # ---------------------------------------------------------------------------
 # WriteTool

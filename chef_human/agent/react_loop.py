@@ -1604,6 +1604,43 @@ class ReActLoop:
                     # asynchronous; only a single response batch is
                     # serialized at this safety boundary.
                     for tc, tool in parallel_candidates:
+                        if (
+                            tc.name in ("write", "edit", "patch")
+                            and current is not None
+                            and _looks_investigative(current.description)
+                            and not _looks_like_file_mutation_step(current.description)
+                        ):
+                            # Reproduces a real benchmark run: mid-"explore
+                            # the firmware/ directory" (purely investigative,
+                            # no mutation verb), the model's only tool call
+                            # was `write`, creating an entire Flask app
+                            # nobody had asked for yet, before any design
+                            # decision had actually been made. Dispatch here
+                            # used to be unconditional -- nothing scoped tool
+                            # calls to what the current step was actually
+                            # about. A step that *also* reads as a mutation
+                            # (e.g. "review and fix the bug in foo.py") is
+                            # exempted, same reasoning as the reasoning-only
+                            # mutation-stall guard's identical exemption
+                            # above.
+                            logger.info(
+                                "Blocked %s during investigative step %r",
+                                tc.name, current.description,
+                            )
+                            result = self._make_tool_error(
+                                f"The current step ('{current.description}') is "
+                                "investigative -- you're still gathering evidence, not "
+                                "implementing yet. Finish investigating (and, if this "
+                                "reveals a design decision you can't make yet, use a "
+                                "checkpoint) before writing or editing files. If you "
+                                "believe this step should include making a change, say "
+                                "so in your next step's wording instead of writing here."
+                            )
+                            self._ui.on_tool_result(tc.name, result)
+                            tool_results.append(result)
+                            failed_calls += 1
+                            continue
+
                         policy = get_tool_policy(tc.name)
                         if (
                             self._config.require_read_before_edit

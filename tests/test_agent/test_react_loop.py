@@ -4905,6 +4905,103 @@ def _make_loop_with_mocks() -> ReActLoop:
     )
 
 
+class TestInvestigativeStepMutationGuard:
+    """Reproduces a real benchmark run (vague_feature_request_real_repo,
+    workspace 20260821-015500): while the current step was 'Explore the
+    firmware/ directory to understand the hardware communication layer'
+    (purely investigative, no mutation verb), the model's only tool call
+    that turn was `write` -- creating a ~400-line Flask app nobody had
+    asked for yet, before any design decision (checkpoint or otherwise)
+    had actually settled on an architecture. `_execute`'s dispatch loop had
+    no guard scoping tool calls to the current step's own goal, so it ran
+    unconditionally. Later in that same run, the checkpoint mechanism
+    properly resolved to a *different* architecture (C + libwebsockets),
+    leaving two contradictory half-implementations on disk.
+
+    A step that also reads as a legitimate mutation (matches
+    `_looks_like_file_mutation_step`, e.g. "Review and fix the bug in
+    foo.py") is deliberately exempted -- this guard only fires when the
+    step is investigative *and nothing else*, mirroring the same
+    exemption `_execute`'s reasoning-only mutation-stall guard already
+    uses for the identical reason (see the comment above that guard about
+    "implementation" matching inside "understand the current
+    implementation")."""
+
+    @staticmethod
+    def _make_write_call_setup(step_description: str):
+        backend = _make_mock_backend()
+        backend.complete.return_value = CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content='<tool_call>{"name": "write", "arguments": '
+                '{"path": "host/web/app.py", "content": "flask app"}}</tool_call>',
+            )
+        )
+        planner = _make_mock_planner()
+        planner.generate_plan.return_value = Plan(
+            goal="Add a web interface",
+            steps=[PlanNode(index=1, description=step_description, status=StepStatus.pending)],
+        )
+        context = _make_mock_context()
+        registry = _make_mock_tool_registry()
+        write_tool = MagicMock()
+        write_tool.name = "write"
+        write_tool.parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        }
+        write_tool.run = AsyncMock(
+            return_value=MagicMock(output="wrote host/web/app.py", success=True, error=None)
+        )
+        registry.get.side_effect = lambda name: {"write": write_tool}.get(name)
+        loop = ReActLoop(
+            llm_backend=backend,
+            tool_registry=registry,
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(max_steps=1),
+        )
+        return loop, write_tool, context
+
+    @pytest.mark.asyncio
+    async def test_write_during_purely_investigative_step_is_blocked(self):
+        loop, write_tool, context = self._make_write_call_setup(
+            "Explore the firmware/ directory to understand the hardware "
+            "communication layer"
+        )
+        await loop.run("Add a web interface")
+
+        write_tool.run.assert_not_awaited()
+        tool_msgs = [
+            c.args[0].content
+            for c in context.conversation.add_message.call_args_list
+            if c.args[0].role == Role.tool
+        ]
+        assert any("investigat" in m.lower() for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_write_on_step_that_also_reads_as_mutation_is_allowed(self):
+        """A step that names a mutation verb alongside investigative
+        language (e.g. "review and update") is not blocked -- only a step
+        that is investigative-only gets this guard."""
+        loop, write_tool, context = self._make_write_call_setup(
+            "Review app.py and update the login handler"
+        )
+        await loop.run("Add a web interface")
+
+        write_tool.run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_write_on_non_investigative_step_is_allowed(self):
+        loop, write_tool, context = self._make_write_call_setup(
+            "Write the Flask application to host/web/app.py"
+        )
+        await loop.run("Add a web interface")
+
+        write_tool.run.assert_awaited_once()
+
+
 class TestLooksInvestigative:
     def test_read_step(self):
         from chef_human.agent.react_loop import _looks_investigative

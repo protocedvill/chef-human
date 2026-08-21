@@ -18,6 +18,7 @@ from chef_human.tools.lookup_symbol import LookupSymbolTool
 from chef_human.tools.patch_tool import PatchTool
 from chef_human.tools.redo import RedoTool
 from chef_human.tools.refactor import RefactorTool
+from chef_human.tools.replan import RequestReplanTool
 from chef_human.tools.reference_finder import ReferenceFinderTool
 from chef_human.tools.registry import ToolRegistry, ToolResult
 from chef_human.tools.shell import BashTool
@@ -53,6 +54,7 @@ def create_tool_registry(
     registry.register(ReadTool(workspace, file_context=file_context))
     registry.register(PatchTool(workspace, diff_store=diff_store))
     registry.register(RedoTool(workspace, diff_store=diff_store))
+    registry.register(RequestReplanTool())
     registry.register(UndoTool(workspace, diff_store=diff_store))
     registry.register(ViewDiffTool(diff_store=diff_store))
     registry.register(WriteTool(workspace, diff_store=diff_store, file_context=file_context))

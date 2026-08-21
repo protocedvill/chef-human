@@ -16,6 +16,13 @@ class ToolResult:
     success: bool = True
     output: str = ""
     error: str | None = None
+    # Machine-distinct marker for control-plane actions (e.g. request_replan).
+    # Ordinary work-plane tools leave this False and the loop treats `output`
+    # as the model-facing text. When True, `control_payload` carries the
+    # structured fields the loop branches on, so the decision never depends on
+    # parsing prose out of `output`.
+    control: bool = False
+    control_payload: dict[str, Any] | None = None
 
 
 class MutationScope(str, Enum):
@@ -69,6 +76,11 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     ),
     "find_references": ToolPolicy(),
     "goto_definition": ToolPolicy(),
+    # request_replan is a control-plane action: it mutates nothing in the repo
+    # (the loop owns the plan mutation it triggers), so it is non-mutating and
+    # carries no read requirement. Explicit entry so the step verifier treats
+    # it as a control signal, not a silent unclassified tool.
+    "request_replan": ToolPolicy(),
 }
 
 

@@ -6,7 +6,7 @@ without yet changing plan behavior.
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] The acting model can emit a real `request_replan` tool call with `reason` and `evidence_summary`
 - [ ] The tool returns a structured acknowledgment result rather than plain prose

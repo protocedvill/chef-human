@@ -5,7 +5,7 @@ from ordinary failure, skipping, and pending work.
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] Plan nodes can represent an explicit `invalidated` status
 - [ ] The new status is treated distinctly from `failed` throughout the in-memory plan model

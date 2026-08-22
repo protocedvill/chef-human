@@ -18,6 +18,9 @@ _STATUS_ICONS = {
     StepStatus.completed: "✓",
     StepStatus.failed: "✗",
     StepStatus.skipped: "–",
+    # Ticket 04: superseded by evidence -- must not fall back to the
+    # pending glyph ("○") or it reads as unstarted work.
+    StepStatus.invalidated: "⊘",
 }
 
 

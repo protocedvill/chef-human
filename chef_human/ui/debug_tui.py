@@ -32,6 +32,9 @@ _STATUS_STYLES = {
     StepStatus.completed: "green",
     StepStatus.failed: "bold red",
     StepStatus.skipped: "dim white",
+    # Ticket 04: distinct from `failed` on purpose -- invalidated means
+    # "superseded by better evidence", not "execution failed".
+    StepStatus.invalidated: "bold magenta",
 }
 
 

@@ -266,3 +266,10 @@ class TestReplUIStatusIcons:
         assert ui._status_icon("failed") == "✗"
         assert ui._status_icon("skipped") == "–"
         assert ui._status_icon("unknown") == "○"
+
+    def test_invalidated_icon_is_distinct(self, ui):
+        """Ticket 04: `invalidated` must have its own glyph in the REPL too --
+        never the pending fallback ("○") and never the failed glyph, so a
+        superseded node doesn't read as unstarted or broken work."""
+        assert ui._status_icon("invalidated") == "⊘"
+        assert ui._status_icon("invalidated") not in ("○", "✗")

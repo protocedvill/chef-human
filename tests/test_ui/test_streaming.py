@@ -219,3 +219,10 @@ class TestStreamingUIStatusIcons:
         assert ui._get_icon(StepStatus.completed) == "✓"
         assert ui._get_icon(StepStatus.failed) == "✗"
         assert ui._get_icon(StepStatus.skipped) == "–"
+        # `invalidated` must have its own glyph -- never the fallback
+        # `○` (which would make it look like pending work) and never the
+        # `failed` glyph.
+        assert ui._get_icon(StepStatus.invalidated) not in ("○", "✗")
+
+    def test_invalidated_icon_is_stable_and_distinct(self, ui):
+        assert ui._get_icon(StepStatus.invalidated) == "⊘"

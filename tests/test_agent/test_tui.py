@@ -231,6 +231,14 @@ class TestPlanColoring:
         assert _STATUS_STYLES[StepStatus.failed] == "bold red"
         assert _STATUS_STYLES[StepStatus.skipped] == "dim white"
 
+    def test_invalidated_step_style_is_distinct_from_failed(self):
+        """Ticket 04: the debug TUI must not render an invalidated node in
+        the same color as a failed one -- the two statuses mean different
+        things (superseded by evidence vs. execution failure)."""
+        from chef_human.ui.debug_tui import _STATUS_STYLES
+        assert StepStatus.invalidated in _STATUS_STYLES
+        assert _STATUS_STYLES[StepStatus.invalidated] != _STATUS_STYLES[StepStatus.failed]
+
     def test_render_plan_uses_color(self, tui):
         plan = Plan(
             goal="Test",

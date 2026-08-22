@@ -23,6 +23,7 @@ class TestStepStatus:
         assert StepStatus.completed.value == "completed"
         assert StepStatus.failed.value == "failed"
         assert StepStatus.skipped.value == "skipped"
+        assert StepStatus.invalidated.value == "invalidated"
 
     def test_is_string_enum(self):
         assert isinstance(StepStatus.pending, str)
@@ -38,6 +39,30 @@ class TestPlanNode:
     def test_custom_status(self):
         step = PlanNode(index=2, description="Done", status=StepStatus.completed)
         assert step.status == StepStatus.completed
+
+    def test_invalidated_status_is_representable_and_distinct(self):
+        """`invalidated` is a first-class status a node can carry (ticket 04),
+        distinct from `failed` -- the plan can express "superseded by better
+        evidence" without overloading the ordinary failure status."""
+        invalidated = PlanNode(index=1, description="Stale step", status=StepStatus.invalidated)
+        assert invalidated.status is StepStatus.invalidated
+        assert invalidated.status is not StepStatus.failed
+        assert invalidated.status != StepStatus.failed
+        assert invalidated.status != StepStatus.skipped
+        assert invalidated.status != StepStatus.pending
+        # A failed node is not an invalidated node and vice versa -- the
+        # distinction survives equality, not just membership.
+        failed = PlanNode(index=1, description="Stale step", status=StepStatus.failed)
+        assert invalidated != failed
+
+    def test_invalidated_serializes_to_dict_and_round_trips(self):
+        """The status must survive the plan's {goal, steps} serialization
+        (benchmark traces, plan persistence) as its plain string value --
+        old loaders see a string they can parse; new code gets the enum back."""
+        node = PlanNode(index=1, description="Superseded", status=StepStatus.invalidated)
+        payload = node.to_dict()
+        assert payload["status"] == "invalidated"
+        assert StepStatus(payload["status"]) is StepStatus.invalidated
 
     def test_identity_is_node_id_not_description(self):
         """Two separately-created nodes are distinct even with identical
@@ -247,6 +272,102 @@ class TestCurrentStep:
 
         branch_1.status = StepStatus.completed
         assert plan.is_complete()
+
+
+class TestInvalidatedStatusInPlanModel:
+    """Ticket 04: with `invalidated` present in the status model, the
+    plan's status-inspecting operations must stay coherent -- an
+    invalidated node is *not* pending work (the loop must not re-execute
+    it on its own), *not* completed (it blocks completion), and distinct
+    from `failed` everywhere the model distinguishes statuses."""
+
+    def test_invalidated_leaf_is_not_the_current_leaf(self):
+        plan = Plan(goal="g", steps=[
+            PlanNode(index=1, description="stale", status=StepStatus.invalidated),
+            PlanNode(index=2, description="next", status=StepStatus.pending),
+        ])
+        current = plan.current_leaf()
+        assert current is not None
+        assert current.description == "next"
+
+    def test_all_invalidated_plan_has_no_current_leaf(self):
+        plan = Plan(goal="g", steps=[
+            PlanNode(index=1, description="stale", status=StepStatus.invalidated),
+        ])
+        assert plan.current_leaf() is None
+
+    def test_invalidated_leaf_blocks_completion_and_is_unresolved(self):
+        plan = Plan(goal="g", steps=[
+            PlanNode(index=1, description="done", status=StepStatus.completed),
+            PlanNode(index=2, description="stale", status=StepStatus.invalidated),
+        ])
+        assert not plan.is_complete()
+        assert plan.unresolved_steps() == [plan.steps[1]]
+
+    def test_invalidated_branch_blocks_completion_even_with_completed_children(self):
+        """Like `failed`, an invalidated branch counts as unresolved -- an
+        invalidated subtree is superseded work, not a finished one, so the
+        plan cannot be reported complete while it still holds invalidated
+        nodes awaiting the evidence-driven replan that replaces them."""
+        child = PlanNode(description="child", status=StepStatus.completed)
+        branch = PlanNode(description="branch", status=StepStatus.invalidated)
+        branch.set_children([child])
+        plan = Plan(goal="g", steps=[branch])
+        assert not plan.is_complete()
+        assert branch in plan.unresolved_steps()
+
+    def test_invalidated_branch_is_not_ready_for_rollup(self):
+        child = PlanNode(description="child", status=StepStatus.completed)
+        branch = PlanNode(description="branch", status=StepStatus.invalidated)
+        branch.set_children([child])
+        plan = Plan(goal="g", steps=[branch])
+        assert plan.ready_rollup_branches() == []
+
+    @pytest.mark.asyncio
+    async def test_update_plan_treats_invalidated_step_as_not_completed(self):
+        """Whole-plan replan: an invalidated node must be offered for
+        continuation (it is not completed work to preserve) and a revised
+        step tagging it with `continues_node_id` must carry its identity
+        forward -- same treatment as any other non-completed node."""
+        invalidated = PlanNode(index=1, description="Stale read", status=StepStatus.invalidated)
+        original_id = invalidated.node_id
+        plan = Plan(goal="g", steps=[invalidated])
+
+        mock_complete = AsyncMock(return_value=CompletionResponse(
+            message=Message(
+                role=Role.assistant,
+                content=json.dumps([
+                    {
+                        "description": "Read the real protocol module",
+                        "continues_node_id": original_id,
+                    }
+                ]),
+            ),
+        ))
+        mock_llm = MagicMock()
+        mock_llm.complete = mock_complete
+
+        planner = Planner(mock_llm)
+        revised = await planner.update_plan(plan, failure_context="evidence contradicts step")
+
+        assert len(revised.steps) == 1
+        assert revised.steps[0].node_id == original_id
+        assert revised.steps[0].status == StepStatus.pending
+
+    @pytest.mark.asyncio
+    async def test_update_plan_does_not_preserve_invalidated_step_automatically(self):
+        """Unlike `completed` steps (kept as-is), an invalidated step is not
+        automatically carried into the revised plan -- its old wording is
+        superseded; it survives only via an explicit `continues_node_id`."""
+        plan = Plan(goal="g", steps=[
+            PlanNode(index=1, description="Stale read", status=StepStatus.invalidated),
+        ])
+        mock_llm = _make_mock_backend([
+            PlanNode(index=1, description="Fresh read"),
+        ])
+        planner = Planner(mock_llm)
+        revised = await planner.update_plan(plan, failure_context="x")
+        assert [s.description for s in revised.steps] == ["Fresh read"]
 
 
 class TestParseSteps:
@@ -491,6 +612,7 @@ class TestFormatPlanForPrompt:
             PlanNode(index=3, description="C", status=StepStatus.completed),
             PlanNode(index=4, description="F", status=StepStatus.failed),
             PlanNode(index=5, description="S", status=StepStatus.skipped),
+            PlanNode(index=6, description="V", status=StepStatus.invalidated),
         ]
         plan = Plan(goal="test", steps=steps)
         result = Planner.format_plan_for_prompt(plan)
@@ -499,6 +621,13 @@ class TestFormatPlanForPrompt:
         assert "[✓]" in result
         assert "[✗]" in result
         assert "[-]" in result
+        # `invalidated` gets its own marker, distinct from `failed`'s --
+        # the prompt render must not conflate the two.
+        assert "[⊘]" in result
+
+    def test_invalidated_marker_differs_from_failed(self):
+        assert Planner._STATUS_MARKERS[StepStatus.invalidated] != Planner._STATUS_MARKERS[StepStatus.failed]
+        assert StepStatus.invalidated in Planner._STATUS_MARKERS
 
 
 class TestFormatPlanForPromptTreeAware:

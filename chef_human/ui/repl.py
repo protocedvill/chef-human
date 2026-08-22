@@ -26,6 +26,9 @@ class ReplUI:
             "completed": "✓",
             "failed": "✗",
             "skipped": "–",
+            # Ticket 04: superseded by evidence -- must not fall back to the
+            # pending glyph ("○") or it reads as unstarted work.
+            "invalidated": "⊘",
         }
         return icons.get(status, "○")
 

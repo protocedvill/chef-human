@@ -47,6 +47,14 @@ class StepStatus(str, Enum):
     completed = "completed"
     failed = "failed"
     skipped = "skipped"
+    # Evidence-driven invalidation (spec: evidence-driven-subtree-replan,
+    # ticket 04): the node's subtree was discarded because fresh source
+    # evidence disproved its assumptions -- distinct from `failed`
+    # (execution/verification failure), `skipped` (budget exhaustion), and
+    # `pending` (not yet worked). A node in this state is not pending work
+    # (the loop must not re-execute it) and not completed (it blocks
+    # completion until the evidence-driven replan replaces it).
+    invalidated = "invalidated"
 
 
 class StepVerdict(str, Enum):
@@ -293,11 +301,15 @@ class Plan:
         """Branches whose children are all complete but that haven't
         themselves passed rollup verification yet, post-order. A tree shape
         alone is never proof of completion -- each of these still needs a
-        rollup verification call before it can be marked complete."""
+        rollup verification call before it can be marked complete.
+        `invalidated` branches are excluded: their subtree has been
+        superseded by evidence (ticket 04), so verifying the rollup of a
+        dead subtree is meaningless -- the evidence-driven replan that
+        replaces it decides the branch's fate, not a rollup call."""
         return [
             branch
             for branch in self._branches()
-            if branch.status != StepStatus.completed
+            if branch.status not in (StepStatus.completed, StepStatus.invalidated)
             and all(child.status == StepStatus.completed for child in branch.children)
         ]
 
@@ -1357,6 +1369,7 @@ class Planner:
         StepStatus.completed: "[✓]",
         StepStatus.failed: "[✗]",
         StepStatus.skipped: "[-]",
+        StepStatus.invalidated: "[⊘]",
     }
 
     @staticmethod

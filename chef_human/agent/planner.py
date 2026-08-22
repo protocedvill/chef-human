@@ -188,11 +188,20 @@ class PlanNode:
             child.parent = self
 
     def to_dict(self) -> dict:
+        """Serializes the node's live-tree fields. `node_id` is included so
+        the stable identity survives plan persistence and benchmark/replay
+        round trips (ticket 06): a reloaded plan can keep its archived
+        subtree entries -- which are keyed by `node_id` -- linked to the
+        nodes they describe. It is an *additive* field; older consumers
+        that only read `index`/`description`/`status`/`type`/`children` are
+        unaffected by its presence, and `Plan.from_dict` treats it as
+        optional so pre-feature documents still load."""
         payload = {
             "index": self.index,
             "description": self.description,
             "status": self.status.value,
             "type": self.declared_type,
+            "node_id": self.node_id,
         }
         if self.children:
             payload["children"] = [child.to_dict() for child in self.children]
@@ -259,6 +268,38 @@ class ArchivedSubtree:
         if self.history:
             payload["history"] = [entry.to_dict() for entry in self.history]
         return payload
+
+    @classmethod
+    def _from_dict(cls, data: dict[str, Any]) -> "ArchivedSubtree | None":
+        """Rebuilds one archive entry from its serialized form (ticket 06).
+        Returns None when the entry is not usable -- no recognizable
+        `node_id` -- so a hand-edited or partially written document degrades
+        to dropping the bad entry instead of crashing the whole plan load.
+        `children`/`history` are recursed through the same lenient rules,
+        and non-dict items in either list are ignored."""
+        node_id = data.get("node_id")
+        if not isinstance(node_id, str) or not node_id:
+            return None
+        children = [
+            Plan._node_from_dict(child)
+            for child in data.get("children", [])
+            if isinstance(child, dict)
+        ]
+        history = [
+            entry
+            for entry in (
+                cls._from_dict(item) for item in data.get("history", [])
+                if isinstance(item, dict)
+            )
+            if entry is not None
+        ]
+        return cls(
+            node_id=node_id,
+            children=children,
+            reason=str(data.get("reason") or ""),
+            evidence_summary=str(data.get("evidence_summary") or ""),
+            history=history,
+        )
 
 
 class Plan:
@@ -363,6 +404,81 @@ class Plan:
                 for node_id, entry in self.archived_nodes.items()
             }
         return payload
+
+    @staticmethod
+    def _node_from_dict(data: dict[str, Any]) -> PlanNode:
+        """Rebuilds one live-tree node from its serialized form (ticket 06).
+        Lenient by design -- this is the load half of backward-compatible
+        persistence: every field except `description` is optional, an
+        unknown `status` value falls back to `pending` rather than raising
+        (so a document from a newer build with a not-yet-known status still
+        loads), and a missing/blank `node_id` gets a fresh stable identity.
+        `children` are rebuilt recursively and re-linked via
+        `set_children` so the loaded tree is executable (parent pointers
+        intact)."""
+        status_value = str(data.get("status") or "pending")
+        try:
+            status = StepStatus(status_value)
+        except ValueError:
+            logger.debug(
+                "Plan._node_from_dict: unknown status %r on step %r -- "
+                "loading as pending",
+                status_value,
+                data.get("description"),
+            )
+            status = StepStatus.pending
+        node_id = data.get("node_id")
+        kwargs: dict[str, Any] = {
+            "index": int(data.get("index") or 0),
+            "description": str(data.get("description") or ""),
+            "status": status,
+            "declared_type": str(data.get("type") or "leaf"),
+        }
+        if isinstance(node_id, str) and node_id:
+            kwargs["node_id"] = node_id
+        node = PlanNode(**kwargs)
+        children = [
+            Plan._node_from_dict(child) for child in data.get("children", [])
+            if isinstance(child, dict)
+        ]
+        if children:
+            node.set_children(children)
+        return node
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Plan":
+        """Rebuilds a `Plan` from the same `{goal, steps}` document
+        `to_dict()` produces -- the load half of backward-compatible
+        persistence (ticket 06).
+
+        Compatibility is one-directional and deliberate: every new field is
+        *optional* on the way in. A document written before the
+        invalidation feature (no `node_id` on steps, no `archived_subtrees`
+        top-level key) loads exactly as older consumers saw it -- fresh
+        stable identities are assigned where none were recorded. A document
+        that carries the new metadata round-trips it losslessly: `node_id`s
+        are restored (so archive entries keyed by node id stay linked to
+        their live nodes), the `invalidated` status comes back as the enum,
+        and the off-tree archive is rebuilt with its structure, reason
+        context, and multi-generation history. Malformed pieces degrade
+        instead of raising: unknown status strings fall back to `pending`,
+        archive entries without a recognizable `node_id` are dropped, and
+        non-dict children are ignored."""
+        steps = [
+            Plan._node_from_dict(step)
+            for step in data.get("steps", [])
+            if isinstance(step, dict)
+        ]
+        plan = cls(goal=str(data.get("goal") or ""), steps=steps)
+        archive = data.get("archived_subtrees")
+        if isinstance(archive, dict):
+            for node_id, entry_data in archive.items():
+                if not isinstance(entry_data, dict):
+                    continue
+                entry = ArchivedSubtree._from_dict(entry_data)
+                if entry is not None:
+                    plan.archived_nodes[entry.node_id] = entry
+        return plan
 
     @property
     def steps(self) -> list[PlanNode]:

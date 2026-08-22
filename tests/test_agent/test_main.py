@@ -602,8 +602,10 @@ class TestToDict:
         plan = Plan(
             goal="test goal",
             steps=[
-                PlanNode(index=1, description="step one", status=StepStatus.completed),
-                PlanNode(index=2, description="step two", status=StepStatus.pending),
+                PlanNode(index=1, description="step one", status=StepStatus.completed,
+                         node_id="aaa1"),
+                PlanNode(index=2, description="step two", status=StepStatus.pending,
+                         node_id="aaa2"),
             ],
         )
         result = AgentResult(
@@ -627,12 +629,14 @@ class TestToDict:
                         "description": "step one",
                         "status": "completed",
                         "type": "leaf",
+                        "node_id": "aaa1",
                     },
                     {
                         "index": 2,
                         "description": "step two",
                         "status": "pending",
                         "type": "leaf",
+                        "node_id": "aaa2",
                     },
                 ],
             },
@@ -643,8 +647,10 @@ class TestToDict:
         plan = Plan(
             goal="my goal",
             steps=[
-                PlanNode(index=1, description="first", status=StepStatus.completed),
-                PlanNode(index=2, description="second", status=StepStatus.pending),
+                PlanNode(index=1, description="first", status=StepStatus.completed,
+                         node_id="bbb1"),
+                PlanNode(index=2, description="second", status=StepStatus.pending,
+                         node_id="bbb2"),
             ],
         )
         d = plan.to_dict()
@@ -656,41 +662,63 @@ class TestToDict:
                     "description": "first",
                     "status": "completed",
                     "type": "leaf",
+                    "node_id": "bbb1",
                 },
                 {
                     "index": 2,
                     "description": "second",
                     "status": "pending",
                     "type": "leaf",
+                    "node_id": "bbb2",
                 },
             ],
         }
 
+    def test_plan_to_dict_round_trips_node_id_through_from_dict(self):
+        """Ticket 06: the stable identity rides along with the serialized
+        payload so a reloaded plan (plan persistence, benchmark/replay
+        loaders) keeps its node ids -- archive entries keyed by node_id
+        stay linked to their live nodes."""
+        plan = Plan(
+            goal="my goal",
+            steps=[PlanNode(index=1, description="first", node_id="ccc1")],
+        )
+        reloaded = Plan.from_dict(plan.to_dict())
+        assert reloaded.steps[0].node_id == "ccc1"
+        assert reloaded.to_dict() == plan.to_dict()
+
     def test_plan_step_to_dict(self):
-        step = PlanNode(index=1, description="do something", status=StepStatus.in_progress)
+        step = PlanNode(index=1, description="do something", status=StepStatus.in_progress,
+                        node_id="ddd1")
         d = step.to_dict()
         assert d == {
             "index": 1,
             "description": "do something",
             "status": "in_progress",
             "type": "leaf",
+            "node_id": "ddd1",
         }
 
     def test_branch_step_to_dict_includes_children(self):
-        step = PlanNode(index=1, description="do something bigger", status=StepStatus.pending)
-        step.set_children([PlanNode(index=1, description="first child")])
+        step = PlanNode(index=1, description="do something bigger", status=StepStatus.pending,
+                        node_id="eee1")
+        step.set_children(
+            [PlanNode(index=1, description="first child", node_id="eee2")]
+        )
 
         assert step.to_dict() == {
             "index": 1,
             "description": "do something bigger",
             "status": "pending",
             "type": "leaf",
+            "node_id": "eee1",
             "children": [
                 {
                     "index": 1,
                     "description": "first child",
                     "status": "pending",
                     "type": "leaf",
+                    "node_id": "eee2",
                 }
             ],
         }
@@ -701,6 +729,7 @@ class TestToDict:
             description="Explore the repo first",
             status=StepStatus.pending,
             declared_type="checkpoint",
+            node_id="fff1",
         )
 
         assert step.to_dict() == {
@@ -708,11 +737,15 @@ class TestToDict:
             "description": "Explore the repo first",
             "status": "pending",
             "type": "checkpoint",
+            "node_id": "fff1",
         }
 
     def test_plan_to_dict_preserves_nested_children(self):
-        branch = PlanNode(index=1, description="Implement backend", declared_type="branch")
-        branch.set_children([PlanNode(index=1, description="Write server.py")])
+        branch = PlanNode(index=1, description="Implement backend", declared_type="branch",
+                          node_id="ggg1")
+        branch.set_children(
+            [PlanNode(index=1, description="Write server.py", node_id="ggg2")]
+        )
         plan = Plan(goal="my goal", steps=[branch])
 
         assert plan.to_dict() == {
@@ -723,12 +756,14 @@ class TestToDict:
                     "description": "Implement backend",
                     "status": "pending",
                     "type": "branch",
+                    "node_id": "ggg1",
                     "children": [
                         {
                             "index": 1,
                             "description": "Write server.py",
                             "status": "pending",
                             "type": "leaf",
+                            "node_id": "ggg2",
                         }
                     ],
                 }

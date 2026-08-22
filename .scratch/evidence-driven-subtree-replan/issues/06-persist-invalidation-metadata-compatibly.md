@@ -6,7 +6,7 @@ behavior.
 
 **Blocked by:** 04 (Add `invalidated` status to plan nodes), 05 (Add archived subtree history to the plan model).
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] The new status and archive metadata can be serialized without breaking the existing top-level plan contract
 - [ ] Older plan consumers that do not know about the new metadata continue to load plans safely

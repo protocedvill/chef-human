@@ -510,11 +510,14 @@ class TestArchivedSubtreeHistory:
 
     def test_plan_without_archives_serializes_identically_to_before(self):
         """Backward-compatibility at the model level: a plan that never
-        archived anything serializes exactly as it always did -- no new
-        empty field in the payload (older consumers see an unchanged
-        document)."""
+        archived anything carries no `archived_subtrees` key in the payload
+        (older consumers see the same document they always did -- they just
+        ignore the new optional per-step `node_id` field that ticket 06
+        adds so archive entries keyed by node id stay linked to their live
+        nodes after a round trip)."""
         plan = Plan(goal="g", steps=[PlanNode(index=1, description="do it")])
-        assert plan.to_dict() == {
+        payload = plan.to_dict()
+        assert payload == {
             "goal": "g",
             "steps": [
                 {
@@ -522,9 +525,11 @@ class TestArchivedSubtreeHistory:
                     "description": "do it",
                     "status": "pending",
                     "type": "leaf",
+                    "node_id": plan.steps[0].node_id,
                 }
             ],
         }
+        assert "archived_subtrees" not in payload
         assert plan.archived_nodes == {}
 
     @pytest.mark.asyncio
@@ -548,6 +553,183 @@ class TestArchivedSubtreeHistory:
             n.description for n in revised.archived_nodes[branch.node_id].children
         ]
         assert archived_children == [n.description for n in discarded]
+
+
+class TestPlanFromDict:
+    """Ticket 06: loading a serialized plan back into a `Plan` must be
+    backward-compatible *and* round-trip the new invalidation metadata.
+
+    The top-level `{goal, steps}` contract is unchanged, and every new field
+    (`node_id`, `archived_subtrees`) is optional: a document produced before
+    the invalidation feature (or by an older consumer that strips unknown
+    keys) loads exactly as before, while a document that carries the new
+    metadata loads it back losslessly so benchmark/replay loaders and plan
+    persistence can round-trip it."""
+
+    def test_old_document_without_new_metadata_loads_as_before(self):
+        """A pre-feature payload has no `node_id` on steps and no
+        `archived_subtrees` top-level field -- the loader must accept it
+        and build the same live tree older consumers saw."""
+        payload = {
+            "goal": "g",
+            "steps": [
+                {"index": 1, "description": "Read the README", "status": "completed"},
+                {
+                    "index": 2,
+                    "description": "Write the code",
+                    "status": "pending",
+                    "type": "branch",
+                    "children": [
+                        {"index": 1, "description": "Implement the helper"},
+                    ],
+                },
+            ],
+        }
+        plan = Plan.from_dict(payload)
+
+        assert plan.goal == "g"
+        assert [s.description for s in plan.steps] == [
+            "Read the README",
+            "Write the code",
+        ]
+        assert plan.steps[0].status is StepStatus.completed
+        assert plan.steps[1].status is StepStatus.pending
+        assert plan.steps[1].declared_type == "branch"
+        child = plan.steps[1].children[0]
+        assert child.parent is plan.steps[1]
+        # Fresh stable identities are assigned where none were recorded --
+        # the archive stays empty and nothing references a phantom id.
+        assert plan.archived_nodes == {}
+        assert all(n.node_id for n in plan.steps)
+
+    def test_node_id_is_restored_from_payload(self):
+        """Steps carrying a `node_id` keep that exact stable identity, so
+        archive entries keyed by node_id stay linked to their live nodes
+        after a round trip; steps without one get a fresh id."""
+        known_id = "a" * 32
+        payload = {
+            "goal": "g",
+            "steps": [
+                {"index": 1, "description": "Stale", "status": "invalidated",
+                 "node_id": known_id},
+                {"index": 2, "description": "Fresh"},
+            ],
+        }
+        plan = Plan.from_dict(payload)
+
+        assert plan.steps[0].node_id == known_id
+        assert plan.steps[1].node_id
+        assert plan.steps[1].node_id != known_id
+        # The new status loads as the enum, not just a bare string.
+        assert plan.steps[0].status is StepStatus.invalidated
+
+    def test_archived_subtrees_round_trip_with_history(self):
+        """The off-tree archive round-trips losslessly: keying by node_id,
+        the discarded structure (ids + statuses), the reason/evidence
+        context, and the multi-generation history chain."""
+        branch = PlanNode(index=1, description="Build the transport layer",
+                          status=StepStatus.invalidated)
+        first_gen = [
+            PlanNode(index=1, description="Assume a TCP socket protocol",
+                     status=StepStatus.completed),
+            PlanNode(index=2, description="Write the socket framing code",
+                     status=StepStatus.failed),
+        ]
+        second_gen = [
+            PlanNode(index=1, description="Use the length-prefixed UDP protocol",
+                     status=StepStatus.pending),
+        ]
+        plan = Plan(goal="g", steps=[branch])
+        plan.archive_subtree(branch, first_gen,
+                             reason="tcp framing disproved",
+                             evidence_summary="protocol.py:42")
+        plan.archive_subtree(branch, second_gen, reason="udp framing also stale")
+
+        reloaded = Plan.from_dict(plan.to_dict())
+
+        original = plan.archived_nodes[branch.node_id]
+        assert list(reloaded.archived_nodes) == [branch.node_id]
+        entry = reloaded.archived_nodes[branch.node_id]
+        assert entry.node_id == branch.node_id
+        # Lossless: the current generation keeps exactly the reason/evidence
+        # context recorded by *its own* archive call (the second call passed
+        # no evidence, so the round-tripped entry carries none either).
+        assert entry.reason == original.reason
+        assert entry.evidence_summary == original.evidence_summary
+        assert [n.node_id for n in entry.children] == [n.node_id for n in second_gen]
+        assert [n.status for n in entry.children] == [StepStatus.pending]
+        assert len(entry.history) == 1
+        prior = entry.history[0]
+        assert prior.reason == "tcp framing disproved"
+        assert [n.node_id for n in prior.children] == [n.node_id for n in first_gen]
+        assert [n.status for n in prior.children] == [
+            StepStatus.completed, StepStatus.failed,
+        ]
+        # The live tree came back alongside the archive, still executable
+        # (parent links intact), and the archive stayed off-tree.
+        assert [s.description for s in reloaded.steps] == ["Build the transport layer"]
+        assert reloaded.steps[0].node_id == branch.node_id
+        assert reloaded.steps[0].status is StepStatus.invalidated
+        assert reloaded.steps[0].children == []
+
+    def test_malformed_or_partial_archive_entries_are_skipped_not_fatal(self):
+        """A loader must degrade gracefully instead of crashing on
+        hand-edited or partially-written documents: entries without a
+        recognizable node_id are dropped, unknown node statuses fall back
+        to `pending`, and non-dict children are ignored. The rest of the
+        plan still loads."""
+        payload = {
+            "goal": "g",
+            "steps": [
+                {"index": 1, "description": "ok step", "status": "definitely_not_a_status"},
+                {"index": 2, "description": "no description key", "status": "pending"},
+            ],
+            "archived_subtrees": {
+                "valid-id": {
+                    "node_id": "valid-id",
+                    "reason": "r",
+                    "evidence_summary": "e",
+                    "children": [
+                        {"index": 1, "description": "discarded", "status": "failed"},
+                        "not-a-dict",
+                        {"description": "missing index"},
+                    ],
+                },
+                "garbage-entry": {"reason": "no node_id here"},
+            },
+        }
+        plan = Plan.from_dict(payload)
+
+        assert plan.goal == "g"
+        assert [s.description for s in plan.steps] == ["ok step", "no description key"]
+        # Unknown status string falls back to pending rather than raising.
+        assert plan.steps[0].status is StepStatus.pending
+        # The one well-formed entry survived; the garbage one was dropped.
+        assert list(plan.archived_nodes) == ["valid-id"]
+        entry = plan.archived_nodes["valid-id"]
+        assert [n.description for n in entry.children] == [
+            "discarded",
+            "missing index",
+        ]
+        assert entry.children[0].status is StepStatus.failed
+
+    def test_from_dict_to_dict_is_a_stable_round_trip(self):
+        """Serializing the reloaded plan again yields an identical
+        document: the loader must not add, drop, or reorder any of the
+        new metadata."""
+        branch = PlanNode(index=1, description="Build the transport layer",
+                          status=StepStatus.invalidated, node_id="b" * 32)
+        discarded = [
+            PlanNode(index=1, description="Stale child", status=StepStatus.completed,
+                     node_id="c" * 32),
+        ]
+        plan = Plan(goal="g", steps=[branch])
+        plan.archive_subtree(branch, discarded, reason="r", evidence_summary="e")
+
+        once = plan.to_dict()
+        reloaded = Plan.from_dict(once)
+
+        assert reloaded.to_dict() == once
 
 
 class TestParseSteps:

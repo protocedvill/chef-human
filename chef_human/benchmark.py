@@ -1176,19 +1176,16 @@ def _serialize_messages(messages: Sequence[Any]) -> list[dict[str, str]]:
     return serialized
 
 
-def _plan_node_from_data(data: dict[str, Any]):
-    from chef_human.agent.planner import PlanNode, StepStatus
+def _plan_from_data(data: dict[str, Any]):
+    """Loads a full serialized plan (goal + steps + optional
+    `archived_subtrees`) for benchmark/replay use (ticket 06). Delegates to
+    `Plan.from_dict`, which is the backward-compatible loader: old replay
+    states without the new metadata load as before, and states that carry
+    the invalidation metadata (node ids, `invalidated` statuses, archived
+    subtrees) round-trip it losslessly."""
+    from chef_human.agent.planner import Plan
 
-    node = PlanNode(
-        index=int(data.get("index", 0)),
-        description=str(data["description"]),
-        status=StepStatus(str(data.get("status", "pending"))),
-        declared_type=str(data.get("type", "leaf")),
-    )
-    children = [_plan_node_from_data(child) for child in data.get("children", [])]
-    if children:
-        node.set_children(children)
-    return node
+    return Plan.from_dict(data)
 
 
 def _run_planner_case(
@@ -1267,8 +1264,13 @@ def _run_planner_case(
         nonlocal result_plan, message
         if case.planner_operation == "continue_from_checkpoint":
             state = case.planner_state or {}
-            root_steps = [_plan_node_from_data(step) for step in state.get("steps", [])]
-            plan = Plan(goal=case.task, steps=root_steps)
+            # Load half of ticket 06: the seeded replay state is loaded
+            # through the backward-compatible plan loader, so a state that
+            # predates the invalidation feature (no node ids, no
+            # `archived_subtrees`) seeds exactly as before, while a state
+            # that carries the new metadata gets its node identities and
+            # off-tree archive restored for the continuation run.
+            plan = _plan_from_data({**state, "goal": case.task})
             result_plan = plan
             tree_snapshots.append(
                 {

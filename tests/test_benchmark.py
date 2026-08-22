@@ -9,6 +9,7 @@ import pytest
 
 from chef_human import benchmark
 from chef_human.benchmark import CASES, BenchmarkCase, Verification
+from chef_human.agent.planner import Plan, PlanNode, StepStatus
 
 
 def _case(*, protected: tuple[str, ...] = ()) -> BenchmarkCase:
@@ -428,14 +429,42 @@ class TestPlannerCase:
 
         assert env["CHEF_OLLAMA_THINK"] == "true"
 
-    def test_plan_node_from_data_preserves_children_and_checkpoint_type(self):
-        node = benchmark._plan_node_from_data(
+    def test_plan_from_data_preserves_children_and_checkpoint_type(self):
+        plan = benchmark._plan_from_data(
             {
-                "index": 6,
-                "description": "Explore the repo first",
-                "status": "completed",
-                "type": "checkpoint",
-                "children": [
+                "goal": "g",
+                "steps": [
+                    {
+                        "index": 6,
+                        "description": "Explore the repo first",
+                        "status": "completed",
+                        "type": "checkpoint",
+                        "children": [
+                            {
+                                "index": 1,
+                                "description": "Read the README",
+                                "status": "completed",
+                                "type": "leaf",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        node = plan.steps[0]
+
+        assert node.declared_type == "checkpoint"
+        assert node.children[0].parent is node
+        assert node.children[0].description == "Read the README"
+
+    def test_plan_from_data_loads_old_payload_without_node_id(self):
+        """A replay `planner_state` written before the invalidation feature
+        has no `node_id` on any step (and no `archived_subtrees` key): the
+        benchmark loader must still build an executable tree for it."""
+        plan = benchmark._plan_from_data(
+            {
+                "goal": "g",
+                "steps": [
                     {
                         "index": 1,
                         "description": "Read the README",
@@ -445,10 +474,36 @@ class TestPlannerCase:
                 ],
             }
         )
+        node = plan.steps[0]
 
-        assert node.declared_type == "checkpoint"
-        assert node.children[0].parent is node
-        assert node.children[0].description == "Read the README"
+        assert node.status is StepStatus.completed
+        assert node.node_id
+        assert node.children == []
+
+    def test_plan_from_data_round_trips_invalidation_metadata(self):
+        """When the replay state does carry the new metadata, the benchmark
+        loader round-trips it: `node_id` on the steps, the new `invalidated`
+        status, and the optional `archived_subtrees` off-tree field."""
+        branch = PlanNode(index=1, description="Build the transport layer",
+                          status=StepStatus.invalidated, node_id="d" * 32)
+        discarded = [
+            PlanNode(index=1, description="Stale child", status=StepStatus.completed,
+                     node_id="e" * 32),
+        ]
+        plan = Plan(goal="g", steps=[branch])
+        plan.archive_subtree(branch, discarded, reason="r", evidence_summary="e")
+        payload = plan.to_dict()
+        assert "archived_subtrees" in payload  # the field under test is present
+
+        reloaded = benchmark._plan_from_data(payload)
+
+        assert reloaded.goal == "g"
+        assert reloaded.steps[0].node_id == branch.node_id
+        assert reloaded.steps[0].status is StepStatus.invalidated
+        assert reloaded.archived_nodes[branch.node_id].children[0].node_id == discarded[0].node_id
+        assert reloaded.archived_nodes[branch.node_id].reason == "r"
+        # Round-trip through the benchmark's own loader is lossless.
+        assert reloaded.to_dict() == payload
 
     def test_planner_runner_returns_plan_and_llm_trace(self, tmp_path, monkeypatch):
         captured = {}
@@ -612,3 +667,97 @@ class TestPlannerCase:
         assert payload["plan"]["steps"][5]["type"] == "checkpoint"
         assert payload["tree_snapshots"][0]["phase"] == "seeded_checkpoint_state"
         assert payload["tree_snapshots"][0]["plan"]["steps"][5]["type"] == "checkpoint"
+
+    def test_replay_state_with_new_metadata_round_trips(self, tmp_path, monkeypatch):
+        """Ticket 06, benchmark/replay seam: when a replay case's
+        `planner_state` carries the new invalidation metadata (`node_id` on
+        steps, an `archived_subtrees` block), the seeded plan restores both
+        losslessly -- node ids survive so the off-tree archive stays keyed
+        to the live nodes, and the archive itself (structure, reason,
+        evidence) comes back. A state without the metadata still loads
+        (the pre-feature replay case above proves that)."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / ".chef-human").mkdir()
+
+        branch_id = "b" * 32
+        child_id = "c" * 32
+        checkpoint_id = "k" * 32
+
+        class FakePlanner:
+            def __init__(self):
+                self._complete = None
+
+            async def continue_from_checkpoint(self, plan, checkpoint, evidence):
+                return []
+
+            async def expand_spliced_steps(self, plan, steps):
+                return None
+
+        class FakeLoop:
+            def __init__(self):
+                self._planner = FakePlanner()
+                self._total_prompt_tokens = 0
+                self._total_completion_tokens = 0
+
+        monkeypatch.setattr(
+            "chef_human.agent.create_agent",
+            lambda max_steps, workspace_root, settings: (FakeLoop(), None),
+        )
+
+        case = BenchmarkCase(
+            case_id="replay_with_metadata",
+            level="smoke",
+            title="Replay state carrying invalidation metadata",
+            task="Build the transport layer",
+            seed_files={},
+            runner_kind="planner",
+            planner_operation="continue_from_checkpoint",
+            planner_state={
+                "steps": [
+                    {"index": 1, "description": "Read the README", "status": "completed",
+                     "type": "leaf"},
+                    {"index": 2, "description": "Stale framing plan", "status": "invalidated",
+                     "type": "branch", "node_id": branch_id},
+                    {"index": 3, "description": "Explore checkpoint", "status": "completed",
+                     "type": "checkpoint", "node_id": checkpoint_id},
+                ],
+                "checkpoint_index": 2,
+                "evidence": "framing assumption disproved",
+                "archived_subtrees": {
+                    branch_id: {
+                        "node_id": branch_id,
+                        "reason": "tcp framing disproved",
+                        "evidence_summary": "protocol.py:42",
+                        "children": [
+                            {"index": 1, "description": "Write the TCP framing",
+                             "status": "failed", "type": "leaf", "node_id": child_id},
+                        ],
+                    }
+                },
+            },
+        )
+
+        result = benchmark._run_planner_case(
+            case, workspace, model=None, timeout_seconds=5
+        )
+
+        seeded = result["planner_plan"]
+        # Node ids round-tripped (the checkpoint and the stale node kept
+        # their exact identities; the legacy step got a fresh one).
+        by_desc = {s["description"]: s for s in seeded["steps"]}
+        assert by_desc["Stale framing plan"]["node_id"] == branch_id
+        assert by_desc["Explore checkpoint"]["node_id"] == checkpoint_id
+        assert by_desc["Read the README"]["node_id"]
+        assert by_desc["Stale framing plan"]["status"] == "invalidated"
+        # The off-tree archive came back keyed to the restored node id.
+        entry = seeded["archived_subtrees"][branch_id]
+        assert entry["reason"] == "tcp framing disproved"
+        assert entry["evidence_summary"] == "protocol.py:42"
+        assert entry["children"][0]["node_id"] == child_id
+        assert entry["children"][0]["status"] == "failed"
+        # The continuation was seeded from the loaded plan, not a fresh one:
+        # the plan object the planner continued from carries the archive.
+        trace = json.loads((workspace / ".chef-human" / "planner-trace.json").read_text())
+        seeded_snapshot = trace["tree_snapshots"][0]["plan"]
+        assert seeded_snapshot["archived_subtrees"][branch_id]["evidence_summary"] == "protocol.py:42"

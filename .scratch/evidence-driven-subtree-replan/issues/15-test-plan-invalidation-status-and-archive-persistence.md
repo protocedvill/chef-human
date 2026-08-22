@@ -5,7 +5,7 @@ serialization behavior independently of loop orchestration.
 
 **Blocked by:** 04 (Add `invalidated` status to plan nodes), 05 (Add archived subtree history to the plan model), 06 (Persist invalidation metadata compatibly).
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] Tests prove the new invalidation status behaves coherently in the plan model
 - [ ] Tests prove discarded subtrees are archived off-tree rather than left in the live executable tree

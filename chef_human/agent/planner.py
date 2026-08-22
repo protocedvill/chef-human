@@ -199,6 +199,68 @@ class PlanNode:
         return payload
 
 
+def _snapshot_node(node: "PlanNode") -> "PlanNode":
+    """A detached copy of `node`'s live subtree -- same node_id (the stable
+    identity the archive is keyed by), same description/status/type, and
+    recursively-copied children, with no `.parent` links back into the live
+    tree. Used by `Plan.archive_subtree` so the archived history is a
+    snapshot: later mutation of the live node (or of its replacement
+    subtree) never rewrites what the archive records."""
+    copy = PlanNode(
+        description=node.description,
+        status=node.status,
+        node_id=node.node_id,
+        index=node.index,
+        declared_type=node.declared_type,
+    )
+    copy.set_children([_snapshot_node(child) for child in node.children])
+    return copy
+
+
+@dataclass
+class ArchivedSubtree:
+    """One discarded version of a node's subtree, preserved off-tree by
+    `Plan.archive_subtree` (spec: evidence-driven-subtree-replan, ticket
+    05). A subtree invalidated by better evidence is removed from the live
+    executable plan (the replacement rebuild is ticket 10's job), but this
+    entry keeps what it was and *why* it was thrown away, so a postmortem
+    can still inspect what the agent used to believe:
+
+    - `node_id` -- the stable identity of the invalidated node (never its
+      description or index); the Plan's archive is keyed by this.
+    - `children` -- a detached snapshot of the node's live children at
+      discard time (structure + status, recursively).
+    - `reason` -- the model-authored contradiction summary from the
+      `request_replan` call (which assumption was disproved).
+    - `evidence_summary` -- the objective evidence that invalidated the
+      subtree (which files/facts superseded it).
+    - `history` -- earlier archive entries for the same node_id, so a node
+      invalidated and rebuilt more than once keeps every discarded
+      generation, in the order they were thrown away.
+
+    This is observability/debugging data only: the live plan tree never
+    references it, and nothing in the executable loop walks it.
+    """
+
+    node_id: str
+    children: list["PlanNode"] = field(default_factory=list)
+    reason: str = ""
+    evidence_summary: str = ""
+    history: list["ArchivedSubtree"] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        payload: dict[str, Any] = {
+            "node_id": self.node_id,
+            "reason": self.reason,
+            "evidence_summary": self.evidence_summary,
+        }
+        if self.children:
+            payload["children"] = [child.to_dict() for child in self.children]
+        if self.history:
+            payload["history"] = [entry.to_dict() for entry in self.history]
+        return payload
+
+
 class Plan:
     """The outer container: a goal plus a root `PlanNode`.
 
@@ -206,7 +268,14 @@ class Plan:
     children, both so `Plan(goal=..., steps=[...])` construction still works
     the way flat-plan callers expect, and so `plan.steps` stays valid. The
     serialized shape intentionally keeps the legacy top-level `{goal, steps}`
-    contract while allowing each step to carry nested `children`."""
+    contract while allowing each step to carry nested `children`.
+
+    Off-tree, the plan also carries an *archive* of discarded subtrees
+    (`archived_nodes`, see `archive_subtree`): history for debugging,
+    replay, and UI inspection of subtrees invalidated by better evidence
+    (spec: evidence-driven-subtree-replan, ticket 05). It is metadata on
+    the Plan, never part of the executable tree -- the live `steps`/`root`
+    structure and every tree-walking operation are unaware of it."""
 
     def __init__(
         self,
@@ -216,22 +285,84 @@ class Plan:
     ) -> None:
         self.goal = goal
         self.root = root if root is not None else PlanNode(description="root")
+        # Archived discarded subtrees, keyed by the invalidated node's
+        # stable node_id (see ArchivedSubtree). Off-tree by construction:
+        # only `archive_subtree` writes it, and the live tree's operations
+        # never read it.
+        self.archived_nodes: dict[str, ArchivedSubtree] = {}
         if steps is not None:
             self.root.set_children(steps)
 
     def __eq__(self, other: object) -> bool:
+        # Archived history is observability data, not plan state: two
+        # plans with the same goal and live tree are the same plan even if
+        # one of them has archived discarded subtrees (an archive only
+        # ever exists on a plan whose live tree already shows the
+        # replacement, so it would never distinguish actionable state).
         if not isinstance(other, Plan):
             return NotImplemented
         return self.goal == other.goal and self.root == other.root
 
+    def archive_subtree(
+        self,
+        node: PlanNode,
+        discarded_children: list[PlanNode],
+        *,
+        reason: str = "",
+        evidence_summary: str = "",
+    ) -> ArchivedSubtree:
+        """Preserve a node's discarded live subtree off-tree, keyed by the
+        node's stable `node_id` -- the model-level half of the
+        evidence-driven replan's "archive the discarded subtree" step
+        (spec: evidence-driven-subtree-replan, ticket 05; the loop that
+        clears the live children, marks the node `invalidated`, and calls
+        this is ticket 10's).
+
+        `discarded_children` is the node's live children *at discard
+        time*, taken before the caller clears/replaces them. The entry is
+        stored as a detached snapshot (same node_id, structure, and
+        statuses, no parent links), so later mutation of the live tree
+        cannot rewrite history. The reason/evidence context comes from
+        the accepted `request_replan` call and is what makes the archive
+        useful for debugging and replay: it records not just what was
+        thrown away but why.
+
+        Archiving again for the same node_id appends a new generation: the
+        previous entry moves into the new entry's `history`, so a node
+        invalidated and rebuilt more than once keeps every discarded
+        version in the order they were thrown away. The archive is
+        metadata only -- the live tree is never read from or written to
+        by this method."""
+        previous = self.archived_nodes.get(node.node_id)
+        entry = ArchivedSubtree(
+            node_id=node.node_id,
+            children=[_snapshot_node(child) for child in discarded_children],
+            reason=reason,
+            evidence_summary=evidence_summary,
+            history=[previous] if previous is not None else [],
+        )
+        self.archived_nodes[node.node_id] = entry
+        return entry
+
     def to_dict(self) -> dict:
         """Serializes as the same top-level {goal, steps} shape existing
         callers expect, with nested decomposition preserved recursively under
-        each step's optional `children` field."""
-        return {
+        each step's optional `children` field. Archived history is added as a
+        new *optional* top-level field, present only when something has
+        actually been archived, so plans that never invalidated a subtree
+        serialize byte-for-byte as before (older consumers and loaders see
+        an unchanged document; backward-compatible loading of the field is
+        ticket 06's job)."""
+        payload = {
             "goal": self.goal,
             "steps": [s.to_dict() for s in self.steps],
         }
+        if self.archived_nodes:
+            payload["archived_subtrees"] = {
+                node_id: entry.to_dict()
+                for node_id, entry in self.archived_nodes.items()
+            }
+        return payload
 
     @property
     def steps(self) -> list[PlanNode]:
@@ -1145,6 +1276,14 @@ class Planner:
         steps = self._normalize_steps(plan.goal, self._parse_steps(response.message.content))
 
         revised = Plan(goal=plan.goal)
+        # Carry the off-tree archive of discarded subtrees over to the
+        # revised plan (ticket 05): a whole-plan replan builds a brand-new
+        # Plan object, and silently dropping previously-archived history
+        # here would destroy the debugging/replay record of subtrees that
+        # were already invalidated by evidence. The entries are shared by
+        # reference -- the old plan is discarded by the caller and the
+        # archive is append-only history, not live state.
+        revised.archived_nodes = plan.archived_nodes
         revised_steps: list[PlanNode] = []
         for s in plan.steps:
             if s.status == StepStatus.completed:

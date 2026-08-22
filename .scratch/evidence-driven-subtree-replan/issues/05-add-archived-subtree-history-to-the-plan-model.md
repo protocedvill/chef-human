@@ -6,7 +6,7 @@ tree.
 
 **Blocked by:** 04 (Add `invalidated` status to plan nodes).
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] The plan can archive discarded subtrees keyed by the invalidated node’s stable identity
 - [ ] Archived history is stored off-tree rather than as live children of the node

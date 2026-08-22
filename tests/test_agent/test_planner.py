@@ -370,6 +370,186 @@ class TestInvalidatedStatusInPlanModel:
         assert [s.description for s in revised.steps] == ["Fresh read"]
 
 
+class TestArchivedSubtreeHistory:
+    """Ticket 05: discarded live subtrees are preserved off-tree, keyed by
+    the invalidated node's stable `node_id`, so a subtree superseded by
+    better evidence is still inspectable later (debugging, replay, UI)
+    without polluting the live executable tree. The archive is Plan
+    metadata, not live children: the node's own `children` are cleared by
+    the caller (the evidence-driven replan that replaces them, ticket 10)
+    and nothing about the archive is reachable through `steps`/`_leaves`/
+    `_branches`. The archive entry must retain enough structure and reason
+    context to support debugging and replay."""
+
+    def _discarded_subtree(self) -> tuple[PlanNode, list[PlanNode]]:
+        """A branch that has been discarded from the live tree (its
+        `children` already cleared, its status `invalidated`) plus the
+        exact list of children that used to be its live children."""
+        branch = PlanNode(index=1, description="Build the transport layer",
+                          status=StepStatus.invalidated)
+        discarded = [
+            PlanNode(index=1, description="Assume a TCP socket protocol",
+                     status=StepStatus.completed),
+            PlanNode(index=2, description="Write the socket framing code",
+                     status=StepStatus.failed),
+        ]
+        return branch, discarded
+
+    def test_archive_is_keyed_by_the_node_stable_identity(self):
+        branch, discarded = self._discarded_subtree()
+        plan = Plan(goal="g", steps=[branch])
+        entry = plan.archive_subtree(branch, discarded, reason="evidence contradicts framing")
+
+        # Keyed by the node's stable node_id -- the same identity
+        # `find_node`/evidence buckets use, never by description or index.
+        assert plan.archived_nodes[branch.node_id] is entry
+        assert entry.node_id == branch.node_id
+
+    def test_archive_is_off_tree_not_live_children(self):
+        """Archiving must not leave the discarded structure reachable from
+        the live executable tree: the node keeps no children (the replan
+        replaces them), and none of the archived descendants are visible
+        through the live-tree operations. (The invalidated node itself
+        stays in the tree -- it is still the sub-goal's node, just with no
+        live children to execute; `current_leaf` skips it per ticket 04.)"""
+        branch, discarded = self._discarded_subtree()
+        plan = Plan(goal="g", steps=[branch])
+        plan.archive_subtree(branch, discarded, reason="r")
+
+        assert branch.children == []
+        # Live-tree views must not see the archived descendants at all.
+        leaf_descriptions = [n.description for n in plan._leaves()]
+        assert "Assume a TCP socket protocol" not in leaf_descriptions
+        assert "Write the socket framing code" not in leaf_descriptions
+        assert [n.description for n in plan._branches()] == []
+        assert all(n.description not in {d.description for d in discarded}
+                   for n in plan.unresolved_steps())
+        # The live plan still exposes only its own live structure.
+        assert [s.description for s in plan.steps] == ["Build the transport layer"]
+
+    def test_archive_retains_structure_and_reason_context(self):
+        """The archive entry must carry the discarded structure *and* the
+        reason context (why the subtree was thrown away, what evidence
+        superseded it) so a postmortem can explain what the agent used to
+        believe and why the plan was discarded."""
+        branch, discarded = self._discarded_subtree()
+        plan = Plan(goal="g", steps=[branch])
+        entry = plan.archive_subtree(
+            branch,
+            discarded,
+            reason="fresh read evidence contradicts the TCP framing assumption",
+            evidence_summary="protocol.py:42 defines a length-prefixed UDP protocol",
+        )
+
+        assert entry.reason == "fresh read evidence contradicts the TCP framing assumption"
+        assert entry.evidence_summary == "protocol.py:42 defines a length-prefixed UDP protocol"
+        # The full discarded structure survives -- node_id, status, and the
+        # nested child shape -- not just the descriptions.
+        assert [n.node_id for n in entry.children] == [n.node_id for n in discarded]
+        assert [n.status for n in entry.children] == [
+            StepStatus.completed, StepStatus.failed,
+        ]
+        assert [n.description for n in entry.children] == [
+            "Assume a TCP socket protocol", "Write the socket framing code",
+        ]
+        # The archived copy is a detached snapshot: mutating the live node
+        # afterwards must not rewrite history.
+        discarded[0].status = StepStatus.pending
+        assert entry.children[0].status == StepStatus.completed
+
+    def test_multiple_archives_for_the_same_node_accumulate(self):
+        """A node invalidated and rebuilt more than once keeps every
+        discarded version of its subtree, in the order they were thrown
+        away -- the first replan's output is itself history once a second
+        invalidation supersedes it."""
+        branch, first = self._discarded_subtree()
+        plan = Plan(goal="g", steps=[branch])
+        plan.archive_subtree(branch, first, reason="first invalidation")
+        plan.archive_subtree(
+            branch,
+            [PlanNode(index=1, description="second generation", status=StepStatus.pending)],
+            reason="second invalidation",
+        )
+        current = plan.archived_nodes[branch.node_id]
+        assert [n.description for n in current.children] == ["second generation"]
+        assert current.reason == "second invalidation"
+        # The earlier discarded generation is preserved in the order it
+        # was thrown away, with its own reason context intact.
+        assert len(current.history) == 1
+        prior = current.history[0]
+        assert prior.reason == "first invalidation"
+        assert [n.description for n in prior.children] == [
+            "Assume a TCP socket protocol", "Write the socket framing code",
+        ]
+        assert [n.node_id for n in prior.children] == [n.node_id for n in first]
+
+    def test_archived_subtree_serializes_off_tree_as_optional_field(self):
+        """The archive rides on the existing top-level `{goal, steps}`
+        contract as a *new optional* field (ticket 06 makes loading
+        backward-compatible; here the model must at least not lose it in
+        serialization) -- and the `steps` payload itself is unchanged."""
+        branch, discarded = self._discarded_subtree()
+        plan = Plan(goal="g", steps=[branch])
+        plan.archive_subtree(branch, discarded, reason="r", evidence_summary="e")
+
+        payload = plan.to_dict()
+        # Existing contract intact: same goal, same live steps, no archive
+        # structure smuggled into a step.
+        assert payload["goal"] == "g"
+        assert [s["description"] for s in payload["steps"]] == ["Build the transport layer"]
+        assert "children" not in payload["steps"][0]
+        # The archive is present off-tree, keyed by the stable node id.
+        assert branch.node_id in payload.get("archived_subtrees", {})
+        entry = payload["archived_subtrees"][branch.node_id]
+        assert entry["reason"] == "r"
+        assert entry["evidence_summary"] == "e"
+        assert [c["description"] for c in entry["children"]] == [
+            "Assume a TCP socket protocol", "Write the socket framing code",
+        ]
+        assert [c["status"] for c in entry["children"]] == ["completed", "failed"]
+
+    def test_plan_without_archives_serializes_identically_to_before(self):
+        """Backward-compatibility at the model level: a plan that never
+        archived anything serializes exactly as it always did -- no new
+        empty field in the payload (older consumers see an unchanged
+        document)."""
+        plan = Plan(goal="g", steps=[PlanNode(index=1, description="do it")])
+        assert plan.to_dict() == {
+            "goal": "g",
+            "steps": [
+                {
+                    "index": 1,
+                    "description": "do it",
+                    "status": "pending",
+                    "type": "leaf",
+                }
+            ],
+        }
+        assert plan.archived_nodes == {}
+
+    @pytest.mark.asyncio
+    async def test_archive_survives_whole_plan_replan(self):
+        """`update_plan` builds a *new* `Plan` object; if the old plan had
+        archived history, dropping it on the whole-plan replan would
+        silently destroy debugging history. The archive must carry over
+        with the revised plan so ticket 10's evidence-driven replacement
+        (which preserves the invalidated node's identity) keeps its
+        history intact."""
+        branch, discarded = self._discarded_subtree()
+        plan = Plan(goal="g", steps=[branch])
+        plan.archive_subtree(branch, discarded, reason="r")
+
+        mock_llm = _make_mock_backend([PlanNode(index=1, description="Fresh step")])
+        planner = Planner(mock_llm)
+        revised = await planner.update_plan(plan, failure_context="x")
+
+        assert branch.node_id in revised.archived_nodes
+        archived_children = [
+            n.description for n in revised.archived_nodes[branch.node_id].children
+        ]
+        assert archived_children == [n.description for n in discarded]
+
+
 class TestParseSteps:
     def test_json_array_of_strings(self):
         planner = Planner(_make_mock_backend([]))

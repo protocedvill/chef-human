@@ -521,7 +521,16 @@ def _rollback_file(path: Path, content: str) -> None:
 
 
 def _looks_investigative(description: str) -> bool:
-    lowered = description.lower()
+    # Filename tokens are stripped before the keyword search: a step like
+    # "Write REVIEW.md at the repository root..." must not read as
+    # investigative just because "review" appears inside the target
+    # filename -- that misclassification auto-completed the step on a bare
+    # `ls` turn (benchmark case chef_human_tools_self_review, tier 8) and
+    # left the deliverable unwritten. Genuine investigative wording around
+    # the filename ("Check REVIEW.md for stale entries") still matches via
+    # its own verb.
+    cleaned = _FILE_TARGET_RE.sub(" ", description)
+    lowered = cleaned.lower()
     return any(kw in lowered for kw in _INVESTIGATIVE_KEYWORDS)
 
 
@@ -2737,7 +2746,20 @@ class ReActLoop:
         investigative_read_names: set[str] = set()
         investigative_needs_verifier = False
 
-        if _looks_investigative(step.description):
+        # A step that names a file-creation target ("Write REVIEW.md ...")
+        # has an objective, disk-checkable deliverable handled further
+        # below -- it must never take the investigative auto-complete
+        # fast-path, whatever its wording. (Belt-and-braces companion to
+        # the filename-stripping in _looks_investigative: a phrasing like
+        # "review the tools and write findings to FINDINGS.md" still
+        # sounds investigative via "find" inside "findings", but the thing
+        # being verified is the created file, not evidence gathering.)
+        step_creation_targets = _looks_like_file_creation_step(step.description)
+
+        if (
+            _looks_investigative(step.description)
+            and not step_creation_targets
+        ):
             investigative_named_files = _named_step_files(step.description)
             if investigative_named_files:
                 investigative_read_names = _read_file_names(files_read)
@@ -2847,7 +2869,7 @@ class ReActLoop:
                     "step; use a relevant read-only tool in this turn."
                 )
 
-        target_names = _looks_like_file_creation_step(step.description)
+        target_names = step_creation_targets
         if target_names and not investigative_needs_verifier:
             for target_name in target_names:
                 initially_existed = self._planning_facts.get(target_name)

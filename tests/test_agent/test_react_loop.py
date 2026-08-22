@@ -4057,6 +4057,74 @@ class TestInvestigativeStepEvidenceRelevanceHeuristic:
         planner.verify_step.assert_not_awaited()
 
 
+class TestCreationStepNeverAutoCompletesAsInvestigative:
+    """Reproduces benchmark case chef_human_tools_self_review (run
+    20260822, tier 8): the step "Write REVIEW.md at the repository root..."
+    was auto-completed as "investigative, has tool evidence" after a turn
+    whose only tool call was `ls chef_human/tools` -- no REVIEW.md was ever
+    written, and the run force-finished with an empty deliverable.
+
+    Chain of causes, all confirmed against the production wording:
+    1. _looks_investigative() matched because "review" is a substring of
+       the *filename* REVIEW.md (bare substring containment).
+    2. The named-files enforcement skipped: REVIEW.md neither existed on
+       disk nor had been read -- but for a creation step, absence of the
+       target is exactly the expected state, so this disarms nothing.
+    3. _evidence_looks_relevant() passed via substring overlap: the word
+       "file" from "...file, function/method..." matched inside
+       "filesystem.py" in the ls output.
+    4. The generic investigative fallback auto-completed on has_tool_evidence
+       before _looks_like_file_creation_step()'s objective disk check was
+       ever consulted."""
+
+    _DESCRIPTION = (
+        "Write REVIEW.md at the repository root with one entry per bug "
+        "found: file, function/method, what is wrong, and a concrete "
+        "input or call sequence demonstrating the failure"
+    )
+
+    def test_filename_keyword_does_not_make_creation_step_investigative(self):
+        from chef_human.agent.react_loop import _looks_investigative
+
+        assert _looks_investigative(self._DESCRIPTION) is False
+
+    @pytest.mark.asyncio
+    async def test_ls_only_turn_does_not_complete_write_review_md_step(self):
+        planner = _make_mock_planner()
+        planner.verify_step = AsyncMock(
+            return_value=(StepVerdict.not_complete, "REVIEW.md does not exist")
+        )
+        step = PlanNode(
+            index=1,
+            description=self._DESCRIPTION,
+            status=StepStatus.pending,
+        )
+        plan = Plan(goal="Review the tools", steps=[step])
+        context = _make_mock_context()
+        loop = ReActLoop(
+            llm_backend=_make_mock_backend(),
+            tool_registry=_make_mock_tool_registry(),
+            context_assembler=context,
+            planner=planner,
+            config=ReActConfig(),
+        )
+        # The task names REVIEW.md and a fresh worktree has no such file,
+        # so planning facts recorded it as absent at plan time.
+        loop._planning_facts = {"REVIEW.md": False}
+
+        await loop._verify_and_mark_step(
+            plan,
+            evidence=(
+                "__init__.py\ndiff.py\nfilesystem.py\nfsutil.py\n"
+                "goto_definition.py\nlint_fix.py\nlookup_symbol.py\npatch_tool.py"
+            ),
+            has_tool_evidence=True,
+            step_override=step,
+        )
+
+        assert step.status != StepStatus.completed
+
+
 class TestDistinctiveStepWordsAndEvidenceRelevance:
     def test_extracts_content_words_filters_stopwords_and_short_words(self):
         from chef_human.agent.react_loop import _distinctive_step_words

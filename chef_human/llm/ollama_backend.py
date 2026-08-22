@@ -136,6 +136,16 @@ class OllamaBackend(LLMBackend):
                 "temperature": request.temperature,
                 "num_predict": request.max_tokens,
                 "stop": request.stop,
+                # Pin the served context window to the length this backend
+                # advertises. Without it, Ollama uses each model's own
+                # default -- and when the request exceeds it, Ollama
+                # silently prunes messages server-side (dropping the user
+                # turn), which the qwen3.8 renderer rejects with a fatal
+                # "no user query found in messages" 500 (ollama issues
+                # #17778/#17754). Explicit num_ctx makes the window the
+                # caller budgets against and the window the server enforces
+                # the same thing.
+                "num_ctx": self._context_length,
             },
         )
 
@@ -176,6 +186,10 @@ class OllamaBackend(LLMBackend):
                 "temperature": request.temperature,
                 "num_predict": request.max_tokens,
                 "stop": request.stop,
+                # See complete() -- keeps the served window aligned with
+                # the caller's budget so server-side pruning can never
+                # silently drop the user turn.
+                "num_ctx": self._context_length,
             },
             stream=True,
         )

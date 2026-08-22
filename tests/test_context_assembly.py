@@ -240,6 +240,58 @@ class TestContextAssemblerTruncation:
         truncated = ca._truncate_file_context(full, 1)
         assert isinstance(truncated, str)
 
+    def test_assemble_reconciles_total_budget_across_sections(self, workspace):
+        """Regression for the Ollama 'no user query found in messages'
+        benchmark crashes (tier 8 retest + tier 12): ContextManager trims
+        the conversation against max_tokens - response - summary while
+        assemble() *additionally* prepends the system prompt, repo map and
+        file context -- two independent budgets that were never
+        reconciled. The assembled request could therefore far exceed the
+        model's served context window; Ollama then silently prunes
+        messages (dropping the user turn) and the qwen3.8 renderer rejects
+        the remainder with a fatal 500."""
+        from chef_human.llm.backend import Message
+
+        class CountTokenizer:
+            def count(self, text: str) -> int:
+                return len(text)
+
+        config = ContextConfig(
+            max_tokens=2000,
+            max_response_tokens=200,
+            summary_tokens=100,
+            repo_map_tokens=400,
+            file_context_tokens=600,
+        )
+        conv = ContextManager(config=config, tokenizer=CountTokenizer())
+        conv.add_message(Message(role=Role.user, content="U" * 100))
+        for i in range(5):
+            conv.add_message(Message(role=Role.assistant, content="A" * 150))
+            conv.add_message(Message(role=Role.tool, content="T" * 60))
+        # Conversation totals 1150 tokens: safely under its own trim budget
+        # (2000-200-100=1700) so _trim_if_needed never fires -- each section
+        # is individually "within budget"; only their SUM overflows.
+
+        repo_map = type("R", (), {"generate": staticmethod(lambda max_tokens: "R" * 300)})()
+        file_context = FileContextManager(workspace=workspace, tokenizer=CountTokenizer())
+        ca = ContextAssembler(
+            conversation=conv,
+            workspace=workspace,
+            file_context=file_context,
+            repo_map=repo_map,
+        )
+
+        # system(600) + repo map(300) + conversation(1150) = 2000 tokens
+        # assembled against an effective budget of 1800.
+        result = ca.assemble(system_prompt="S" * 600)
+
+        total = sum(len(m.content) for m in result)
+        allowed = config.max_tokens - config.max_response_tokens
+        assert total <= allowed, f"assembled {total} tokens > budget {allowed}"
+        assert any(m.role == Role.user for m in result), (
+            "assembled request lost every user message"
+        )
+
     def test_tool_definitions_included(self, conversation, workspace, file_context, repo_map):
         ca = ContextAssembler(
             conversation=conversation,

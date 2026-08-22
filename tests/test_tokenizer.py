@@ -10,12 +10,13 @@ from chef_human.llm.tokenizer import (
     create_tokenizer,
 )
 from chef_human.agent.context import ContextConfig, ContextManager
+from chef_human.llm.backend import Role
 
 
 # Minimal Message for testing
 @dataclass
 class FakeMessage:
-    role: str = "user"
+    role: Any = Role.user  # production code reads .role.value (see _last_non_user_index)
     content: str = ""
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
@@ -102,10 +103,16 @@ class TestContextManager:
         assert len(cm.get_messages()) == 5
 
     def test_trims_oldest_when_over_budget(self):
+        # All-user lists are deliberately never trimmed (_last_non_user_index
+        # returns -1 -> break): the guard keeps a user turn alive for the
+        # Qwen chat template. Trimming applies to mixed histories -- the
+        # realistic ReAct shape (task + alternating assistant/tool turns).
         cm = ContextManager(config=ContextConfig(max_tokens=20, max_response_tokens=0, summary_tokens=0))
-        for i in range(10):
-            cm.add_message(FakeMessage(content="a" * 16))  # type: ignore[arg-type] # 4 tokens each
+        cm.add_message(FakeMessage(content="task"))
+        for i in range(9):
+            cm.add_message(FakeMessage(role=Role.assistant, content="a" * 16))  # 4 tokens each
         assert len(cm.get_messages()) < 10
+        assert cm.get_messages()[0].role == Role.user
 
     def test_protects_last_message_when_only_two_remain(self):
         cm = ContextManager(config=ContextConfig(max_tokens=8, max_response_tokens=0, summary_tokens=0))

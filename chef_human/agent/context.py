@@ -225,6 +225,47 @@ class ContextAssembler:
                     Message(role=Role.system, content=f"## Related Symbols\n\n{symbol_text}")
                 )
 
+        # Final reconciliation across sections. ContextManager trims the
+        # conversation against max_tokens - response - summary on its own,
+        # while the system prompt / repo map / file context above were each
+        # bounded against their own sub-budgets -- two independent budgets
+        # that never summed to the real constraint. The assembled request
+        # could therefore exceed the model's served context window; Ollama
+        # then silently prunes messages server-side (dropping the user
+        # turn), which the qwen3.8 renderer rejects with a fatal
+        # "no user query found in messages" 500 -- observed live as the
+        # crash that killed benchmark runs mid-flight (tier 12 and the
+        # tier-8 retest). Drop oldest-but-first conversation turns here,
+        # with the full picture visible, until the whole request fits.
+        # Never removes the leading task message (or, if the list somehow
+        # starts non-user, stops while exactly one trailing user would
+        # remain), so a user turn always survives rendering.
+        allowed = (
+            self._conversation.config.max_tokens
+            - self._conversation.config.max_response_tokens
+        )
+
+        def _role_name(m: Message) -> str:
+            return getattr(m.role, "value", str(m.role))
+
+        prefix_tokens = sum(self._conversation.tokenizer.count(m.content) for m in messages)
+
+        def _conv_tokens() -> int:
+            return sum(
+                self._conversation.tokenizer.count(m.content)
+                for m in conversation_messages
+            )
+
+        while len(conversation_messages) > 1 and prefix_tokens + _conv_tokens() > allowed:
+            first_is_user = _role_name(conversation_messages[0]) == "user"
+            another_user = any(
+                _role_name(m) == "user" for m in conversation_messages[1:]
+            )
+            if not (first_is_user or another_user):
+                break
+            dropped = conversation_messages.pop(1)
+            del dropped
+
         messages.extend(conversation_messages)
         return messages
 

@@ -15,7 +15,7 @@ overridden.
 
 **Blocked by:** 05 (RetryManager per-node counters + headless escalation)
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] In interactive mode, a node exhausting its budget gets the same automatic fallback as headless (marked failed, execution continues) — the run never blocks waiting on the human
 - [x] A notification of the escalation is surfaced to the human, referencing the specific node
